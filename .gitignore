@@ -1,0 +1,9 @@
+# dependencies
+node_modules/
+
+# local env (keep .env.example; never commit .env)
+.env
+
+# misc
+.DS_Store
+*.log
