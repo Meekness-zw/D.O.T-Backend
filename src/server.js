@@ -24,6 +24,7 @@ import {
   getAdminMerchants,
   getAdminCouriers,
 } from './adminService.js';
+import { supabaseAdmin as publicSupabase } from './supabaseAdminClient.js';
 
 const app = express();
 const supabase = supabaseAdmin;
@@ -114,6 +115,78 @@ app.get('/', (req, res) => {
     version: '1.0.0',
     environment: NODE_ENV
   });
+});
+
+// Public stores listing & search (no auth required; uses public RLS policies)
+app.get('/stores', async (req, res) => {
+  try {
+    const supabasePublic = publicSupabase;
+    if (!supabasePublic) throw new Error('Server not configured');
+
+    const {
+      search,
+      category,
+      city,
+      limit: limitParam,
+      offset: offsetParam,
+      hasPromos,
+    } = req.query || {};
+
+    const limit = Math.min(parseInt(limitParam, 10) || 50, 100);
+    const offset = parseInt(offsetParam, 10) || 0;
+
+    let query = supabasePublic
+      .from('stores')
+      .select(
+        `
+          id,
+          store_name,
+          logo,
+          description,
+          city,
+          rating,
+          total_reviews,
+          is_open,
+          is_active
+        `,
+      )
+      .eq('is_active', true)
+      .range(offset, offset + limit - 1);
+
+    if (city) {
+      query = query.ilike('city', city);
+    }
+
+    if (category) {
+      const term = `%${category.trim()}%`;
+      query = query.or(`description.ilike.${term},store_name.ilike.${term}`);
+    }
+
+    if (search && search.trim()) {
+      const term = `%${search.trim()}%`;
+      query = query.or(`store_name.ilike.${term},description.ilike.${term},city.ilike.${term}`);
+    }
+
+    const { data, error } = await query;
+    if (error) {
+      console.error('public /stores error:', error);
+      throw new Error(error.message || 'Failed to load stores');
+    }
+
+    // Basic placeholder for promotions flag: if hasPromos=true, keep as is for now (extend when promotions table exists)
+    let stores = data || [];
+    if (hasPromos === 'true') {
+      stores = stores.slice(0, 10);
+    }
+
+    return res.json({ stores });
+  } catch (error) {
+    console.error('get /stores error:', error);
+    return res.status(500).json({
+      error: 'Failed to load stores',
+      details: error.message || 'Please try again later',
+    });
+  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
