@@ -610,6 +610,140 @@ app.get('/users/me/payments', requireAuth, async (req, res) => {
   }
 });
 
+// GET /users/me/notifications — notifications for current user
+app.get('/users/me/notifications', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
+    const offset = parseInt(req.query.offset, 10) || 0;
+
+    const { data, error } = await supabase
+      .from('notifications')
+      .select('id, title, message, type, reference_id, is_read, created_at')
+      .eq('user_id', req.userId)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (error) {
+      console.error('get notifications error:', error);
+      throw new Error(error.message || 'Failed to load notifications');
+    }
+
+    return res.json({ notifications: data || [] });
+  } catch (error) {
+    console.error('get /users/me/notifications error:', error);
+    return res.status(500).json({
+      error: 'Failed to load notifications',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /users/me/notifications — create a notification for the current user
+app.post('/users/me/notifications', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { title, message, type = 'system', referenceId } = req.body || {};
+
+    if (!title || !message) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        details: 'title and message are required',
+      });
+    }
+
+    const allowedTypes = ['order', 'delivery', 'payment', 'system', 'promotion'];
+    if (!allowedTypes.includes(type)) {
+      return res.status(400).json({
+        error: 'Invalid notification type',
+        details: `type must be one of: ${allowedTypes.join(', ')}`,
+      });
+    }
+
+    const insert = {
+      user_id: req.userId,
+      title: String(title).trim(),
+      message: String(message).trim(),
+      type,
+      reference_id: referenceId || null,
+    };
+
+    const { data, error } = await supabase
+      .from('notifications')
+      .insert(insert)
+      .select('id, title, message, type, reference_id, is_read, created_at')
+      .single();
+
+    if (error) {
+      console.error('create notification error:', error);
+      throw new Error(error.message || 'Failed to create notification');
+    }
+
+    return res.status(201).json(data);
+  } catch (error) {
+    console.error('post /users/me/notifications error:', error);
+    return res.status(500).json({
+      error: 'Failed to create notification',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /users/me/notifications/:id/read — mark a single notification as read
+app.post('/users/me/notifications/:id/read', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+
+    const { data, error } = await supabase
+      .from('notifications')
+      .update({ is_read: true })
+      .eq('id', id)
+      .eq('user_id', req.userId)
+      .select('id, title, message, type, reference_id, is_read, created_at')
+      .single();
+
+    if (error) {
+      console.error('mark notification read error:', error);
+      throw new Error(error.message || 'Failed to mark notification as read');
+    }
+
+    return res.json(data);
+  } catch (error) {
+    console.error('post /users/me/notifications/:id/read error:', error);
+    return res.status(500).json({
+      error: 'Failed to mark notification as read',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /users/me/notifications/read-all — mark all notifications as read
+app.post('/users/me/notifications/read-all', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    const { error } = await supabase
+      .from('notifications')
+      .update({ is_read: true })
+      .eq('user_id', req.userId)
+      .eq('is_read', false);
+
+    if (error) {
+      console.error('mark all notifications read error:', error);
+      throw new Error(error.message || 'Failed to mark notifications as read');
+    }
+
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('post /users/me/notifications/read-all error:', error);
+    return res.status(500).json({
+      error: 'Failed to mark notifications as read',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // GET /users/me/addresses — saved delivery addresses for the current customer
 app.get('/users/me/addresses', requireAuth, async (req, res) => {
   try {
