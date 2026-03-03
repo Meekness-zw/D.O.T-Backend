@@ -132,7 +132,8 @@ export async function verifyPhoneOtp({ phone, token, isSignUp = false, password 
     sessionId,
     supabaseUrl: SUPABASE_URL,
     jwtSecret: SUPABASE_JWT_SECRET,
-    expiresInSeconds: 3600,
+    // 7 days session validity
+    expiresInSeconds: 60 * 60 * 24 * 7,
   });
 
   return {
@@ -258,7 +259,8 @@ export async function loginWithPassword({ phone, password }) {
     sessionId,
     supabaseUrl: SUPABASE_URL,
     jwtSecret: SUPABASE_JWT_SECRET,
-    expiresInSeconds: 3600,
+    // 7 days session validity
+    expiresInSeconds: 60 * 60 * 24 * 7,
   });
 
   return {
