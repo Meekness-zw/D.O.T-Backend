@@ -356,11 +356,14 @@ export async function upsertMerchantOnboarding({
   if (latitude == null || longitude == null) throw new Error('latitude and longitude are required');
 
   // Ensure profile role + save owner name on user_profiles
+  const fallbackEmail = email ? String(email).trim() : `${userId}@merchant.local`;
+
   const { error: profileError } = await supabase.from('user_profiles').upsert(
     {
       id: userId,
       full_name: ownerName ? String(ownerName).trim() : null,
       role: 'merchant',
+      email: fallbackEmail,
     },
     { onConflict: 'id' },
   );
