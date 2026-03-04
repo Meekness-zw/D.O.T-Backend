@@ -610,6 +610,86 @@ app.get('/users/me/payments', requireAuth, async (req, res) => {
   }
 });
 
+// GET /merchant/onboarding-status — check if merchant has fully completed setup
+app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    // Merchant core row must exist and be active
+    const { data: merchant, error: merchantError } = await supabase
+      .from('merchants')
+      .select('id, business_name, business_type, is_active')
+      .eq('id', req.userId)
+      .maybeSingle();
+
+    if (merchantError) {
+      console.error('merchant status merchant error:', merchantError);
+      throw new Error(merchantError.message || 'Failed to load merchant');
+    }
+
+    const isMerchant = !!merchant && merchant.is_active !== false;
+
+    // At least one active store with required address/geo fields
+    let hasStore = false;
+    if (isMerchant) {
+      const { data: stores, error: storesError } = await supabase
+        .from('stores')
+        .select('id, address_line1, city, latitude, longitude, is_active')
+        .eq('merchant_id', req.userId)
+        .eq('is_active', true)
+        .limit(1);
+
+      if (storesError) {
+        console.error('merchant status stores error:', storesError);
+        throw new Error(storesError.message || 'Failed to load stores for merchant');
+      }
+
+      hasStore =
+        Array.isArray(stores) &&
+        stores.length > 0 &&
+        !!stores[0].address_line1 &&
+        !!stores[0].city &&
+        stores[0].latitude != null &&
+        stores[0].longitude != null;
+    }
+
+    // Required merchant documents: owner_id and proof_of_address must exist
+    let hasRequiredDocuments = false;
+    if (isMerchant) {
+      const { data: docs, error: docsError } = await supabase
+        .from('merchant_documents')
+        .select('document_type')
+        .eq('merchant_id', req.userId);
+
+      if (docsError) {
+        console.error('merchant status documents error:', docsError);
+        throw new Error(docsError.message || 'Failed to load merchant documents');
+      }
+
+      const types = Array.isArray(docs) ? docs.map((d) => d.document_type) : [];
+      const hasOwnerId = types.includes('owner_id');
+      const hasProofOfAddress = types.includes('proof_of_address');
+
+      hasRequiredDocuments = hasOwnerId && hasProofOfAddress;
+    }
+
+    const onboardingComplete = isMerchant && hasStore && hasRequiredDocuments;
+
+    return res.json({
+      isMerchant,
+      hasStore,
+      hasRequiredDocuments,
+      onboardingComplete,
+    });
+  } catch (error) {
+    console.error('get /merchant/onboarding-status error:', error);
+    return res.status(500).json({
+      error: 'Failed to load merchant onboarding status',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // GET /users/me/notifications — notifications for current user
 app.get('/users/me/notifications', requireAuth, async (req, res) => {
   try {

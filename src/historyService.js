@@ -40,7 +40,11 @@ export async function getOrdersForUser(userId, options = {}) {
         created_at,
         updated_at,
         store_id,
-        stores ( store_name )
+        stores ( store_name ),
+        order_items (
+          product_name,
+          quantity
+        )
       `)
       .eq('customer_id', userId)
       .order('created_at', { ascending: false })
@@ -65,7 +69,11 @@ export async function getOrdersForUser(userId, options = {}) {
         created_at,
         updated_at,
         store_id,
-        stores ( store_name )
+        stores ( store_name ),
+        order_items (
+          product_name,
+          quantity
+        )
       `)
       .in('store_id', ids)
       .order('created_at', { ascending: false })
@@ -87,7 +95,11 @@ export async function getOrdersForUser(userId, options = {}) {
         created_at,
         updated_at,
         store_id,
-        stores ( store_name )
+        stores ( store_name ),
+        order_items (
+          product_name,
+          quantity
+        )
       `)
       .eq('courier_id', userId)
       .order('created_at', { ascending: false })
