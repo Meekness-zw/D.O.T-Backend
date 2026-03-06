@@ -50,7 +50,10 @@ export async function getOrdersForUser(userId, options = {}) {
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
   } else if (profile.role === 'merchant') {
-    const { data: storeIds } = await supabase.from('stores').select('id').eq('merchant_id', userId);
+    const { data: storeIds } = await supabase
+      .from('stores')
+      .select('id')
+      .eq('merchant_id', userId);
     const ids = (storeIds || []).map((s) => s.id);
     if (ids.length === 0) return { orders: [], role: 'merchant' };
     query = supabase
@@ -189,8 +192,21 @@ export async function getFullUserMe(userId) {
     const { data } = await supabase.from('customers').select('*').eq('id', userId).single();
     result.customer = data || null;
   } else if (profile.role === 'merchant') {
-    const { data } = await supabase.from('merchants').select('*').eq('id', userId).single();
-    result.merchant = data || null;
+    const { data: merchant } = await supabase
+      .from('merchants')
+      .select('*')
+      .eq('id', userId)
+      .single();
+    result.merchant = merchant || null;
+
+    const { data: store } = await supabase
+      .from('stores')
+      .select('id, store_name, logo, city, address_line1')
+      .eq('merchant_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    result.store = store || null;
   } else if (profile.role === 'courier') {
     const { data } = await supabase.from('couriers').select('*').eq('id', userId).single();
     result.courier = data || null;
