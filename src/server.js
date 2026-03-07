@@ -337,6 +337,352 @@ app.post('/merchants/onboarding', requireAuth, async (req, res) => {
   }
 });
 
+// GET /merchant/products — list products for stores owned by current merchant
+app.get('/merchant/products', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    const { data: stores, error: storesError } = await supabase
+      .from('stores')
+      .select('id')
+      .eq('merchant_id', req.userId)
+      .eq('is_active', true);
+
+    if (storesError) {
+      console.error('merchant products stores error:', storesError);
+      throw new Error(storesError.message || 'Failed to load stores for merchant');
+    }
+
+    const storeIds = Array.isArray(stores) ? stores.map((s) => s.id) : [];
+    if (storeIds.length === 0) {
+      return res.json({ products: [] });
+    }
+
+    const { data, error } = await supabase
+      .from('products')
+      .select(
+        `
+        id,
+        store_id,
+        category_id,
+        name,
+        description,
+        price,
+        unit,
+        is_available,
+        is_featured,
+        image_url,
+        product_categories ( name )
+      `,
+      )
+      .in('store_id', storeIds)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('merchant products query error:', error);
+      throw new Error(error.message || 'Failed to load products');
+    }
+
+    const products = (data || []).map((p) => ({
+      id: p.id,
+      store_id: p.store_id,
+      category_id: p.category_id,
+      name: p.name,
+      description: p.description,
+      price: p.price,
+      unit: p.unit,
+      is_available: p.is_available,
+      is_featured: p.is_featured,
+      image_url: p.image_url,
+      category_name:
+        (Array.isArray(p.product_categories)
+          ? p.product_categories[0]?.name
+          : p.product_categories?.name) || null,
+    }));
+
+    return res.json({ products });
+  } catch (error) {
+    console.error('get /merchant/products error:', error);
+    return res.status(500).json({
+      error: 'Failed to load products',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// PATCH /merchant/products/:id — update product fields (only for merchant's own products)
+app.patch('/merchant/products/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+
+    const { data: product, error: productError } = await supabase
+      .from('products')
+      .select('id, store_id')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (productError) {
+      console.error('merchant products find error:', productError);
+      throw new Error(productError.message || 'Failed to load product');
+    }
+
+    if (!product) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('merchant_id')
+      .eq('id', product.store_id)
+      .maybeSingle();
+
+    if (storeError) {
+      console.error('merchant products store check error:', storeError);
+      throw new Error(storeError.message || 'Failed to verify store ownership');
+    }
+
+    if (!store || store.merchant_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Cannot modify this product' });
+    }
+
+    const { name, description, price, is_available, is_featured, image_url, category_id, unit } = req.body || {};
+
+    const update = {};
+    if (name !== undefined) update.name = String(name).trim();
+    if (description !== undefined) update.description = description ? String(description).trim() : null;
+    if (price !== undefined && price !== null && price !== '') {
+      update.price = Number(price);
+    }
+    if (is_available !== undefined) update.is_available = !!is_available;
+    if (is_featured !== undefined) update.is_featured = !!is_featured;
+    if (image_url !== undefined) update.image_url = image_url ? String(image_url).trim() : null;
+    if (category_id !== undefined) update.category_id = category_id || null;
+    if (unit !== undefined) update.unit = unit === 'kg' ? 'kg' : 'item';
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({
+        error: 'No fields to update',
+        details: 'Provide at least one updatable field',
+      });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('products')
+      .update(update)
+      .eq('id', id)
+      .select('id, store_id, name, description, price, unit, is_available, is_featured, image_url')
+      .single();
+
+    if (updateError) {
+      console.error('merchant products update error:', updateError);
+      throw new Error(updateError.message || 'Failed to update product');
+    }
+
+    return res.json(updated);
+  } catch (error) {
+    console.error('patch /merchant/products/:id error:', error);
+    return res.status(500).json({
+      error: 'Failed to update product',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// GET /merchant/stores — list stores for current merchant (for dashboard)
+app.get('/merchant/stores', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { data, error } = await supabase
+      .from('stores')
+      .select('id, store_name, logo, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country')
+      .eq('merchant_id', req.userId)
+      .eq('is_active', true)
+      .order('created_at', { ascending: false });
+    if (error) throw new Error(error.message || 'Failed to load stores');
+    return res.json({ stores: data || [] });
+  } catch (error) {
+    console.error('get /merchant/stores error:', error);
+    return res.status(500).json({
+      error: 'Failed to load stores',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// PATCH /merchant/stores/:id — update store (only merchant's own store)
+app.patch('/merchant/stores/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('id, merchant_id')
+      .eq('id', id)
+      .maybeSingle();
+    if (storeError || !store || store.merchant_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Store not found or access denied' });
+    }
+    const {
+      store_name,
+      logo,
+      description,
+      phone,
+      email,
+      address_line1,
+      address_line2,
+      city,
+      state_province,
+      postal_code,
+      country,
+    } = req.body || {};
+    const update = {};
+    if (store_name !== undefined && String(store_name).trim()) update.store_name = String(store_name).trim();
+    if (logo !== undefined) update.logo = logo ? String(logo).trim() : null;
+    if (description !== undefined) update.description = description ? String(description).trim() : null;
+    if (phone !== undefined) update.phone = phone ? String(phone).trim() : null;
+    if (email !== undefined) update.email = email ? String(email).trim() : null;
+    if (address_line1 !== undefined && String(address_line1).trim()) update.address_line1 = String(address_line1).trim();
+    if (address_line2 !== undefined) update.address_line2 = address_line2 ? String(address_line2).trim() : null;
+    if (city !== undefined && String(city).trim()) update.city = String(city).trim();
+    if (state_province !== undefined) update.state_province = state_province ? String(state_province).trim() : null;
+    if (postal_code !== undefined) update.postal_code = postal_code ? String(postal_code).trim() : null;
+    if (country !== undefined) update.country = country ? String(country).trim() : null;
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ error: 'No fields to update', details: 'Provide at least one updatable field' });
+    }
+    const { data: updated, error: updateError } = await supabase
+      .from('stores')
+      .update(update)
+      .eq('id', id)
+      .select()
+      .single();
+    if (updateError) throw new Error(updateError.message || 'Failed to update store');
+    return res.json(updated);
+  } catch (error) {
+    console.error('patch /merchant/stores/:id error:', error);
+    return res.status(500).json({
+      error: 'Failed to update store',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// GET /merchant/stores/:storeId/categories — product categories for a store
+app.get('/merchant/stores/:storeId/categories', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { storeId } = req.params;
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('merchant_id')
+      .eq('id', storeId)
+      .maybeSingle();
+    if (storeError || !store || store.merchant_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Store not found or access denied' });
+    }
+    const { data, error } = await supabase
+      .from('product_categories')
+      .select('id, name, display_order')
+      .eq('store_id', storeId)
+      .eq('is_active', true)
+      .order('display_order', { ascending: true });
+    if (error) throw new Error(error.message || 'Failed to load categories');
+    return res.json({ categories: data || [] });
+  } catch (error) {
+    console.error('get /merchant/stores/:storeId/categories error:', error);
+    return res.status(500).json({
+      error: 'Failed to load categories',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /merchant/products — create product (store must belong to merchant)
+app.post('/merchant/products', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { store_id, name, description, price, category_id, unit, image_url, is_available, is_featured } = req.body || {};
+    if (!store_id || !name || price === undefined || price === null) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        details: 'store_id, name, and price are required',
+      });
+    }
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('id')
+      .eq('id', store_id)
+      .eq('merchant_id', req.userId)
+      .maybeSingle();
+    if (storeError || !store) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Store not found or access denied' });
+    }
+    const insert = {
+      store_id,
+      name: String(name).trim(),
+      description: description ? String(description).trim() : null,
+      price: Number(price),
+      unit: unit === 'kg' ? 'kg' : 'item',
+      image_url: image_url ? String(image_url).trim() : null,
+      is_available: is_available !== false,
+      is_featured: !!is_featured,
+    };
+    if (category_id) insert.category_id = category_id;
+    const { data: created, error: insertError } = await supabase
+      .from('products')
+      .insert(insert)
+      .select('id, store_id, name, description, price, unit, image_url, is_available, is_featured, category_id')
+      .single();
+    if (insertError) {
+      console.error('post /merchant/products error:', insertError);
+      throw new Error(insertError.message || 'Failed to create product');
+    }
+    return res.status(201).json(created);
+  } catch (error) {
+    console.error('post /merchant/products error:', error);
+    return res.status(500).json({
+      error: 'Failed to create product',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// DELETE /merchant/products/:id — delete product (only for merchant's own products)
+app.delete('/merchant/products/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { data: product, error: productError } = await supabase
+      .from('products')
+      .select('id, store_id')
+      .eq('id', id)
+      .maybeSingle();
+    if (productError) throw new Error(productError.message || 'Failed to load product');
+    if (!product) return res.status(404).json({ error: 'Product not found' });
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('merchant_id')
+      .eq('id', product.store_id)
+      .maybeSingle();
+    if (storeError || !store || store.merchant_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Cannot delete this product' });
+    }
+    const { error: deleteError } = await supabase.from('products').delete().eq('id', id);
+    if (deleteError) {
+      console.error('delete /merchant/products error:', deleteError);
+      throw new Error(deleteError.message || 'Failed to delete product');
+    }
+    return res.status(204).send();
+  } catch (error) {
+    console.error('delete /merchant/products/:id error:', error);
+    return res.status(500).json({
+      error: 'Failed to delete product',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // POST /auth/login-password { phone, password }
 app.post('/auth/login-password', async (req, res) => {
   try {
@@ -573,6 +919,50 @@ app.get('/users/me/orders', requireAuth, async (req, res) => {
     console.error('get orders error:', error);
     return res.status(500).json({
       error: 'Failed to load orders',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// PATCH /orders/:id — merchant updates order status (confirm, preparing, ready, cancelled)
+app.patch('/orders/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { status } = req.body || {};
+    const allowed = ['confirmed', 'preparing', 'ready', 'cancelled'];
+    if (!status || !allowed.includes(status)) {
+      return res.status(400).json({
+        error: 'Invalid status',
+        details: `status must be one of: ${allowed.join(', ')}`,
+      });
+    }
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .select('id, store_id')
+      .eq('id', id)
+      .maybeSingle();
+    if (orderError || !order) return res.status(404).json({ error: 'Order not found' });
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('merchant_id')
+      .eq('id', order.store_id)
+      .maybeSingle();
+    if (storeError || !store || store.merchant_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Cannot update this order' });
+    }
+    const { data: updated, error: updateError } = await supabase
+      .from('orders')
+      .update({ status })
+      .eq('id', id)
+      .select('id, order_number, status')
+      .single();
+    if (updateError) throw new Error(updateError.message || 'Failed to update order');
+    return res.json(updated);
+  } catch (error) {
+    console.error('patch /orders/:id error:', error);
+    return res.status(500).json({
+      error: 'Failed to update order',
       details: error.message || 'Please try again later',
     });
   }
