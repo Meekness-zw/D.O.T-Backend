@@ -427,6 +427,50 @@ export async function upsertMerchantOnboarding({
     await supabase.from('stores').update({ logo: url }).eq('id', storeId);
   }
 
+  // Seed default product categories tailored to the business type when the store is first created
+  // or when it has no categories yet. This lets the app show relevant sections (e.g. Bakery, Groceries).
+  const { data: existingCategories, error: categoriesError } = await supabase
+    .from('product_categories')
+    .select('id')
+    .eq('store_id', storeId)
+    .limit(1);
+  if (categoriesError) {
+    console.error('merchant onboarding categories check error:', categoriesError);
+  } else if (!existingCategories || existingCategories.length === 0) {
+    const type = String(businessType).toLowerCase();
+    let categoriesToInsert = [];
+
+    if (type === 'bakery') {
+      categoriesToInsert = ['Bread', 'Pastries', 'Cakes', 'Cookies', 'Drinks'];
+    } else if (type === 'grocery' || type === 'grocery / retail') {
+      categoriesToInsert = ['Fruits & Vegetables', 'Meat & Poultry', 'Dairy & Eggs', 'Pantry Staples', 'Snacks & Drinks'];
+    } else if (type === 'pharmacy') {
+      categoriesToInsert = ['Prescription Medicines', 'Over-the-counter', 'Vitamins & Supplements', 'Personal Care', 'Baby & Kids'];
+    } else if (type === 'restaurant' || type === 'restaurant / food') {
+      categoriesToInsert = ['Starters', 'Mains', 'Sides', 'Drinks', 'Desserts'];
+    } else if (type === 'hardware') {
+      categoriesToInsert = ['Tools', 'Building Materials', 'Plumbing', 'Electrical', 'Paint & Finishes'];
+    } else {
+      categoriesToInsert = ['Featured', 'Best Sellers', 'New Arrivals'];
+    }
+
+    const rows = categoriesToInsert.map((name, index) => ({
+      store_id: storeId,
+      name,
+      display_order: index,
+      is_active: true,
+    }));
+
+    if (rows.length > 0) {
+      const { error: insertCategoriesError } = await supabase
+        .from('product_categories')
+        .insert(rows);
+      if (insertCategoriesError) {
+        console.error('merchant onboarding categories insert error:', insertCategoriesError);
+      }
+    }
+  }
+
   // Merchant documents (optional except owner_id + proof_of_address should be enforced by UI)
   if (ownerIdBase64) {
     const ext = extForMime(parseDataUrl(ownerIdBase64)?.mime);

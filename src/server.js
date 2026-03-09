@@ -337,6 +337,44 @@ app.post('/merchants/onboarding', requireAuth, async (req, res) => {
   }
 });
 
+// PATCH /merchant/profile — update merchant business_type (what the shop does)
+app.patch('/merchant/profile', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { business_type } = req.body || {};
+    if (!business_type || !String(business_type).trim()) {
+      return res.status(400).json({
+        error: 'business_type is required',
+        details: 'Provide a non-empty business_type string',
+      });
+    }
+
+    const { data: merchantRow, error: merchantError } = await supabase
+      .from('merchants')
+      .update({ business_type: String(business_type).trim() })
+      .eq('id', req.userId)
+      .select('id, business_name, business_type, is_active')
+      .maybeSingle();
+
+    if (merchantError) {
+      console.error('patch /merchant/profile error:', merchantError);
+      throw new Error(merchantError.message || 'Failed to update merchant profile');
+    }
+
+    if (!merchantRow) {
+      return res.status(404).json({ error: 'Merchant not found' });
+    }
+
+    return res.json(merchantRow);
+  } catch (error) {
+    console.error('patch /merchant/profile error:', error);
+    return res.status(500).json({
+      error: 'Failed to update merchant profile',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // GET /merchant/products — list products for stores owned by current merchant
 app.get('/merchant/products', requireAuth, async (req, res) => {
   try {
