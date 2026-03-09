@@ -607,26 +607,88 @@ app.patch('/merchant/stores/:id', requireAuth, async (req, res) => {
 });
 
 // GET /merchant/stores/:storeId/categories — product categories for a store
+// If no categories exist yet, seed sensible defaults based on merchant.business_type.
 app.get('/merchant/stores/:storeId/categories', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
     const { storeId } = req.params;
+
     const { data: store, error: storeError } = await supabase
       .from('stores')
-      .select('merchant_id')
+      .select('id, merchant_id')
       .eq('id', storeId)
       .maybeSingle();
+
     if (storeError || !store || store.merchant_id !== req.userId) {
       return res.status(403).json({ error: 'Forbidden', details: 'Store not found or access denied' });
     }
-    const { data, error } = await supabase
+
+    let { data: categories, error } = await supabase
       .from('product_categories')
       .select('id, name, display_order')
       .eq('store_id', storeId)
       .eq('is_active', true)
       .order('display_order', { ascending: true });
+
     if (error) throw new Error(error.message || 'Failed to load categories');
-    return res.json({ categories: data || [] });
+
+    if (!categories || categories.length === 0) {
+      // Look up merchant business_type and seed default categories for this type of shop.
+      const { data: merchantRow, error: merchantError } = await supabase
+        .from('merchants')
+        .select('business_type')
+        .eq('id', store.merchant_id)
+        .maybeSingle();
+
+      if (merchantError) {
+        console.error('merchant categories business_type error:', merchantError);
+      } else {
+        const type = String(merchantRow?.business_type || '').toLowerCase();
+        let categoriesToInsert = [];
+
+        if (type === 'bakery') {
+          categoriesToInsert = ['Bread', 'Pastries', 'Cakes', 'Cookies', 'Drinks'];
+        } else if (type === 'grocery' || type === 'grocery / retail') {
+          categoriesToInsert = ['Fruits & Vegetables', 'Meat & Poultry', 'Dairy & Eggs', 'Pantry Staples', 'Snacks & Drinks'];
+        } else if (type === 'pharmacy') {
+          categoriesToInsert = ['Prescription Medicines', 'Over-the-counter', 'Vitamins & Supplements', 'Personal Care', 'Baby & Kids'];
+        } else if (type === 'restaurant' || type === 'restaurant / food') {
+          categoriesToInsert = ['Starters', 'Mains', 'Sides', 'Drinks', 'Desserts'];
+        } else if (type === 'hardware' || type === 'hardware store') {
+          categoriesToInsert = ['Tools', 'Building Materials', 'Plumbing', 'Electrical', 'Paint & Finishes'];
+        } else {
+          categoriesToInsert = ['Featured', 'Best Sellers', 'New Arrivals'];
+        }
+
+        const rows = categoriesToInsert.map((name, index) => ({
+          store_id: storeId,
+          name,
+          display_order: index,
+          is_active: true,
+        }));
+
+        if (rows.length > 0) {
+          const { error: insertError } = await supabase
+            .from('product_categories')
+            .insert(rows);
+          if (insertError) {
+            console.error('merchant categories seed insert error:', insertError);
+          } else {
+            const { data: seeded, error: reloadError } = await supabase
+              .from('product_categories')
+              .select('id, name, display_order')
+              .eq('store_id', storeId)
+              .eq('is_active', true)
+              .order('display_order', { ascending: true });
+            if (!reloadError) {
+              categories = seeded || [];
+            }
+          }
+        }
+      }
+    }
+
+    return res.json({ categories: categories || [] });
   } catch (error) {
     console.error('get /merchant/stores/:storeId/categories error:', error);
     return res.status(500).json({
@@ -681,6 +743,74 @@ app.post('/merchant/products', requireAuth, async (req, res) => {
     console.error('post /merchant/products error:', error);
     return res.status(500).json({
       error: 'Failed to create product',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /merchant/products/upload-image — upload a product image and return its URL
+app.post('/merchant/products/upload-image', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { store_id, image_base64 } = req.body || {};
+
+    if (!store_id || !image_base64) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        details: 'store_id and image_base64 are required',
+      });
+    }
+
+    // Ensure store belongs to this merchant
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('id, merchant_id')
+      .eq('id', store_id)
+      .maybeSingle();
+
+    if (storeError || !store || store.merchant_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Store not found or access denied' });
+    }
+
+    // Parse data URL
+    const match = String(image_base64).match(/^data:([^;]+);base64,(.+)$/);
+    if (!match) {
+      return res.status(400).json({ error: 'Invalid image payload', details: 'Expected base64 data URL' });
+    }
+    const mime = match[1];
+    const base64 = match[2];
+    const buffer = Buffer.from(base64, 'base64');
+    const ext = mime.includes('png') ? 'png' : mime.includes('jpeg') || mime.includes('jpg') ? 'jpg' : 'bin';
+
+    const filename = `${store_id}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('product-images')
+      .upload(filename, buffer, {
+        contentType: mime,
+        upsert: true,
+      });
+
+    if (uploadError) {
+      console.error('product image upload error:', uploadError);
+      throw new Error(uploadError.message || 'Failed to upload image');
+    }
+
+    const { data: urlData } = supabase.storage.from('product-images').getPublicUrl(filename);
+    const imageUrl = urlData?.publicUrl || null;
+
+    if (!imageUrl) {
+      return res.status(500).json({
+        error: 'Failed to resolve image URL',
+        details: 'Upload succeeded but URL could not be resolved',
+      });
+    }
+
+    return res.json({ image_url: imageUrl });
+  } catch (error) {
+    console.error('post /merchant/products/upload-image error:', error);
+    return res.status(500).json({
+      error: 'Failed to upload image',
       details: error.message || 'Please try again later',
     });
   }
