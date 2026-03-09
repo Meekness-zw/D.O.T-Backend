@@ -816,6 +816,260 @@ app.post('/merchant/products/upload-image', requireAuth, async (req, res) => {
   }
 });
 
+// GET /public/promotions — list active promo deals (for customer app home screen)
+app.get('/public/promotions', async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const now = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from('promotions')
+      .select(
+        `
+        id,
+        store_id,
+        title,
+        description,
+        tag,
+        image_url,
+        is_active,
+        starts_at,
+        ends_at,
+        stores (
+          store_name,
+          logo,
+          city
+        )
+      `,
+      )
+      .eq('is_active', true)
+      .or('starts_at.is.null,starts_at.lte.' + now)
+      .or('ends_at.is.null,ends_at.gte.' + now)
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    if (error) throw new Error(error.message || 'Failed to load promotions');
+
+    const deals = (data || []).map((p) => ({
+      id: p.id,
+      store_id: p.store_id,
+      title: p.title,
+      description: p.description,
+      tag: p.tag,
+      image_url: p.image_url,
+      store_name: p.stores?.store_name || null,
+      store_logo: p.stores?.logo || null,
+      store_city: p.stores?.city || null,
+      starts_at: p.starts_at,
+      ends_at: p.ends_at,
+    }));
+
+    return res.json({ promotions: deals });
+  } catch (error) {
+    console.error('get /public/promotions error:', error);
+    return res.status(500).json({
+      error: 'Failed to load promotions',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// GET /merchant/promotions — list promotions for stores owned by current merchant
+app.get('/merchant/promotions', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    const { data: stores, error: storesError } = await supabase
+      .from('stores')
+      .select('id')
+      .eq('merchant_id', req.userId)
+      .eq('is_active', true);
+
+    if (storesError) {
+      console.error('merchant promotions stores error:', storesError);
+      throw new Error(storesError.message || 'Failed to load stores for merchant');
+    }
+
+    const storeIds = Array.isArray(stores) ? stores.map((s) => s.id) : [];
+    if (storeIds.length === 0) {
+      return res.json({ promotions: [] });
+    }
+
+    const { data, error } = await supabase
+      .from('promotions')
+      .select('id, store_id, title, description, tag, image_url, is_active, starts_at, ends_at')
+      .in('store_id', storeIds)
+      .order('created_at', { ascending: false });
+
+    if (error) throw new Error(error.message || 'Failed to load promotions');
+
+    return res.json({ promotions: data || [] });
+  } catch (error) {
+    console.error('get /merchant/promotions error:', error);
+    return res.status(500).json({
+      error: 'Failed to load promotions',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /merchant/promotions — create a new promotion for a store
+app.post('/merchant/promotions', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { store_id, title, description, tag, image_url, is_active, starts_at, ends_at } = req.body || {};
+
+    if (!store_id || !title) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        details: 'store_id and title are required',
+      });
+    }
+
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('id, merchant_id')
+      .eq('id', store_id)
+      .maybeSingle();
+
+    if (storeError || !store || store.merchant_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Store not found or access denied' });
+    }
+
+    const insert = {
+      store_id,
+      title: String(title).trim(),
+      description: description ? String(description).trim() : null,
+      tag: tag ? String(tag).trim() : null,
+      image_url: image_url ? String(image_url).trim() : null,
+      is_active: is_active !== false,
+      starts_at: starts_at || null,
+      ends_at: ends_at || null,
+    };
+
+    const { data, error } = await supabase
+      .from('promotions')
+      .insert(insert)
+      .select('id, store_id, title, description, tag, image_url, is_active, starts_at, ends_at')
+      .single();
+
+    if (error) throw new Error(error.message || 'Failed to create promotion');
+
+    return res.status(201).json(data);
+  } catch (error) {
+    console.error('post /merchant/promotions error:', error);
+    return res.status(500).json({
+      error: 'Failed to create promotion',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// PATCH /merchant/promotions/:id — update an existing promotion
+app.patch('/merchant/promotions/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+
+    const { data: promo, error: promoError } = await supabase
+      .from('promotions')
+      .select('id, store_id')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (promoError || !promo) {
+      return res.status(404).json({ error: 'Promotion not found' });
+    }
+
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('merchant_id')
+      .eq('id', promo.store_id)
+      .maybeSingle();
+
+    if (storeError || !store || store.merchant_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Cannot modify this promotion' });
+    }
+
+    const { title, description, tag, image_url, is_active, starts_at, ends_at } = req.body || {};
+    const update = {};
+    if (title !== undefined && String(title).trim()) update.title = String(title).trim();
+    if (description !== undefined) update.description = description ? String(description).trim() : null;
+    if (tag !== undefined) update.tag = tag ? String(tag).trim() : null;
+    if (image_url !== undefined) update.image_url = image_url ? String(image_url).trim() : null;
+    if (is_active !== undefined) update.is_active = !!is_active;
+    if (starts_at !== undefined) update.starts_at = starts_at || null;
+    if (ends_at !== undefined) update.ends_at = ends_at || null;
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({
+        error: 'No fields to update',
+        details: 'Provide at least one updatable field',
+      });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('promotions')
+      .update(update)
+      .eq('id', id)
+      .select('id, store_id, title, description, tag, image_url, is_active, starts_at, ends_at')
+      .single();
+
+    if (updateError) throw new Error(updateError.message || 'Failed to update promotion');
+
+    return res.json(updated);
+  } catch (error) {
+    console.error('patch /merchant/promotions/:id error:', error);
+    return res.status(500).json({
+      error: 'Failed to update promotion',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// DELETE /merchant/promotions/:id — delete a promotion
+app.delete('/merchant/promotions/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+
+    const { data: promo, error: promoError } = await supabase
+      .from('promotions')
+      .select('id, store_id')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (promoError || !promo) {
+      return res.status(404).json({ error: 'Promotion not found' });
+    }
+
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('merchant_id')
+      .eq('id', promo.store_id)
+      .maybeSingle();
+
+    if (storeError || !store || store.merchant_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Cannot delete this promotion' });
+    }
+
+    const { error: deleteError } = await supabase
+      .from('promotions')
+      .delete()
+      .eq('id', id);
+
+    if (deleteError) throw new Error(deleteError.message || 'Failed to delete promotion');
+
+    return res.status(204).send();
+  } catch (error) {
+    console.error('delete /merchant/promotions/:id error:', error);
+    return res.status(500).json({
+      error: 'Failed to delete promotion',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // DELETE /merchant/products/:id — delete product (only for merchant's own products)
 app.delete('/merchant/products/:id', requireAuth, async (req, res) => {
   try {

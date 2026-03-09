@@ -162,6 +162,21 @@ CREATE TABLE IF NOT EXISTS products (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Store Promotions / Deals
+CREATE TABLE IF NOT EXISTS promotions (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  store_id UUID NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  description TEXT,
+  tag TEXT,
+  image_url TEXT,
+  is_active BOOLEAN DEFAULT TRUE,
+  starts_at TIMESTAMP WITH TIME ZONE,
+  ends_at TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- Merchant Settings
 CREATE TABLE IF NOT EXISTS merchant_settings (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -474,6 +489,11 @@ CREATE INDEX IF NOT EXISTS idx_wallet_transactions_created_at ON wallet_transact
 CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_is_read ON notifications(is_read);
 CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON notifications(created_at DESC);
+
+-- Promotions
+CREATE INDEX IF NOT EXISTS idx_promotions_store_id ON promotions(store_id);
+CREATE INDEX IF NOT EXISTS idx_promotions_is_active ON promotions(is_active);
+CREATE INDEX IF NOT EXISTS idx_promotions_time ON promotions(starts_at, ends_at);
 
 -- ============================================
 -- FUNCTIONS & TRIGGERS
