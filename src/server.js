@@ -533,7 +533,7 @@ app.get('/merchant/stores', requireAuth, async (req, res) => {
     if (!supabase) throw new Error('Server not configured');
     const { data, error } = await supabase
       .from('stores')
-      .select('id, store_name, logo, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country')
+      .select('id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country')
       .eq('merchant_id', req.userId)
       .eq('is_active', true)
       .order('created_at', { ascending: false });
@@ -564,6 +564,7 @@ app.patch('/merchant/stores/:id', requireAuth, async (req, res) => {
     const {
       store_name,
       logo,
+      banner_url,
       description,
       phone,
       email,
@@ -577,6 +578,7 @@ app.patch('/merchant/stores/:id', requireAuth, async (req, res) => {
     const update = {};
     if (store_name !== undefined && String(store_name).trim()) update.store_name = String(store_name).trim();
     if (logo !== undefined) update.logo = logo ? String(logo).trim() : null;
+    if (banner_url !== undefined) update.banner_url = banner_url ? String(banner_url).trim() : null;
     if (description !== undefined) update.description = description ? String(description).trim() : null;
     if (phone !== undefined) update.phone = phone ? String(phone).trim() : null;
     if (email !== undefined) update.email = email ? String(email).trim() : null;
@@ -679,6 +681,83 @@ app.post('/merchant/stores/:id/upload-logo', requireAuth, async (req, res) => {
     console.error('post /merchant/stores/:id/upload-logo error:', error);
     return res.status(500).json({
       error: 'Failed to upload logo',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /merchant/stores/:id/upload-banner — upload store banner image and return URL
+app.post('/merchant/stores/:id/upload-banner', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { image_base64 } = req.body || {};
+
+    if (!image_base64) {
+      return res.status(400).json({
+        error: 'Missing image_base64',
+        details: 'image_base64 is required',
+      });
+    }
+
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('id, merchant_id')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (storeError || !store || store.merchant_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Store not found or access denied' });
+    }
+
+    const match = String(image_base64).match(/^data:([^;]+);base64,(.+)$/);
+    if (!match) {
+      return res.status(400).json({ error: 'Invalid image payload', details: 'Expected base64 data URL' });
+    }
+    const mime = match[1];
+    const base64 = match[2];
+    const buffer = Buffer.from(base64, 'base64');
+    const ext = mime.includes('png') ? 'png' : mime.includes('jpeg') || mime.includes('jpg') ? 'jpg' : 'bin';
+
+    const filename = `stores/${id}/banner.${ext}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('store-logos')
+      .upload(filename, buffer, {
+        contentType: mime,
+        upsert: true,
+      });
+
+    if (uploadError) {
+      console.error('store banner upload error:', uploadError);
+      throw new Error(uploadError.message || 'Failed to upload banner');
+    }
+
+    const { data: urlData } = supabase.storage.from('store-logos').getPublicUrl(filename);
+    const bannerUrl = urlData?.publicUrl || null;
+
+    if (!bannerUrl) {
+      return res.status(500).json({
+        error: 'Failed to resolve banner URL',
+        details: 'Upload succeeded but URL could not be resolved',
+      });
+    }
+
+    const { error: updateError } = await supabase
+      .from('stores')
+      .update({ banner_url: bannerUrl })
+      .eq('id', id);
+
+    if (updateError) {
+      console.error('store banner update error:', updateError);
+      throw new Error(updateError.message || 'Failed to update store banner');
+    }
+
+    return res.json({ banner_url: bannerUrl });
+  } catch (error) {
+    console.error('post /merchant/stores/:id/upload-banner error:', error);
+    return res.status(500).json({
+      error: 'Failed to upload banner',
       details: error.message || 'Please try again later',
     });
   }

@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS stores (
   merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
   store_name TEXT NOT NULL,
   logo TEXT,
+  banner_url TEXT,
   description TEXT,
   phone TEXT,
   email TEXT,
