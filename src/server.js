@@ -929,7 +929,7 @@ app.post('/merchant/promotions/upload-image', requireAuth, async (req, res) => {
     const filename = `promotions/${store_id}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
 
     const { error: uploadError } = await supabase.storage
-      .from('product-images')
+      .from('promo-images')
       .upload(filename, buffer, {
         contentType: mime,
         upsert: true,
@@ -940,7 +940,7 @@ app.post('/merchant/promotions/upload-image', requireAuth, async (req, res) => {
       throw new Error(uploadError.message || 'Failed to upload image');
     }
 
-    const { data: urlData } = supabase.storage.from('product-images').getPublicUrl(filename);
+    const { data: urlData } = supabase.storage.from('promo-images').getPublicUrl(filename);
     const imageUrl = urlData?.publicUrl || null;
 
     if (!imageUrl) {
