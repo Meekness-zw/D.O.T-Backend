@@ -606,6 +606,84 @@ app.patch('/merchant/stores/:id', requireAuth, async (req, res) => {
   }
 });
 
+// POST /merchant/stores/:id/upload-logo — upload store logo and return URL
+app.post('/merchant/stores/:id/upload-logo', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { image_base64 } = req.body || {};
+
+    if (!image_base64) {
+      return res.status(400).json({
+        error: 'Missing image_base64',
+        details: 'image_base64 is required',
+      });
+    }
+
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('id, merchant_id')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (storeError || !store || store.merchant_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Store not found or access denied' });
+    }
+
+    const match = String(image_base64).match(/^data:([^;]+);base64,(.+)$/);
+    if (!match) {
+      return res.status(400).json({ error: 'Invalid image payload', details: 'Expected base64 data URL' });
+    }
+    const mime = match[1];
+    const base64 = match[2];
+    const buffer = Buffer.from(base64, 'base64');
+    const ext = mime.includes('png') ? 'png' : mime.includes('jpeg') || mime.includes('jpg') ? 'jpg' : 'bin';
+
+    const filename = `stores/${id}/logo.${ext}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('store-logos')
+      .upload(filename, buffer, {
+        contentType: mime,
+        upsert: true,
+      });
+
+    if (uploadError) {
+      console.error('store logo upload error:', uploadError);
+      throw new Error(uploadError.message || 'Failed to upload logo');
+    }
+
+    const { data: urlData } = supabase.storage.from('store-logos').getPublicUrl(filename);
+    const logoUrl = urlData?.publicUrl || null;
+
+    if (!logoUrl) {
+      return res.status(500).json({
+        error: 'Failed to resolve logo URL',
+        details: 'Upload succeeded but URL could not be resolved',
+      });
+    }
+
+    // Save on store
+    const { error: updateError } = await supabase
+      .from('stores')
+      .update({ logo: logoUrl })
+      .eq('id', id);
+
+    if (updateError) {
+      console.error('store logo update error:', updateError);
+      throw new Error(updateError.message || 'Failed to update store logo');
+    }
+
+    return res.json({ logo_url: logoUrl });
+  } catch (error) {
+    console.error('post /merchant/stores/:id/upload-logo error:', error);
+    return res.status(500).json({
+      error: 'Failed to upload logo',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // GET /merchant/stores/:storeId/categories — product categories for a store
 // If no categories exist yet, seed sensible defaults based on merchant.business_type.
 app.get('/merchant/stores/:storeId/categories', requireAuth, async (req, res) => {
@@ -809,6 +887,72 @@ app.post('/merchant/products/upload-image', requireAuth, async (req, res) => {
     return res.json({ image_url: imageUrl });
   } catch (error) {
     console.error('post /merchant/products/upload-image error:', error);
+    return res.status(500).json({
+      error: 'Failed to upload image',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /merchant/promotions/upload-image — upload a promo image and return its URL
+app.post('/merchant/promotions/upload-image', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { store_id, image_base64 } = req.body || {};
+
+    if (!store_id || !image_base64) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        details: 'store_id and image_base64 are required',
+      });
+    }
+
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('id, merchant_id')
+      .eq('id', store_id)
+      .maybeSingle();
+
+    if (storeError || !store || store.merchant_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Store not found or access denied' });
+    }
+
+    const match = String(image_base64).match(/^data:([^;]+);base64,(.+)$/);
+    if (!match) {
+      return res.status(400).json({ error: 'Invalid image payload', details: 'Expected base64 data URL' });
+    }
+    const mime = match[1];
+    const base64 = match[2];
+    const buffer = Buffer.from(base64, 'base64');
+    const ext = mime.includes('png') ? 'png' : mime.includes('jpeg') || mime.includes('jpg') ? 'jpg' : 'bin';
+
+    const filename = `promotions/${store_id}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('product-images')
+      .upload(filename, buffer, {
+        contentType: mime,
+        upsert: true,
+      });
+
+    if (uploadError) {
+      console.error('promo image upload error:', uploadError);
+      throw new Error(uploadError.message || 'Failed to upload image');
+    }
+
+    const { data: urlData } = supabase.storage.from('product-images').getPublicUrl(filename);
+    const imageUrl = urlData?.publicUrl || null;
+
+    if (!imageUrl) {
+      return res.status(500).json({
+        error: 'Failed to resolve image URL',
+        details: 'Upload succeeded but URL could not be resolved',
+      });
+    }
+
+    return res.json({ image_url: imageUrl });
+  } catch (error) {
+    console.error('post /merchant/promotions/upload-image error:', error);
     return res.status(500).json({
       error: 'Failed to upload image',
       details: error.message || 'Please try again later',
