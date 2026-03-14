@@ -1,7 +1,7 @@
 import 'dotenv/config.js';
 import express from 'express';
 import cors from 'cors';
-import { sendOtpToPhone, verifyPhoneOtp, loginWithPassword } from './authService.js';
+import { sendOtpToPhone, verifyPhoneOtp, loginWithPassword, checkPhoneRegistered } from './authService.js';
 import { ensureUserProfile, getProfile, updateProfile, uploadProfilePhoto } from './userService.js';
 import { getOrdersForUser, getWalletTransactionsForUser, getPaymentsForUser, getFullUserMe, getMerchantDashboardStats } from './historyService.js';
 import { createPesepayTransaction, handlePesepayCallback } from './paymentService.js';
@@ -305,8 +305,18 @@ app.post('/merchants/onboarding', requireAuth, async (req, res) => {
       phone,
       email,
       address,
+      address_line2,
+      city,
+      state_province,
+      postal_code,
+      country,
       latitude,
       longitude,
+      description,
+      operating_hours,
+      is_open,
+      business_registration_number,
+      tax_id,
       storeLogoBase64,
       ownerIdBase64,
       businessCertificateBase64,
@@ -322,8 +332,18 @@ app.post('/merchants/onboarding', requireAuth, async (req, res) => {
       phone,
       email,
       address,
+      address_line2,
+      city,
+      state_province,
+      postal_code,
+      country,
       latitude,
       longitude,
+      description,
+      operating_hours,
+      is_open,
+      business_registration_number,
+      tax_id,
       storeLogoBase64,
       ownerIdBase64,
       businessCertificateBase64,
@@ -1411,6 +1431,24 @@ app.post('/auth/login-password', async (req, res) => {
       error: 'Failed to sign in',
       details: 'Please try again',
     });
+  }
+});
+
+// POST /auth/check-phone { phone } — check if phone is already registered (any role)
+app.post('/auth/check-phone', async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone || typeof phone !== 'string') {
+      return res.status(400).json({ error: 'Phone number is required' });
+    }
+    if (!phone.startsWith('+') || phone.length < 10) {
+      return res.status(400).json({ error: 'Invalid phone number format' });
+    }
+    const result = await checkPhoneRegistered(phone);
+    return res.json(result);
+  } catch (error) {
+    console.error('check-phone error:', error);
+    return res.status(500).json({ error: error.message || 'Check failed' });
   }
 });
 

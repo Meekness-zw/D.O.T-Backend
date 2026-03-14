@@ -154,6 +154,24 @@ export async function verifyPhoneOtp({ phone, token, isSignUp = false, password 
 }
 
 /**
+ * Check if a phone number is already registered (exists in Supabase Auth).
+ * Returns { registered: true, role } or { registered: false }. Role comes from user_profiles.
+ */
+export async function checkPhoneRegistered(phone) {
+  if (!phone || typeof phone !== 'string') {
+    return { registered: false };
+  }
+  const user = await findSupabaseUserByPhone(phone);
+  if (!user) return { registered: false };
+  const { data: profile } = await supabaseAdmin
+    .from('user_profiles')
+    .select('role')
+    .eq('id', user.id)
+    .maybeSingle();
+  return { registered: true, role: profile?.role ?? null };
+}
+
+/**
  * Find an existing Supabase Auth user by phone. Returns the user or null.
  */
 async function findSupabaseUserByPhone(phone) {

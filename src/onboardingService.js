@@ -340,8 +340,18 @@ export async function upsertMerchantOnboarding({
   phone,
   email,
   address,
+  address_line2,
+  city,
+  state_province,
+  postal_code,
+  country,
   latitude,
   longitude,
+  description,
+  operating_hours,
+  is_open,
+  business_registration_number,
+  tax_id,
   storeLogoBase64,
   ownerIdBase64,
   businessCertificateBase64,
@@ -355,7 +365,6 @@ export async function upsertMerchantOnboarding({
   if (!address || !String(address).trim()) throw new Error('address is required');
   if (latitude == null || longitude == null) throw new Error('latitude and longitude are required');
 
-  // Ensure profile role + save owner name on user_profiles
   const fallbackEmail = email ? String(email).trim() : `${userId}@merchant.local`;
 
   const { error: profileError } = await supabase.from('user_profiles').upsert(
@@ -369,20 +378,20 @@ export async function upsertMerchantOnboarding({
   );
   if (profileError) throw new Error(profileError.message || 'Failed to update user profile');
 
-  const { error: merchantError } = await supabase.from('merchants').upsert(
-    {
-      id: userId,
-      business_name: String(businessName).trim(),
-      business_type: String(businessType).trim(),
-      is_active: true,
-    },
-    { onConflict: 'id' },
-  );
+  const merchantPayload = {
+    id: userId,
+    business_name: String(businessName).trim(),
+    business_type: String(businessType).trim(),
+    is_active: true,
+  };
+  if (business_registration_number !== undefined) merchantPayload.business_registration_number = business_registration_number ? String(business_registration_number).trim() : null;
+  if (tax_id !== undefined) merchantPayload.tax_id = tax_id ? String(tax_id).trim() : null;
+
+  const { error: merchantError } = await supabase.from('merchants').upsert(merchantPayload, { onConflict: 'id' });
   if (merchantError) throw new Error(merchantError.message || 'Failed to save merchant');
 
-  const city = cityFromAddress(address);
+  const cityValue = (city && String(city).trim()) || cityFromAddress(address);
 
-  // Create a store (or update most recent store for this merchant)
   const { data: existingStore } = await supabase
     .from('stores')
     .select('id')
@@ -397,9 +406,19 @@ export async function upsertMerchantOnboarding({
     phone: phone ? String(phone).trim() : null,
     email: email ? String(email).trim() : null,
     address_line1: String(address).trim(),
-    city,
+    address_line2: address_line2 ? String(address_line2).trim() : null,
+    city: cityValue,
+    state_province: state_province ? String(state_province).trim() : null,
+    postal_code: postal_code ? String(postal_code).trim() : null,
+    country: (country && String(country).trim()) || 'Zimbabwe',
     latitude,
     longitude,
+    description: description ? String(description).trim() : null,
+    operating_hours:
+      operating_hours && typeof operating_hours === 'object' && Object.keys(operating_hours).length > 0
+        ? operating_hours
+        : null,
+    is_open: is_open !== false,
     is_active: true,
   };
 
