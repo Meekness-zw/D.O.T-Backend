@@ -543,7 +543,23 @@ app.get('/merchant/stores', requireAuth, async (req, res) => {
       .eq('is_active', true)
       .order('created_at', { ascending: false });
     if (error) throw new Error(error.message || 'Failed to load stores');
-    return res.json({ stores: data || [] });
+    const stores = data || [];
+    for (const store of stores) {
+      if (store.logo && typeof store.logo === 'string') {
+        const pathMatch = store.logo.match(/\/store-logos\/(.+)$/);
+        if (pathMatch) {
+          try {
+            const { data: signed, error: signErr } = await supabase.storage
+              .from('store-logos')
+              .createSignedUrl(pathMatch[1], 3600);
+            if (!signErr && signed?.signedUrl) store.logo = signed.signedUrl;
+          } catch (e) {
+            console.error('store logo signed url error:', e);
+          }
+        }
+      }
+    }
+    return res.json({ stores });
   } catch (error) {
     console.error('get /merchant/stores error:', error);
     return res.status(500).json({
@@ -1552,6 +1568,23 @@ app.get('/users/me', requireAuth, async (req, res) => {
     const data = await getFullUserMe(req.userId);
     if (!data) {
       return res.status(404).json({ error: 'User not found', details: 'No profile for this user' });
+    }
+    if (data.store?.logo && supabase) {
+      const publicUrl = data.store.logo;
+      const pathMatch = String(publicUrl).match(/\/store-logos\/(.+)$/);
+      if (pathMatch) {
+        const path = pathMatch[1];
+        try {
+          const { data: signed, error: signErr } = await supabase.storage
+            .from('store-logos')
+            .createSignedUrl(path, 3600);
+          if (!signErr && signed?.signedUrl) {
+            data.store.logo = signed.signedUrl;
+          }
+        } catch (e) {
+          console.error('store logo signed url error:', e);
+        }
+      }
     }
     return res.json(data);
   } catch (error) {
