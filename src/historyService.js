@@ -74,6 +74,7 @@ export async function getOrdersForUser(userId, options = {}) {
         store_id,
         stores ( store_name ),
         order_items (
+          product_id,
           product_name,
           quantity
         )
@@ -213,4 +214,195 @@ export async function getFullUserMe(userId) {
   }
 
   return result;
+}
+
+/**
+ * Dashboard stats for merchant: KPIs, revenue by day, best-selling products, category counts.
+ * All data from DB for the merchant's stores.
+ */
+export async function getMerchantDashboardStats(userId) {
+  if (!userId || !supabase) throw new Error('userId required and server must be configured');
+
+  const profile = await getProfile(userId);
+  if (profile?.role !== 'merchant') {
+    return {
+      totalSales: 0,
+      totalOrders: 0,
+      avgOrderValue: 0,
+      openOrders: 0,
+      revenueByDay: [],
+      bestProducts: [],
+      categoryCounts: [],
+    };
+  }
+
+  const { data: storeRows } = await supabase
+    .from('stores')
+    .select('id')
+    .eq('merchant_id', userId);
+  const storeIds = (storeRows || []).map((s) => s.id);
+  if (storeIds.length === 0) {
+    return {
+      totalSales: 0,
+      totalOrders: 0,
+      avgOrderValue: 0,
+      openOrders: 0,
+      revenueByDay: buildEmptyRevenueByDay(),
+      bestProducts: [],
+      categoryCounts: [],
+    };
+  }
+
+  const now = new Date();
+  const ninetyDaysAgo = new Date(now);
+  ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
+  const fromIso = ninetyDaysAgo.toISOString();
+
+  const { data: orders, error: ordersError } = await supabase
+    .from('orders')
+    .select(
+      `
+      id,
+      status,
+      total_amount,
+      created_at,
+      order_items (
+        product_id,
+        quantity
+      )
+    `
+    )
+    .in('store_id', storeIds)
+    .gte('created_at', fromIso)
+    .order('created_at', { ascending: false })
+    .limit(1000);
+
+  if (ordersError) throw new Error(ordersError.message || 'Failed to fetch orders for dashboard');
+  const orderList = orders || [];
+
+  const totalSales = orderList.reduce((sum, o) => sum + (Number(o.total_amount) || 0), 0);
+  const totalOrders = orderList.length;
+  const avgOrderValue = totalOrders > 0 ? totalSales / totalOrders : 0;
+  const openOrders = orderList.filter((o) =>
+    ['pending', 'confirmed', 'preparing'].includes(o.status)
+  ).length;
+
+  const revenueByDay = buildRevenueByDay(orderList);
+
+  const soldByProductId = {};
+  orderList.forEach((o) => {
+    const items = o.order_items || [];
+    items.forEach((item) => {
+      const pid = item.product_id;
+      if (pid) {
+        soldByProductId[pid] = (soldByProductId[pid] || 0) + (Number(item.quantity) || 0);
+      }
+    });
+  });
+
+  const { data: productsData, error: productsError } = await supabase
+    .from('products')
+    .select(
+      `
+      id,
+      name,
+      price,
+      is_available,
+      image_url,
+      product_categories ( name )
+    `
+    )
+    .in('store_id', storeIds);
+
+  if (productsError) throw new Error(productsError.message || 'Failed to fetch products for dashboard');
+  const productsList = productsData || [];
+
+  const categoryName = (p) =>
+    (Array.isArray(p.product_categories)
+      ? p.product_categories[0]?.name
+      : p.product_categories?.name) || 'Uncategorized';
+
+  const categoryCountsMap = {};
+  productsList.forEach((p) => {
+    const c = categoryName(p).trim() || 'Uncategorized';
+    categoryCountsMap[c] = (categoryCountsMap[c] || 0) + 1;
+  });
+  const categoryCounts = Object.entries(categoryCountsMap).map(([name, value]) => ({
+    name,
+    value,
+  }));
+
+  const bestProducts = productsList
+    .map((p) => ({
+      id: p.id,
+      name: p.name || '—',
+      price: p.price,
+      sold: soldByProductId[p.id] ?? 0,
+      is_available: p.is_available,
+      image_url: p.image_url,
+    }))
+    .sort((a, b) => b.sold - a.sold)
+    .slice(0, 8)
+    .map((p) => ({
+      id: p.id,
+      name: p.name,
+      price: p.price,
+      sold: p.sold,
+      soldLabel: p.sold > 0 ? `${p.sold} pcs` : '—',
+      status: p.is_available === false ? 'Out of Stock' : 'In Stock',
+      statusClass: p.is_available === false ? 'status-out' : 'status-in',
+      image: p.image_url,
+    }));
+
+  return {
+    totalSales,
+    totalOrders,
+    avgOrderValue,
+    openOrders,
+    revenueByDay,
+    bestProducts,
+    categoryCounts: categoryCounts.length
+      ? categoryCounts
+      : [{ name: 'No categories', value: 1 }],
+  };
+}
+
+function buildEmptyRevenueByDay() {
+  const days = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    days.push({
+      date: d.toISOString().slice(0, 10),
+      label: d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+      revenue: 0,
+      netIncome: 0,
+    });
+  }
+  return days;
+}
+
+function buildRevenueByDay(orders) {
+  const now = new Date();
+  const days = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    days.push({
+      date: d.toISOString().slice(0, 10),
+      label: d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+      revenue: 0,
+      netIncome: 0,
+    });
+  }
+  orders.forEach((o) => {
+    const created = (o.created_at || '').toString().slice(0, 10);
+    const amount = Number(o.total_amount) || 0;
+    const row = days.find((d) => d.date === created);
+    if (row) {
+      row.revenue += amount;
+      row.netIncome += amount * 0.7;
+    }
+  });
+  return days;
 }

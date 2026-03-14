@@ -3,7 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import { sendOtpToPhone, verifyPhoneOtp, loginWithPassword } from './authService.js';
 import { ensureUserProfile, getProfile, updateProfile, uploadProfilePhoto } from './userService.js';
-import { getOrdersForUser, getWalletTransactionsForUser, getPaymentsForUser, getFullUserMe } from './historyService.js';
+import { getOrdersForUser, getWalletTransactionsForUser, getPaymentsForUser, getFullUserMe, getMerchantDashboardStats } from './historyService.js';
 import { createPesepayTransaction, handlePesepayCallback } from './paymentService.js';
 import { verifyAccessToken } from './sessionToken.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
@@ -1684,6 +1684,20 @@ app.get('/users/me/payments', requireAuth, async (req, res) => {
     console.error('get payments error:', error);
     return res.status(500).json({
       error: 'Failed to load payments',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// GET /merchant/dashboard-stats — real-time KPIs, revenue by day, best products, categories (from DB)
+app.get('/merchant/dashboard-stats', requireAuth, async (req, res) => {
+  try {
+    const stats = await getMerchantDashboardStats(req.userId);
+    return res.json(stats);
+  } catch (error) {
+    console.error('get /merchant/dashboard-stats error:', error);
+    return res.status(500).json({
+      error: 'Failed to load dashboard stats',
       details: error.message || 'Please try again later',
     });
   }
