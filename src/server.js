@@ -337,23 +337,28 @@ app.post('/merchants/onboarding', requireAuth, async (req, res) => {
   }
 });
 
-// PATCH /merchant/profile — update merchant business_type (what the shop does)
+// PATCH /merchant/profile — update merchant (business_name, business_type, business_registration_number, tax_id)
 app.patch('/merchant/profile', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
-    const { business_type } = req.body || {};
-    if (!business_type || !String(business_type).trim()) {
+    const { business_name, business_type, business_registration_number, tax_id } = req.body || {};
+    const update = {};
+    if (business_name !== undefined && String(business_name).trim()) update.business_name = String(business_name).trim();
+    if (business_type !== undefined) update.business_type = business_type ? String(business_type).trim() : null;
+    if (business_registration_number !== undefined) update.business_registration_number = business_registration_number ? String(business_registration_number).trim() : null;
+    if (tax_id !== undefined) update.tax_id = tax_id ? String(tax_id).trim() : null;
+    if (Object.keys(update).length === 0) {
       return res.status(400).json({
-        error: 'business_type is required',
-        details: 'Provide a non-empty business_type string',
+        error: 'No fields to update',
+        details: 'Provide at least one of: business_name, business_type, business_registration_number, tax_id',
       });
     }
 
     const { data: merchantRow, error: merchantError } = await supabase
       .from('merchants')
-      .update({ business_type: String(business_type).trim() })
+      .update(update)
       .eq('id', req.userId)
-      .select('id, business_name, business_type, is_active')
+      .select('id, business_name, business_type, business_registration_number, tax_id, is_active')
       .maybeSingle();
 
     if (merchantError) {
@@ -533,7 +538,7 @@ app.get('/merchant/stores', requireAuth, async (req, res) => {
     if (!supabase) throw new Error('Server not configured');
     const { data, error } = await supabase
       .from('stores')
-      .select('id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country')
+      .select('id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country, latitude, longitude, is_open')
       .eq('merchant_id', req.userId)
       .eq('is_active', true)
       .order('created_at', { ascending: false });
@@ -574,6 +579,9 @@ app.patch('/merchant/stores/:id', requireAuth, async (req, res) => {
       state_province,
       postal_code,
       country,
+      latitude,
+      longitude,
+      is_open,
     } = req.body || {};
     const update = {};
     if (store_name !== undefined && String(store_name).trim()) update.store_name = String(store_name).trim();
@@ -588,6 +596,9 @@ app.patch('/merchant/stores/:id', requireAuth, async (req, res) => {
     if (state_province !== undefined) update.state_province = state_province ? String(state_province).trim() : null;
     if (postal_code !== undefined) update.postal_code = postal_code ? String(postal_code).trim() : null;
     if (country !== undefined) update.country = country ? String(country).trim() : null;
+    if (latitude !== undefined && latitude !== null && latitude !== '') update.latitude = Number(latitude);
+    if (longitude !== undefined && longitude !== null && longitude !== '') update.longitude = Number(longitude);
+    if (is_open !== undefined) update.is_open = !!is_open;
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ error: 'No fields to update', details: 'Provide at least one updatable field' });
     }
