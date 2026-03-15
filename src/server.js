@@ -16,6 +16,7 @@ import {
 } from './onboardingService.js';
 import {
   getAdminStats,
+  getAdminStatsCharts,
   getAdminUsers,
   getAdminOrders,
   getAdminDeliveries,
@@ -2482,6 +2483,16 @@ app.get('/admin/stats', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('admin/stats error:', error);
     return res.status(500).json({ error: 'Failed to load stats', details: error.message || 'Try again later' });
+  }
+});
+
+app.get('/admin/stats/charts', requireAdmin, async (req, res) => {
+  try {
+    const charts = await getAdminStatsCharts();
+    return res.json(charts);
+  } catch (error) {
+    console.error('admin/stats/charts error:', error);
+    return res.status(500).json({ error: 'Failed to load chart data', details: error.message || 'Try again later' });
   }
 });
 

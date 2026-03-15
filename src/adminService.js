@@ -58,6 +58,54 @@ export async function getAdminStats() {
   };
 }
 
+/** Last 7 days: orders and signups per day for charts */
+export async function getAdminStatsCharts() {
+  if (!supabase) throw new Error('Server not configured');
+
+  const days = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    const start = new Date(d);
+    start.setUTCHours(0, 0, 0, 0);
+    const end = new Date(d);
+    end.setUTCHours(23, 59, 59, 999);
+    days.push({
+      date: start.toISOString().slice(0, 10),
+      label: start.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+      start: start.toISOString(),
+      end: end.toISOString(),
+    });
+  }
+
+  const ordersByDay = await Promise.all(
+    days.map(async (day) => {
+      const { count } = await supabase
+        .from('orders')
+        .select('*', { count: 'exact', head: true })
+        .gte('created_at', day.start)
+        .lte('created_at', day.end);
+      return { ...day, orders: count ?? 0 };
+    }),
+  );
+
+  const signupsByDay = await Promise.all(
+    days.map(async (day) => {
+      const { count } = await supabase
+        .from('user_profiles')
+        .select('*', { count: 'exact', head: true })
+        .gte('created_at', day.start)
+        .lte('created_at', day.end);
+      return { ...day, signups: count ?? 0 };
+    }),
+  );
+
+  return {
+    ordersByDay: ordersByDay.map(({ date, label, orders }) => ({ date, label, orders })),
+    signupsByDay: signupsByDay.map(({ date, label, signups }) => ({ date, label, signups })),
+  };
+}
+
 export async function getAdminUsers(options = {}) {
   if (!supabase) throw new Error('Server not configured');
   const { limit = 50, offset = 0, role, search } = options;
