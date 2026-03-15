@@ -560,7 +560,6 @@ app.get('/merchant/stores', requireAuth, async (req, res) => {
       .from('stores')
       .select('id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country, latitude, longitude, is_open')
       .eq('merchant_id', req.userId)
-      .eq('is_active', true)
       .order('created_at', { ascending: false });
     if (error) throw new Error(error.message || 'Failed to load stores');
     const stores = data || [];
@@ -2560,6 +2559,30 @@ app.get('/admin/merchants', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('admin/merchants error:', error);
     return res.status(500).json({ error: 'Failed to load merchants', details: error.message || 'Try again later' });
+  }
+});
+
+// PATCH /admin/merchants/:id — set merchant is_verified (admin only)
+app.patch('/admin/merchants/:id', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { is_verified } = req.body || {};
+    if (typeof is_verified !== 'boolean') {
+      return res.status(400).json({ error: 'Bad request', details: 'Body must include is_verified (boolean)' });
+    }
+    const { data, error } = await supabase
+      .from('merchants')
+      .update({ is_verified })
+      .eq('id', id)
+      .select('id, business_name, is_verified')
+      .maybeSingle();
+    if (error) throw new Error(error.message || 'Failed to update merchant');
+    if (!data) return res.status(404).json({ error: 'Merchant not found' });
+    return res.json(data);
+  } catch (error) {
+    console.error('PATCH admin/merchants error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to update merchant' });
   }
 });
 
