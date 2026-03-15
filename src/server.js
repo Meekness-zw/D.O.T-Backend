@@ -1125,6 +1125,7 @@ app.get('/public/promotions', async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
     const now = new Date().toISOString();
+    console.log('[PublicPromos] Request at', now);
 
     const { data, error } = await supabase
       .from('promotions')
@@ -1153,7 +1154,12 @@ app.get('/public/promotions', async (req, res) => {
       .order('created_at', { ascending: false })
       .limit(20);
 
-    if (error) throw new Error(error.message || 'Failed to load promotions');
+    if (error) {
+      console.error('[PublicPromos] Supabase error', { code: error.code, message: error.message, details: error.details });
+      throw new Error(error.message || 'Failed to load promotions');
+    }
+
+    console.log('[PublicPromos] Raw rows count:', Array.isArray(data) ? data.length : 0);
 
     const deals = (data || []).map((p) => ({
       id: p.id,
@@ -1169,6 +1175,8 @@ app.get('/public/promotions', async (req, res) => {
       starts_at: p.starts_at,
       ends_at: p.ends_at,
     }));
+
+    console.log('[PublicPromos] Returning deals count:', deals.length);
 
     return res.json({ promotions: deals });
   } catch (error) {
