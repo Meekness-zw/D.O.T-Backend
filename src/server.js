@@ -1,7 +1,7 @@
 import 'dotenv/config.js';
 import express from 'express';
 import cors from 'cors';
-import { sendOtpToPhone, verifyPhoneOtp, loginWithPassword, checkPhoneRegistered } from './authService.js';
+import { sendOtpToPhone, verifyPhoneOtp, loginWithPassword, checkPhoneRegistered, deleteUserById } from './authService.js';
 import { ensureUserProfile, getProfile, updateProfile, uploadProfilePhoto } from './userService.js';
 import { getOrdersForUser, getWalletTransactionsForUser, getPaymentsForUser, getFullUserMe, getMerchantDashboardStats } from './historyService.js';
 import { createPesepayTransaction, handlePesepayCallback } from './paymentService.js';
@@ -1668,6 +1668,20 @@ app.get('/users/me', requireAuth, async (req, res) => {
   }
 });
 
+// DELETE /users/me/account — permanently delete the current user's account (auth + profile + role data)
+app.delete('/users/me/account', requireAuth, async (req, res) => {
+  try {
+    await deleteUserById(req.userId);
+    return res.status(200).json({ success: true, message: 'Account deleted' });
+  } catch (error) {
+    console.error('delete account error:', error);
+    return res.status(500).json({
+      error: 'Failed to delete account',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // GET /users/me/orders — order history for current user (by role). Use ?role=customer|merchant|courier when user has multiple roles.
 app.get('/users/me/orders', requireAuth, async (req, res) => {
   try {
@@ -2222,6 +2236,12 @@ app.get('/users/me/payment-methods', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
 
+    // Ensure user has a customer row (multi-role: merchant+customer may have just switched)
+    const { error: upsertErr } = await supabase.from('customers').upsert({ id: req.userId }, { onConflict: 'id' });
+    if (upsertErr) {
+      console.warn('payment-methods: ensure customer row:', upsertErr.message);
+    }
+
     const { data, error } = await supabase
       .from('customer_payment_methods')
       .select('id, type, provider, last_four_digits, expiry_date, phone_country_code, phone_number, is_default, is_active, created_at, updated_at')
@@ -2230,7 +2250,10 @@ app.get('/users/me/payment-methods', requireAuth, async (req, res) => {
 
     if (error) {
       console.error('get payment-methods error:', error);
-      throw new Error(error.message || 'Failed to load payment methods');
+      return res.status(500).json({
+        error: 'Failed to load payment methods',
+        details: error.message || 'Database error',
+      });
     }
 
     return res.json({ paymentMethods: data || [] });

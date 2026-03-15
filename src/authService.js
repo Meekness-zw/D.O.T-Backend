@@ -316,3 +316,17 @@ export async function signOut() {
   if (!supabaseAdmin) return;
   await supabaseAdmin.auth.signOut();
 }
+
+/**
+ * Permanently delete an auth user by id (service role only).
+ * Supabase will remove the auth.users row; ensure DB FKs (e.g. user_profiles.id -> auth.users.id ON DELETE CASCADE) so profile/role data is removed.
+ */
+export async function deleteUserById(userId) {
+  if (!userId) throw new Error('User id is required');
+  if (!supabaseAdmin) throw new Error('Admin client not configured');
+  const { error } = await supabaseAdmin.auth.admin.deleteUser(userId);
+  if (error) {
+    console.error('deleteUserById error:', error);
+    throw new Error(error.message || 'Failed to delete account');
+  }
+}
