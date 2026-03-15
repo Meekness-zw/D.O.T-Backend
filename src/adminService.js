@@ -124,7 +124,28 @@ export async function getAdminUsers(options = {}) {
 
   const { data, error, count } = await query;
   if (error) throw new Error(error.message || 'Failed to fetch users');
-  return { users: data || [], total: count ?? 0 };
+  const users = data || [];
+
+  // Attach all roles from user_roles (multi-role support); fallback to profile.role
+  if (users.length > 0) {
+    const ids = users.map((u) => u.id);
+    const { data: roleRows } = await supabase
+      .from('user_roles')
+      .select('user_id, role')
+      .in('user_id', ids);
+    const rolesByUserId = new Map();
+    (roleRows || []).forEach((r) => {
+      if (!rolesByUserId.has(r.user_id)) rolesByUserId.set(r.user_id, []);
+      rolesByUserId.get(r.user_id).push(r.role);
+    });
+    users.forEach((u) => {
+      u.roles = rolesByUserId.get(u.id)?.length
+        ? rolesByUserId.get(u.id)
+        : (u.role ? [u.role] : []);
+    });
+  }
+
+  return { users, total: count ?? 0 };
 }
 
 export async function getAdminOrders(options = {}) {
