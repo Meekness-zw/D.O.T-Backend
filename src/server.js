@@ -32,6 +32,32 @@ const supabase = supabaseAdmin;
 const PORT = process.env.PORT || 4000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
+// Simple distance + ETA helpers
+function deg2rad(deg) {
+  return (deg * Math.PI) / 180;
+}
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const R = 6371; // km
+  const dLat = deg2rad(lat2 - lat1);
+  const dLon = deg2rad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(deg2rad(lat1)) *
+      Math.cos(deg2rad(lat2)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+function estimateEtaMinutes(distanceKm) {
+  const speedKmh = 25; // average courier speed
+  const minutes = (distanceKm / speedKmh) * 60;
+  const clamped = Math.min(Math.max(minutes, 10), 60); // 10–60 mins
+  return Math.round(clamped);
+}
+
 // Environment validation (Twilio + Supabase for phone auth)
 const requiredEnvVars = [
   'SUPABASE_URL',
@@ -131,6 +157,8 @@ app.get('/stores', async (req, res) => {
       limit: limitParam,
       offset: offsetParam,
       hasPromos,
+      user_lat,
+      user_lng,
     } = req.query || {};
 
     const limit = Math.min(parseInt(limitParam, 10) || 50, 100);
@@ -146,6 +174,8 @@ app.get('/stores', async (req, res) => {
           banner_url,
           description,
           city,
+          latitude,
+          longitude,
           rating,
           total_reviews,
           is_open,
@@ -179,6 +209,29 @@ app.get('/stores', async (req, res) => {
     let stores = data || [];
     if (hasPromos === 'true') {
       stores = stores.slice(0, 10);
+    }
+
+    // Attach distance + ETA if user lat/lng provided
+    let userLat = null;
+    let userLng = null;
+    if (user_lat != null && user_lat !== '' && user_lng != null && user_lng !== '') {
+      const latNum = Number(user_lat);
+      const lngNum = Number(user_lng);
+      if (Number.isFinite(latNum) && Number.isFinite(lngNum)) {
+        userLat = latNum;
+        userLng = lngNum;
+      }
+    }
+
+    if (userLat != null && userLng != null) {
+      stores = stores.map((s) => {
+        if (s.latitude != null && s.longitude != null) {
+          const distance_km = haversineKm(userLat, userLng, s.latitude, s.longitude);
+          const eta_minutes = estimateEtaMinutes(distance_km);
+          return { ...s, distance_km, eta_minutes };
+        }
+        return { ...s, distance_km: null, eta_minutes: null };
+      });
     }
 
     return res.json({ stores });
