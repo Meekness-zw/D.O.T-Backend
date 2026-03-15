@@ -171,6 +171,7 @@ CREATE TABLE IF NOT EXISTS promotions (
   title TEXT NOT NULL,
   description TEXT,
   tag TEXT,
+  category TEXT, -- Optional: category name this promotion applies to (e.g. \"Burgers\")
   image_url TEXT,
   is_active BOOLEAN DEFAULT TRUE,
   starts_at TIMESTAMP WITH TIME ZONE,

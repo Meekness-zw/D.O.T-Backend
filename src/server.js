@@ -1135,6 +1135,7 @@ app.get('/public/promotions', async (req, res) => {
         title,
         description,
         tag,
+        category,
         image_url,
         is_active,
         starts_at,
@@ -1160,6 +1161,7 @@ app.get('/public/promotions', async (req, res) => {
       title: p.title,
       description: p.description,
       tag: p.tag,
+      category: p.category,
       image_url: p.image_url,
       store_name: p.stores?.store_name || null,
       store_logo: p.stores?.logo || null,
@@ -1201,7 +1203,7 @@ app.get('/merchant/promotions', requireAuth, async (req, res) => {
 
     const { data, error } = await supabase
       .from('promotions')
-      .select('id, store_id, title, description, tag, image_url, is_active, starts_at, ends_at, recurrence_type, recurrence_weekday, recurrence_month_day, recurrence_time')
+      .select('id, store_id, title, description, tag, category, image_url, is_active, starts_at, ends_at, recurrence_type, recurrence_weekday, recurrence_month_day, recurrence_time')
       .in('store_id', storeIds)
       .order('created_at', { ascending: false });
 
@@ -1245,6 +1247,7 @@ app.post('/merchant/promotions', requireAuth, async (req, res) => {
       title: String(title).trim(),
       description: description ? String(description).trim() : null,
       tag: tag ? String(tag).trim() : null,
+      category: req.body?.category ? String(req.body.category).trim() : null,
       image_url: image_url ? String(image_url).trim() : null,
       is_active: is_active !== false,
       starts_at: starts_at || null,
@@ -1258,7 +1261,7 @@ app.post('/merchant/promotions', requireAuth, async (req, res) => {
     const { data, error } = await supabase
       .from('promotions')
       .insert(insert)
-      .select('id, store_id, title, description, tag, image_url, is_active, starts_at, ends_at, recurrence_type, recurrence_weekday, recurrence_month_day, recurrence_time')
+      .select('id, store_id, title, description, tag, category, image_url, is_active, starts_at, ends_at, recurrence_type, recurrence_weekday, recurrence_month_day, recurrence_time')
       .single();
 
     if (error) throw new Error(error.message || 'Failed to create promotion');
@@ -1299,11 +1302,12 @@ app.patch('/merchant/promotions/:id', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden', details: 'Cannot modify this promotion' });
     }
 
-    const { title, description, tag, image_url, is_active, starts_at, ends_at, recurrence_type, recurrence_weekday, recurrence_month_day, recurrence_time } = req.body || {};
+    const { title, description, tag, category, image_url, is_active, starts_at, ends_at, recurrence_type, recurrence_weekday, recurrence_month_day, recurrence_time } = req.body || {};
     const update = {};
     if (title !== undefined && String(title).trim()) update.title = String(title).trim();
     if (description !== undefined) update.description = description ? String(description).trim() : null;
     if (tag !== undefined) update.tag = tag ? String(tag).trim() : null;
+    if (category !== undefined) update.category = category ? String(category).trim() : null;
     if (image_url !== undefined) update.image_url = image_url ? String(image_url).trim() : null;
     if (is_active !== undefined) update.is_active = !!is_active;
     if (starts_at !== undefined) update.starts_at = starts_at || null;
@@ -1331,7 +1335,7 @@ app.patch('/merchant/promotions/:id', requireAuth, async (req, res) => {
       .from('promotions')
       .update(update)
       .eq('id', id)
-      .select('id, store_id, title, description, tag, image_url, is_active, starts_at, ends_at, recurrence_type, recurrence_weekday, recurrence_month_day, recurrence_time')
+      .select('id, store_id, title, description, tag, category, image_url, is_active, starts_at, ends_at, recurrence_type, recurrence_weekday, recurrence_month_day, recurrence_time')
       .single();
 
     if (updateError) throw new Error(updateError.message || 'Failed to update promotion');
