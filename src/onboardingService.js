@@ -353,6 +353,7 @@ export async function upsertMerchantOnboarding({
   business_registration_number,
   tax_id,
   storeLogoBase64,
+  storeBannerBase64,
   ownerIdBase64,
   businessCertificateBase64,
   proofOfAddressBase64,
@@ -444,6 +445,16 @@ export async function upsertMerchantOnboarding({
       dataUrl: storeLogoBase64,
     });
     await supabase.from('stores').update({ logo: url }).eq('id', storeId);
+  }
+
+  if (storeBannerBase64) {
+    const ext = extForMime(parseDataUrl(storeBannerBase64)?.mime);
+    const url = await uploadToBucket({
+      bucket: 'store-logos',
+      path: `stores/${storeId}/banner.${ext}`,
+      dataUrl: storeBannerBase64,
+    });
+    await supabase.from('stores').update({ banner_url: url }).eq('id', storeId);
   }
 
   // Seed default product categories tailored to the business type when the store is first created
