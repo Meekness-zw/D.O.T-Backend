@@ -530,6 +530,85 @@ app.get('/merchant/products', requireAuth, async (req, res) => {
   }
 });
 
+// GET /stores/:storeId/menu — public menu for a store (categories + products)
+app.get('/stores/:storeId/menu', async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { storeId } = req.params;
+
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('id, is_active')
+      .eq('id', storeId)
+      .maybeSingle();
+
+    if (storeError || !store || store.is_active === false) {
+      return res.status(404).json({ error: 'Store not found' });
+    }
+
+    const { data: productsData, error: productsError } = await supabase
+      .from('products')
+      .select(
+        `
+        id,
+        store_id,
+        category_id,
+        name,
+        description,
+        price,
+        unit,
+        is_available,
+        is_featured,
+        image_url,
+        product_categories ( name )
+      `,
+      )
+      .eq('store_id', storeId)
+      .eq('is_available', true)
+      .order('display_order', { ascending: true });
+
+    if (productsError) {
+      console.error('public store menu products error:', productsError);
+      throw new Error(productsError.message || 'Failed to load menu');
+    }
+
+    const products = (productsData || []).map((p) => {
+      const categoryName =
+        (Array.isArray(p.product_categories)
+          ? p.product_categories[0]?.name
+          : p.product_categories?.name) || 'Other';
+      return {
+        id: p.id,
+        store_id: p.store_id,
+        name: p.name,
+        description: p.description,
+        price: p.price,
+        unit: p.unit,
+        is_available: p.is_available,
+        is_featured: p.is_featured,
+        image_url: p.image_url,
+        category: categoryName,
+      };
+    });
+
+    const categorySet = new Set();
+    products.forEach((p) => {
+      if (p.is_featured) categorySet.add('Popular');
+      if (p.category) categorySet.add(p.category);
+    });
+    const categories = Array.from(categorySet);
+    if (categories.length === 0) categories.push('Menu');
+
+    return res.json({ categories, products });
+  } catch (error) {
+    console.error('get /stores/:storeId/menu error:', error);
+    return res.status(500).json({
+      error: 'Failed to load menu',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // PATCH /merchant/products/:id — update product fields (only for merchant's own products)
 app.patch('/merchant/products/:id', requireAuth, async (req, res) => {
   try {
