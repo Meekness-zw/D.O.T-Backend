@@ -3,6 +3,7 @@ import twilio from 'twilio';
 import bcrypt from 'bcryptjs';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { createSupabaseAccessToken } from './sessionToken.js';
+import { getRoles } from './userService.js';
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
@@ -255,7 +256,7 @@ export async function loginWithPassword({ phone, password }) {
     throw new Error('Incorrect phone or password.');
   }
 
-  // Optionally load role and full_name from user_profiles for convenience
+  // Load profile and all roles (multi-role support)
   let profile = null;
   const { data: profileData, error: profileError } = await supabaseAdmin
     .from('user_profiles')
@@ -268,6 +269,9 @@ export async function loginWithPassword({ phone, password }) {
   } else {
     profile = profileData;
   }
+
+  const roles = await getRoles(existingUser.id);
+  const primaryRole = profile?.role ?? (roles[0] ?? null);
 
   const sessionId = crypto.randomUUID();
   const accessToken = createSupabaseAccessToken({
@@ -286,7 +290,8 @@ export async function loginWithPassword({ phone, password }) {
       id: existingUser.id,
       phone: existingUser.phone ?? phone,
       email: existingUser.email ?? null,
-      role: profile?.role ?? null,
+      role: primaryRole,
+      roles: roles.length > 0 ? roles : (primaryRole ? [primaryRole] : []),
       full_name: profile?.full_name ?? null,
       user_metadata: existingUser.user_metadata ?? {},
       app_metadata: existingUser.app_metadata ?? {},

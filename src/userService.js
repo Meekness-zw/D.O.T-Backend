@@ -7,14 +7,33 @@ if (!supabase) {
 }
 
 /**
+ * Get all roles for a user from user_roles. Falls back to profile.role if user_roles is empty.
+ */
+export async function getRoles(userId) {
+  if (!userId || !supabase) return [];
+  const { data: rows, error } = await supabase
+    .from('user_roles')
+    .select('role')
+    .eq('user_id', userId);
+  if (error) {
+    console.error('getRoles error:', error);
+    return [];
+  }
+  if (Array.isArray(rows) && rows.length > 0) {
+    return rows.map((r) => r.role);
+  }
+  // Fallback: no user_roles (e.g. before migration) — use profile.role
+  const profile = await getProfile(userId);
+  return profile?.role ? [profile.role] : [];
+}
+
+/**
  * Ensures the user has a profile and a row in the correct role table.
- * Called after phone verification (sign-up and sign-in) with the role they selected.
+ * Supports multiple roles: adding a role does not remove existing roles or overwrite profile details.
  *
- * 1) user_profiles: id, email, phone, full_name, role (one row per user)
- * 2) Role table (one of):
- *    - customers: id (references user_profiles)
- *    - merchants: id, business_name (fullName or 'New Merchant')
- *    - couriers: id
+ * 1) user_profiles: id, email, phone, full_name, role (primary role; only set for new users)
+ * 2) user_roles: add this role so user is listed under multiple roles
+ * 3) Role table: ensure row in customers / merchants / couriers
  */
 export async function ensureUserProfile({
   userId,
@@ -38,7 +57,7 @@ export async function ensureUserProfile({
   }
 
   try {
-    // Load existing profile so we don't wipe fields (name/email) on every login
+    // Load existing profile so we don't wipe fields (name/email/role) on every login
     const { data: existingProfile, error: existingError } = await supabase
       .from('user_profiles')
       .select('email, phone, full_name, role')
@@ -54,9 +73,6 @@ export async function ensureUserProfile({
     const trimmedFullName = fullName && fullName.trim();
 
     // Derive a safe email value.
-    // 1) If caller provided non-empty email, use it.
-    // 2) Else, keep existing email if present.
-    // 3) Else, generate a stable placeholder from phone or userId.
     const normalisedEmail =
       trimmedEmail ||
       existingProfile?.email ||
@@ -65,14 +81,17 @@ export async function ensureUserProfile({
     const phoneToUse = phone || existingProfile?.phone || null;
     const fullNameToUse = trimmedFullName || existingProfile?.full_name || null;
 
-    // 1) Upsert into user_profiles (preserving fields when not overridden)
+    // Primary role: only set for new users; existing users keep their primary role
+    const primaryRole = existingProfile?.role ?? role;
+
+    // 1) Upsert into user_profiles (preserve primary role when adding another role)
     const { error: profileError } = await supabase.from('user_profiles').upsert(
       {
         id: userId,
         email: normalisedEmail,
         phone: phoneToUse,
         full_name: fullNameToUse,
-        role
+        role: primaryRole,
       },
       { onConflict: 'id' }
     );
@@ -82,7 +101,15 @@ export async function ensureUserProfile({
       throw new Error(`Failed to create user profile: ${profileError.message}`);
     }
 
-    // 2) Create row in role-specific table if not exists
+    // 2) Add this role to user_roles (multi-role support; no-op if already present)
+    const { error: roleInsertError } = await supabase
+      .from('user_roles')
+      .upsert({ user_id: userId, role }, { onConflict: 'user_id,role' });
+    if (roleInsertError) {
+      console.warn('user_roles insert warning (table may not exist yet):', roleInsertError.message);
+    }
+
+    // 3) Create row in role-specific table if not exists
     let roleError;
 
     if (role === 'customer') {

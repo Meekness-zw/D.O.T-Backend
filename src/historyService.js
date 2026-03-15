@@ -4,26 +4,28 @@
  */
 
 import { supabaseAdmin } from './supabaseAdminClient.js';
-import { getProfile } from './userService.js';
+import { getProfile, getRoles } from './userService.js';
 
 const supabase = supabaseAdmin;
 
 /**
  * Get orders for the current user based on their role.
- * Customer: orders where customer_id = userId
- * Merchant: orders for stores belonging to this merchant
- * Courier: orders where courier_id = userId
+ * Supports multi-role: pass options.role to get orders for that role (must be in user's roles).
  */
 export async function getOrdersForUser(userId, options = {}) {
   if (!userId || !supabase) throw new Error('userId required and server must be configured');
 
   const profile = await getProfile(userId);
-  if (!profile?.role) return { orders: [], role: null };
+  const userRoles = await getRoles(userId);
+  const effectiveRole = options.role && userRoles.includes(options.role)
+    ? options.role
+    : (profile?.role ?? null);
+  if (!effectiveRole) return { orders: [], role: null };
 
   const { limit = 50, offset = 0, status } = options;
   let query;
 
-  if (profile.role === 'customer') {
+  if (effectiveRole === 'customer') {
     query = supabase
       .from('orders')
       .select(`
@@ -49,7 +51,7 @@ export async function getOrdersForUser(userId, options = {}) {
       .eq('customer_id', userId)
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
-  } else if (profile.role === 'merchant') {
+  } else if (effectiveRole === 'merchant') {
     const { data: storeIds } = await supabase
       .from('stores')
       .select('id')
@@ -82,7 +84,7 @@ export async function getOrdersForUser(userId, options = {}) {
       .in('store_id', ids)
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
-  } else if (profile.role === 'courier') {
+  } else if (effectiveRole === 'courier') {
     query = supabase
       .from('orders')
       .select(`
@@ -109,14 +111,14 @@ export async function getOrdersForUser(userId, options = {}) {
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
   } else {
-    return { orders: [], role: profile.role };
+    return { orders: [], role: effectiveRole };
   }
 
   if (status) query = query.eq('status', status);
 
   const { data, error } = await query;
   if (error) throw new Error(error.message || 'Failed to fetch orders');
-  return { orders: data || [], role: profile.role };
+  return { orders: data || [], role: effectiveRole };
 }
 
 /**
@@ -178,8 +180,8 @@ export async function getPaymentsForUser(userId, options = {}) {
 }
 
 /**
- * Get full "me" payload: profile + role-specific row (customer, merchant, or courier)
- * so the app has all user fields in one place.
+ * Get full "me" payload: profile + roles list + role-specific rows for every role the user has.
+ * Multi-role: one user can have customer, merchant, courier; all data returned so app can switch without re-fetching.
  */
 export async function getFullUserMe(userId) {
   if (!userId || !supabase) throw new Error('userId required and server must be configured');
@@ -187,19 +189,20 @@ export async function getFullUserMe(userId) {
   const profile = await getProfile(userId);
   if (!profile) return null;
 
-  const result = { profile };
+  const roles = await getRoles(userId);
+  const result = { profile, roles: roles.length > 0 ? roles : (profile.role ? [profile.role] : []) };
 
-  if (profile.role === 'customer') {
+  if (result.roles.includes('customer')) {
     const { data } = await supabase.from('customers').select('*').eq('id', userId).single();
     result.customer = data || null;
-  } else if (profile.role === 'merchant') {
+  }
+  if (result.roles.includes('merchant')) {
     const { data: merchant } = await supabase
       .from('merchants')
       .select('*')
       .eq('id', userId)
       .single();
     result.merchant = merchant || null;
-
     const { data: store } = await supabase
       .from('stores')
       .select('id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country, latitude, longitude, is_open')
@@ -208,7 +211,8 @@ export async function getFullUserMe(userId) {
       .limit(1)
       .maybeSingle();
     result.store = store || null;
-  } else if (profile.role === 'courier') {
+  }
+  if (result.roles.includes('courier')) {
     const { data } = await supabase.from('couriers').select('*').eq('id', userId).single();
     result.courier = data || null;
   }

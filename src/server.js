@@ -1668,14 +1668,15 @@ app.get('/users/me', requireAuth, async (req, res) => {
   }
 });
 
-// GET /users/me/orders — order history for current user (by role: customer, merchant, courier)
+// GET /users/me/orders — order history for current user (by role). Use ?role=customer|merchant|courier when user has multiple roles.
 app.get('/users/me/orders', requireAuth, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
     const offset = parseInt(req.query.offset, 10) || 0;
     const status = req.query.status || undefined;
-    const { orders, role } = await getOrdersForUser(req.userId, { limit, offset, status });
-    return res.json({ orders, role });
+    const role = req.query.role || undefined;
+    const { orders, role: resolvedRole } = await getOrdersForUser(req.userId, { limit, offset, status, role });
+    return res.json({ orders, role: resolvedRole });
   } catch (error) {
     console.error('get orders error:', error);
     return res.status(500).json({
