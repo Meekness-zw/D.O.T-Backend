@@ -785,7 +785,13 @@ app.post('/merchant/stores/:id/upload-banner', requireAuth, async (req, res) => 
     }
     const mime = match[1];
     const base64 = match[2];
-    const buffer = Buffer.from(base64, 'base64');
+    let buffer;
+    try {
+      buffer = Buffer.from(base64, 'base64');
+    } catch (bufErr) {
+      console.error('store banner buffer error:', bufErr);
+      return res.status(400).json({ error: 'Invalid image', details: bufErr.message || 'Failed to decode base64' });
+    }
     const ext = mime.includes('png') ? 'png' : mime.includes('jpeg') || mime.includes('jpg') ? 'jpg' : 'bin';
 
     const filename = `stores/${id}/banner.${ext}`;
@@ -799,7 +805,10 @@ app.post('/merchant/stores/:id/upload-banner', requireAuth, async (req, res) => 
 
     if (uploadError) {
       console.error('store banner upload error:', uploadError);
-      throw new Error(uploadError.message || 'Failed to upload banner');
+      return res.status(500).json({
+        error: 'Failed to upload banner',
+        details: uploadError.message || 'Storage upload failed. Check that the store-logos bucket exists and allows uploads to stores/*.',
+      });
     }
 
     const { data: urlData } = supabase.storage.from('store-logos').getPublicUrl(filename);
@@ -819,7 +828,10 @@ app.post('/merchant/stores/:id/upload-banner', requireAuth, async (req, res) => 
 
     if (updateError) {
       console.error('store banner update error:', updateError);
-      throw new Error(updateError.message || 'Failed to update store banner');
+      return res.status(500).json({
+        error: 'Failed to save banner URL',
+        details: updateError.message || 'Database update failed. Ensure the stores table has a banner_url column.',
+      });
     }
 
     return res.json({ banner_url: bannerUrl });
