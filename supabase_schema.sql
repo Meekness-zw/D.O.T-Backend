@@ -150,6 +150,7 @@ CREATE TABLE IF NOT EXISTS products (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   store_id UUID NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
   category_id UUID REFERENCES product_categories(id) ON DELETE SET NULL,
+  category TEXT, -- Category name stored on product (e.g. "Burgers", "Drinks")
   name TEXT NOT NULL,
   description TEXT,
   price DECIMAL(10, 2) NOT NULL,
@@ -174,6 +175,11 @@ CREATE TABLE IF NOT EXISTS promotions (
   is_active BOOLEAN DEFAULT TRUE,
   starts_at TIMESTAMP WITH TIME ZONE,
   ends_at TIMESTAMP WITH TIME ZONE,
+  -- Auto-post on a set day every week or month (saved in DB; cron activates at recurrence_time)
+  recurrence_type TEXT DEFAULT 'once' CHECK (recurrence_type IN ('once', 'weekly', 'monthly')),
+  recurrence_weekday SMALLINT CHECK (recurrence_weekday IS NULL OR (recurrence_weekday >= 0 AND recurrence_weekday <= 6)), -- 0=Sunday .. 6=Saturday
+  recurrence_month_day SMALLINT CHECK (recurrence_month_day IS NULL OR (recurrence_month_day >= 1 AND recurrence_month_day <= 31)),
+  recurrence_time TEXT, -- HH:MM 24h, e.g. '09:00'
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -460,6 +466,7 @@ CREATE INDEX IF NOT EXISTS idx_stores_is_active ON stores(is_active);
 -- Products
 CREATE INDEX IF NOT EXISTS idx_products_store_id ON products(store_id);
 CREATE INDEX IF NOT EXISTS idx_products_category_id ON products(category_id);
+CREATE INDEX IF NOT EXISTS idx_products_category ON products(store_id, category);
 CREATE INDEX IF NOT EXISTS idx_products_is_available ON products(is_available);
 
 -- Orders

@@ -1186,7 +1186,7 @@ app.get('/merchant/promotions', requireAuth, async (req, res) => {
 
     const { data, error } = await supabase
       .from('promotions')
-      .select('id, store_id, title, description, tag, image_url, is_active, starts_at, ends_at')
+      .select('id, store_id, title, description, tag, image_url, is_active, starts_at, ends_at, recurrence_type, recurrence_weekday, recurrence_month_day, recurrence_time')
       .in('store_id', storeIds)
       .order('created_at', { ascending: false });
 
@@ -1206,7 +1206,7 @@ app.get('/merchant/promotions', requireAuth, async (req, res) => {
 app.post('/merchant/promotions', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
-    const { store_id, title, description, tag, image_url, is_active, starts_at, ends_at } = req.body || {};
+    const { store_id, title, description, tag, image_url, is_active, starts_at, ends_at, recurrence_type, recurrence_weekday, recurrence_month_day, recurrence_time } = req.body || {};
 
     if (!store_id || !title) {
       return res.status(400).json({
@@ -1234,12 +1234,16 @@ app.post('/merchant/promotions', requireAuth, async (req, res) => {
       is_active: is_active !== false,
       starts_at: starts_at || null,
       ends_at: ends_at || null,
+      recurrence_type: recurrence_type === 'weekly' || recurrence_type === 'monthly' ? recurrence_type : 'once',
+      recurrence_weekday: recurrence_type === 'weekly' && recurrence_weekday >= 0 && recurrence_weekday <= 6 ? Number(recurrence_weekday) : null,
+      recurrence_month_day: recurrence_type === 'monthly' && recurrence_month_day >= 1 && recurrence_month_day <= 31 ? Number(recurrence_month_day) : null,
+      recurrence_time: recurrence_type === 'weekly' || recurrence_type === 'monthly' ? (recurrence_time && /^\d{1,2}:\d{2}$/.test(String(recurrence_time).trim()) ? String(recurrence_time).trim() : null) : null,
     };
 
     const { data, error } = await supabase
       .from('promotions')
       .insert(insert)
-      .select('id, store_id, title, description, tag, image_url, is_active, starts_at, ends_at')
+      .select('id, store_id, title, description, tag, image_url, is_active, starts_at, ends_at, recurrence_type, recurrence_weekday, recurrence_month_day, recurrence_time')
       .single();
 
     if (error) throw new Error(error.message || 'Failed to create promotion');
@@ -1280,7 +1284,7 @@ app.patch('/merchant/promotions/:id', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden', details: 'Cannot modify this promotion' });
     }
 
-    const { title, description, tag, image_url, is_active, starts_at, ends_at } = req.body || {};
+    const { title, description, tag, image_url, is_active, starts_at, ends_at, recurrence_type, recurrence_weekday, recurrence_month_day, recurrence_time } = req.body || {};
     const update = {};
     if (title !== undefined && String(title).trim()) update.title = String(title).trim();
     if (description !== undefined) update.description = description ? String(description).trim() : null;
@@ -1289,6 +1293,17 @@ app.patch('/merchant/promotions/:id', requireAuth, async (req, res) => {
     if (is_active !== undefined) update.is_active = !!is_active;
     if (starts_at !== undefined) update.starts_at = starts_at || null;
     if (ends_at !== undefined) update.ends_at = ends_at || null;
+    if (recurrence_type !== undefined) {
+      update.recurrence_type = recurrence_type === 'weekly' || recurrence_type === 'monthly' ? recurrence_type : 'once';
+      if (update.recurrence_type === 'once') {
+        update.recurrence_weekday = null;
+        update.recurrence_month_day = null;
+        update.recurrence_time = null;
+      }
+    }
+    if (recurrence_weekday !== undefined) update.recurrence_weekday = recurrence_type === 'weekly' && recurrence_weekday >= 0 && recurrence_weekday <= 6 ? Number(recurrence_weekday) : null;
+    if (recurrence_month_day !== undefined) update.recurrence_month_day = recurrence_type === 'monthly' && recurrence_month_day >= 1 && recurrence_month_day <= 31 ? Number(recurrence_month_day) : null;
+    if (recurrence_time !== undefined) update.recurrence_time = (recurrence_type === 'weekly' || recurrence_type === 'monthly') && recurrence_time && /^\d{1,2}:\d{2}$/.test(String(recurrence_time).trim()) ? String(recurrence_time).trim() : null;
 
     if (Object.keys(update).length === 0) {
       return res.status(400).json({
@@ -1301,7 +1316,7 @@ app.patch('/merchant/promotions/:id', requireAuth, async (req, res) => {
       .from('promotions')
       .update(update)
       .eq('id', id)
-      .select('id, store_id, title, description, tag, image_url, is_active, starts_at, ends_at')
+      .select('id, store_id, title, description, tag, image_url, is_active, starts_at, ends_at, recurrence_type, recurrence_weekday, recurrence_month_day, recurrence_time')
       .single();
 
     if (updateError) throw new Error(updateError.message || 'Failed to update promotion');
@@ -2645,9 +2660,41 @@ app.use((req, res) => {
   });
 });
 
+// Run scheduled promotions: activate promotions whose recurrence matches current UTC time (weekly/monthly).
+async function runScheduledPromotions() {
+  if (!supabase) return;
+  const now = new Date();
+  const utcDow = now.getUTCDay(); // 0=Sun .. 6=Sat
+  const utcDom = now.getUTCDate(); // 1-31
+  const h = now.getUTCHours();
+  const m = now.getUTCMinutes();
+  const timeStr = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+
+  const { data: weekly } = await supabase
+    .from('promotions')
+    .select('id')
+    .eq('recurrence_type', 'weekly')
+    .eq('recurrence_weekday', utcDow)
+    .eq('recurrence_time', timeStr);
+  const { data: monthly } = await supabase
+    .from('promotions')
+    .select('id')
+    .eq('recurrence_type', 'monthly')
+    .eq('recurrence_month_day', utcDom)
+    .eq('recurrence_time', timeStr);
+
+  const ids = [...(weekly || []), ...(monthly || [])].map((r) => r.id);
+  if (ids.length === 0) return;
+  const { error } = await supabase.from('promotions').update({ is_active: true }).in('id', ids);
+  if (error) console.error('runScheduledPromotions error:', error);
+  else if (ids.length) console.log('[Cron] Activated recurring promotions:', ids.length);
+}
+
 app.listen(PORT, () => {
   console.log('✅ DOT Backend API started successfully');
   console.log(`📍 Server: http://localhost:${PORT}`);
   console.log(`🌍 Environment: ${NODE_ENV}`);
   console.log(`🔒 CORS allowed origins:`, allowedOrigins);
+  runScheduledPromotions();
+  setInterval(runScheduledPromotions, 15 * 60 * 1000);
 });
