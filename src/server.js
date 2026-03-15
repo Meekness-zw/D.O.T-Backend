@@ -557,34 +557,53 @@ app.patch('/merchant/products/:id', requireAuth, async (req, res) => {
 app.get('/merchant/stores', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
-    const { data, error } = await supabase
+    let data, error;
+    const fullSelect = 'id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country, latitude, longitude, is_open';
+    const minimalSelect = 'id, store_name, logo, merchant_id, created_at';
+    let result = await supabase
       .from('stores')
-      .select('id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country, latitude, longitude, is_open')
+      .select(fullSelect)
       .eq('merchant_id', req.userId)
       .order('created_at', { ascending: false });
-    if (error) throw new Error(error.message || 'Failed to load stores');
+    data = result.data;
+    error = result.error;
+    if (error) {
+      console.error('get /merchant/stores Supabase error:', { code: error.code, message: error.message, details: error.details });
+      // If full select fails (e.g. missing column in DB), retry with minimal columns
+      result = await supabase
+        .from('stores')
+        .select(minimalSelect)
+        .eq('merchant_id', req.userId)
+        .order('created_at', { ascending: false });
+      data = result.data;
+      error = result.error;
+    }
+    if (error) {
+      console.error('get /merchant/stores Supabase retry error:', { code: error.code, message: error.message });
+      throw new Error(error.message || 'Failed to load stores');
+    }
     const stores = data || [];
     for (const store of stores) {
-      if (store.logo && typeof store.logo === 'string') {
-        const pathMatch = store.logo.match(/\/store-logos\/(.+)$/);
-        if (pathMatch) {
-          try {
+      try {
+        if (store.logo && typeof store.logo === 'string') {
+          const pathMatch = store.logo.match(/\/store-logos\/(.+)$/);
+          if (pathMatch) {
             const { data: signed, error: signErr } = await supabase.storage
               .from('store-logos')
               .createSignedUrl(pathMatch[1], 3600);
             if (!signErr && signed?.signedUrl) store.logo = signed.signedUrl;
-          } catch (e) {
-            console.error('store logo signed url error:', e);
           }
         }
+      } catch (e) {
+        console.error('store logo signed url error:', e);
       }
     }
     return res.json({ stores });
-  } catch (error) {
-    console.error('get /merchant/stores error:', error);
+  } catch (err) {
+    console.error('get /merchant/stores error:', err);
     return res.status(500).json({
       error: 'Failed to load stores',
-      details: error.message || 'Please try again later',
+      details: err.message || 'Please try again later',
     });
   }
 });
