@@ -1935,6 +1935,272 @@ app.get('/users/me/payments', requireAuth, async (req, res) => {
   }
 });
 
+// POST /orders — create a new customer order for a single store
+// Body: { items: [{ product_id, product_name, product_price, quantity, unit, weight_kg, subtotal }], store_id, payment_method: 'cash' | 'wallet', delivery_notes? }
+app.post('/orders', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    const { items, store_id, payment_method, delivery_notes } = req.body || {};
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({
+        error: 'Invalid items',
+        details: 'Order must contain at least one item',
+      });
+    }
+
+    if (!store_id) {
+      return res.status(400).json({
+        error: 'Missing store_id',
+        details: 'store_id is required to place an order',
+      });
+    }
+
+    if (!['cash', 'wallet'].includes(payment_method)) {
+      return res.status(400).json({
+        error: 'Invalid payment_method',
+        details: 'payment_method must be cash or wallet',
+      });
+    }
+
+    // Ensure a customer row exists
+    const { data: existingCustomer, error: customerError } = await supabase
+      .from('customers')
+      .select('id')
+      .eq('id', req.userId)
+      .maybeSingle();
+
+    if (customerError) {
+      console.error('create order ensure customer error:', customerError);
+      throw new Error(customerError.message || 'Failed to ensure customer');
+    }
+
+    if (!existingCustomer) {
+      const { error: insertCustomerError } = await supabase
+        .from('customers')
+        .insert({ id: req.userId })
+        .select('id')
+        .single();
+      if (insertCustomerError) {
+        console.error('create order insert customer error:', insertCustomerError);
+        throw new Error(insertCustomerError.message || 'Failed to create customer');
+      }
+    }
+
+    // Fetch store for pickup address/coordinates
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('id, store_name, address_line1, city, latitude, longitude')
+      .eq('id', store_id)
+      .maybeSingle();
+
+    if (storeError) {
+      console.error('create order store error:', storeError);
+      throw new Error(storeError.message || 'Failed to load store');
+    }
+
+    if (!store) {
+      return res.status(400).json({
+        error: 'Invalid store',
+        details: 'Store not found',
+      });
+    }
+
+    if (
+      store.latitude == null ||
+      store.longitude == null ||
+      !store.address_line1 ||
+      !store.city
+    ) {
+      return res.status(400).json({
+        error: 'Store location incomplete',
+        details: 'Store must have a full address and coordinates to place an order',
+      });
+    }
+
+    // Fetch default delivery address for customer
+    const { data: addresses, error: addressesError } = await supabase
+      .from('customer_addresses')
+      .select('id, label, address_line1, city, latitude, longitude')
+      .eq('customer_id', req.userId)
+      .order('created_at', { ascending: false });
+
+    if (addressesError) {
+      console.error('create order addresses error:', addressesError);
+      throw new Error(addressesError.message || 'Failed to load addresses');
+    }
+
+    const defAddr =
+      (addresses || []).find((a) => a.is_default) || (addresses || [])[0] || null;
+
+    if (
+      !defAddr ||
+      !defAddr.address_line1 ||
+      !defAddr.city ||
+      defAddr.latitude == null ||
+      defAddr.longitude == null
+    ) {
+      return res.status(400).json({
+        error: 'Missing delivery address',
+        details: 'A default saved address with coordinates is required to place an order',
+      });
+    }
+
+    const deliveryAddress = `${defAddr.address_line1}, ${defAddr.city}`;
+
+    // Compute amounts
+    const subtotal = items.reduce(
+      (sum, item) => sum + Number(item.subtotal || 0),
+      0,
+    );
+    const deliveryFee = 0; // TODO: dynamic delivery pricing
+    const tax = 0;
+    const totalAmount = subtotal + deliveryFee + tax;
+
+    if (!Number.isFinite(totalAmount) || totalAmount <= 0) {
+      return res.status(400).json({
+        error: 'Invalid total',
+        details: 'Order total must be greater than 0',
+      });
+    }
+
+    // If paying by wallet, ensure sufficient balance and create a debit transaction
+    let paymentStatus = 'pending';
+    if (payment_method === 'wallet') {
+      const { data: lastTx } = await supabase
+        .from('wallet_transactions')
+        .select('balance_after')
+        .eq('user_id', req.userId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      const currentBalance = lastTx?.balance_after || 0;
+      if (currentBalance < totalAmount) {
+        return res.status(400).json({
+          error: 'Insufficient wallet balance',
+          details: 'Your wallet balance is not enough to pay for this order',
+        });
+      }
+
+      paymentStatus = 'paid';
+    }
+
+    // Generate simple order_number
+    const orderNumber = `DOT-${Date.now().toString(36).toUpperCase()}`;
+
+    // Create order + items in a single transaction
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .insert({
+        order_number: orderNumber,
+        customer_id: req.userId,
+        store_id,
+        status: 'pending',
+        subtotal: subtotal,
+        delivery_fee: deliveryFee,
+        tax,
+        total_amount: totalAmount,
+        payment_method,
+        payment_status: paymentStatus,
+        pickup_address: `${store.address_line1}, ${store.city}`,
+        pickup_latitude: store.latitude,
+        pickup_longitude: store.longitude,
+        delivery_address: deliveryAddress,
+        delivery_latitude: defAddr.latitude,
+        delivery_longitude: defAddr.longitude,
+        delivery_notes,
+      })
+      .select('*')
+      .single();
+
+    if (orderError) {
+      console.error('create order insert order error:', orderError);
+      throw new Error(orderError.message || 'Failed to create order');
+    }
+
+    const orderItemsPayload = items.map((item) => ({
+      order_id: order.id,
+      product_id: item.product_id,
+      product_name: item.product_name,
+      product_price: item.product_price,
+      quantity: item.unit === 'kg' ? 1 : item.quantity,
+      unit: item.unit === 'kg' ? 'kg' : 'item',
+      weight_kg: item.unit === 'kg' ? item.quantity : null,
+      subtotal: item.subtotal,
+    }));
+
+    const { error: itemsError } = await supabase
+      .from('order_items')
+      .insert(orderItemsPayload);
+
+    if (itemsError) {
+      console.error('create order insert items error:', itemsError);
+      throw new Error(itemsError.message || 'Failed to create order items');
+    }
+
+    // If wallet payment, record payment + wallet debit transaction
+    if (payment_method === 'wallet') {
+      const { data: payment, error: paymentError } = await supabase
+        .from('payments')
+        .insert({
+          order_id: order.id,
+          customer_id: req.userId,
+          amount: totalAmount,
+          currency: 'USD',
+          payment_method: 'wallet',
+          payment_provider: 'Wallet',
+          status: 'completed',
+        })
+        .select('*')
+        .single();
+
+      if (paymentError) {
+        console.error('create order insert payment error:', paymentError);
+        throw new Error(paymentError.message || 'Failed to create payment');
+      }
+
+      const { data: lastTxAfter } = await supabase
+        .from('wallet_transactions')
+        .select('balance_after')
+        .eq('user_id', req.userId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      const prevBalance = lastTxAfter?.balance_after || 0;
+      const newBalance = prevBalance - totalAmount;
+
+      const { error: walletError } = await supabase
+        .from('wallet_transactions')
+        .insert({
+          user_id: req.userId,
+          user_type: 'customer',
+          transaction_type: 'debit',
+          amount: totalAmount,
+          balance_after: newBalance,
+          description: `Order payment ${orderNumber}`,
+          reference_id: payment.id,
+          status: 'completed',
+        });
+
+      if (walletError) {
+        console.error('create order wallet debit error:', walletError);
+        throw new Error(walletError.message || 'Failed to record wallet transaction');
+      }
+    }
+
+    return res.status(201).json({ order });
+  } catch (error) {
+    console.error('post /orders error:', error);
+    return res.status(500).json({
+      error: 'Failed to place order',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // GET /merchant/dashboard-stats — real-time KPIs, revenue by day, best products, categories (from DB)
 app.get('/merchant/dashboard-stats', requireAuth, async (req, res) => {
   try {
@@ -2631,6 +2897,79 @@ app.get('/users/me/favorites', requireAuth, async (req, res) => {
     console.error('get /users/me/favorites error:', error);
     return res.status(500).json({
       error: 'Failed to load favorites',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /users/me/favorites — add a favorite store for the current customer
+app.post('/users/me/favorites', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { store_id } = req.body || {};
+
+    if (!store_id) {
+      return res.status(400).json({
+        error: 'Missing required field',
+        details: 'store_id is required',
+      });
+    }
+
+    // Ensure a customer row exists for this user (mirrors other customer features)
+    const { data: customerExisting, error: customerError } = await supabase
+      .from('customers')
+      .select('id')
+      .eq('id', req.userId)
+      .maybeSingle();
+
+    if (customerError) {
+      console.error('favorites ensure customer error:', customerError);
+      throw new Error(customerError.message || 'Failed to ensure customer');
+    }
+
+    if (!customerExisting) {
+      const { error: insertCustomerError } = await supabase
+        .from('customers')
+        .insert({ id: req.userId })
+        .select('id')
+        .single();
+      if (insertCustomerError) {
+        console.error('favorites create customer error:', insertCustomerError);
+        throw new Error(insertCustomerError.message || 'Failed to create customer');
+      }
+    }
+
+    const { data, error } = await supabase
+      .from('customer_favorites')
+      .insert({
+        customer_id: req.userId,
+        store_id,
+      })
+      .select('id, store_id, created_at')
+      .single();
+
+    if (error) {
+      // Ignore unique-constraint duplicate: treat as success
+      const isUniqueViolation =
+        error.code === '23505' || (error.message || '').toLowerCase().includes('unique');
+      if (isUniqueViolation) {
+        return res.status(200).json({
+          id: null,
+          store_id,
+          created_at: new Date().toISOString(),
+          already_exists: true,
+        });
+      }
+
+      console.error('create favorite error:', error);
+      throw new Error(error.message || 'Failed to create favorite');
+    }
+
+    return res.status(201).json(data);
+  } catch (error) {
+    console.error('post /users/me/favorites error:', error);
+    return res.status(500).json({
+      error: 'Failed to create favorite',
       details: error.message || 'Please try again later',
     });
   }
