@@ -77,15 +77,29 @@ export async function upsertCourierProfile({
     dobIso = `${dobMatch[3]}-${dobMatch[2]}-${dobMatch[1]}`;
   }
 
-  // Update profile name and ensure role stays courier
-  const { error: profileError } = await supabase.from('user_profiles').upsert(
-    {
-      id: userId,
+  // Enforce minimum age of 18 years for couriers
+  const parsedDob = new Date(dobIso);
+  if (Number.isNaN(parsedDob.getTime())) {
+    throw new Error('Invalid date of birth format');
+  }
+  const today = new Date();
+  let age = today.getFullYear() - parsedDob.getFullYear();
+  const m = today.getMonth() - parsedDob.getMonth();
+  if (m < 0 || (m === 0 && today.getDate() < parsedDob.getDate())) {
+    age -= 1;
+  }
+  if (age < 18) {
+    throw new Error('You must be at least 18 years old to create a courier account');
+  }
+
+  // Update profile name and ensure role stays courier without touching email
+  const { error: profileError } = await supabase
+    .from('user_profiles')
+    .update({
       full_name: String(fullName).trim(),
       role: 'courier',
-    },
-    { onConflict: 'id' },
-  );
+    })
+    .eq('id', userId);
   if (profileError) throw new Error(profileError.message || 'Failed to update user profile');
 
   const { error: courierError } = await supabase.from('couriers').upsert(
