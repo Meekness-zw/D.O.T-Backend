@@ -2492,6 +2492,89 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
   }
 });
 
+// GET /courier/onboarding-status — check if courier profile is fully set up and verified
+app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    const { data: courier, error: courierError } = await supabase
+      .from('couriers')
+      .select(
+        'id, city, national_id, date_of_birth, drivers_license_number, drivers_license_expiry, verification_status',
+      )
+      .eq('id', req.userId)
+      .maybeSingle();
+
+    if (courierError) {
+      console.error('courier status courier error:', courierError);
+      throw new Error(courierError.message || 'Failed to load courier');
+    }
+
+    const hasProfile =
+      !!courier &&
+      !!courier.national_id &&
+      !!courier.date_of_birth &&
+      !!courier.city;
+
+    let hasVehicle = false;
+    if (courier) {
+      const { data: vehicles, error: vehiclesError } = await supabase
+        .from('courier_vehicles')
+        .select('id')
+        .eq('courier_id', req.userId)
+        .eq('is_active', true)
+        .limit(1);
+
+      if (vehiclesError) {
+        console.error('courier status vehicles error:', vehiclesError);
+        throw new Error(vehiclesError.message || 'Failed to load courier vehicles');
+      }
+
+      hasVehicle = Array.isArray(vehicles) && vehicles.length > 0;
+    }
+
+    const hasDriverLicense =
+      !!courier &&
+      !!courier.drivers_license_number &&
+      !!courier.drivers_license_expiry;
+
+    let hasPayoutMethod = false;
+    if (courier) {
+      const { data: payoutMethods, error: payoutError } = await supabase
+        .from('courier_payout_methods')
+        .select('id')
+        .eq('courier_id', req.userId)
+        .limit(1);
+
+      if (payoutError) {
+        console.error('courier status payout error:', payoutError);
+        throw new Error(payoutError.message || 'Failed to load payout methods');
+      }
+
+      hasPayoutMethod = Array.isArray(payoutMethods) && payoutMethods.length > 0;
+    }
+
+    const verificationStatus = courier?.verification_status || 'pending';
+    const onboardingComplete =
+      hasProfile && hasVehicle && hasDriverLicense && hasPayoutMethod;
+
+    return res.json({
+      hasProfile,
+      hasVehicle,
+      hasDriverLicense,
+      hasPayoutMethod,
+      verificationStatus,
+      onboardingComplete,
+    });
+  } catch (error) {
+    console.error('get /courier/onboarding-status error:', error);
+    return res.status(500).json({
+      error: 'Failed to load courier onboarding status',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // GET /users/me/notifications — notifications for current user
 app.get('/users/me/notifications', requireAuth, async (req, res) => {
   try {
