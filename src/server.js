@@ -1893,11 +1893,208 @@ app.patch('/orders/:id', requireAuth, async (req, res) => {
       .select('id, order_number, status')
       .single();
     if (updateError) throw new Error(updateError.message || 'Failed to update order');
+
+    // Record status change in history table
+    const { error: historyError } = await supabase.from('order_status_history').insert({
+      order_id: updated.id,
+      status,
+      notes: null,
+      changed_by: req.userId,
+    });
+    if (historyError) {
+      console.error('order_status_history insert error:', historyError);
+    }
+
     return res.json(updated);
   } catch (error) {
     console.error('patch /orders/:id error:', error);
     return res.status(500).json({
       error: 'Failed to update order',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// GET /orders/:id — fetch a single order for the current user (customer, merchant, or courier)
+app.get('/orders/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+
+    const { data: order, error } = await supabase
+      .from('orders')
+      .select(
+        `
+        id,
+        order_number,
+        customer_id,
+        store_id,
+        courier_id,
+        status,
+        total_amount,
+        pickup_address,
+        pickup_latitude,
+        pickup_longitude,
+        delivery_address,
+        delivery_latitude,
+        delivery_longitude,
+        created_at,
+        updated_at
+      `,
+      )
+      .eq('id', id)
+      .maybeSingle();
+
+    if (error) {
+      console.error('get /orders/:id error:', error);
+      throw new Error(error.message || 'Failed to load order');
+    }
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    // Ensure user is involved in the order (customer, merchant, or courier)
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('merchant_id, store_name')
+      .eq('id', order.store_id)
+      .maybeSingle();
+    if (storeError) {
+      console.error('get /orders/:id store error:', storeError);
+      throw new Error(storeError.message || 'Failed to load store for order');
+    }
+
+    const isCustomer = order.customer_id === req.userId;
+    const isCourier = order.courier_id === req.userId;
+    const isMerchant = store?.merchant_id === req.userId;
+    if (!isCustomer && !isCourier && !isMerchant) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        details: 'You are not allowed to view this order',
+      });
+    }
+
+    return res.json({ order: { ...order, store_name: store?.store_name || null } });
+  } catch (error) {
+    console.error('get /orders/:id error:', error);
+    return res.status(500).json({
+      error: 'Failed to load order',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// GET /courier/jobs/open — list ready orders with no courier assigned
+app.get('/courier/jobs/open', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    // Ensure user has courier role
+    const me = await getFullUserMe(req.userId);
+    if (!me?.roles?.includes('courier')) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        details: 'User is not a courier',
+      });
+    }
+
+    const { data, error } = await supabase
+      .from('orders')
+      .select(
+        `
+        id,
+        order_number,
+        total_amount,
+        status,
+        pickup_address,
+        delivery_address,
+        stores (
+          store_name,
+          city
+        )
+      `,
+      )
+      .eq('status', 'ready')
+      .is('courier_id', null)
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      console.error('get /courier/jobs/open error:', error);
+      throw new Error(error.message || 'Failed to load jobs');
+    }
+
+    return res.json({ jobs: data || [] });
+  } catch (error) {
+    console.error('get /courier/jobs/open error:', error);
+    return res.status(500).json({
+      error: 'Failed to load jobs',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /courier/jobs/:id/accept — courier accepts a job
+app.post('/courier/jobs/:id/accept', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+
+    // Ensure user has courier role
+    const me = await getFullUserMe(req.userId);
+    if (!me?.roles?.includes('courier')) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        details: 'User is not a courier',
+      });
+    }
+
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .select('id, status, courier_id')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (orderError) {
+      console.error('courier accept job order error:', orderError);
+      throw new Error(orderError.message || 'Failed to load order');
+    }
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    if (order.status !== 'ready' || order.courier_id != null) {
+      return res.status(400).json({
+        error: 'Job not available',
+        details: 'Order is not in a ready state or already assigned',
+      });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('orders')
+      .update({ courier_id: req.userId, status: 'assigned' })
+      .eq('id', id)
+      .select('id, order_number, status, courier_id')
+      .single();
+
+    if (updateError) {
+      console.error('courier accept job update error:', updateError);
+      throw new Error(updateError.message || 'Failed to assign courier');
+    }
+
+    const { error: historyError } = await supabase.from('order_status_history').insert({
+      order_id: updated.id,
+      status: 'assigned',
+      notes: 'Courier accepted job',
+      changed_by: req.userId,
+    });
+    if (historyError) {
+      console.error('order_status_history insert (assigned) error:', historyError);
+    }
+
+    return res.json({ order: updated });
+  } catch (error) {
+    console.error('post /courier/jobs/:id/accept error:', error);
+    return res.status(500).json({
+      error: 'Failed to accept job',
       details: error.message || 'Please try again later',
     });
   }
