@@ -93,7 +93,7 @@ app.use(cors({
   credentials: true,
 }));
 
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '20mb' }));
 
 /** Auth middleware: require Bearer token, set req.userId from JWT sub */
 function requireAuth(req, res, next) {
@@ -2510,11 +2510,9 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
       throw new Error(courierError.message || 'Failed to load courier');
     }
 
-    const hasProfile =
-      !!courier &&
-      !!courier.national_id &&
-      !!courier.date_of_birth &&
-      !!courier.city;
+    // Consider profile step complete as soon as a courier row exists.
+    // Field-level validation (national_id, dob, city) is enforced at save time.
+    const hasProfile = !!courier;
 
     let hasVehicle = false;
     if (courier) {
