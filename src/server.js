@@ -349,6 +349,35 @@ app.post('/couriers/onboarding/payout-method', requireAuth, async (req, res) => 
   }
 });
 
+// GET /courier/payout-method — get default payout method for courier wallet
+app.get('/courier/payout-method', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    const { data, error } = await supabase
+      .from('courier_payout_methods')
+      .select('id, method_type, provider, account_number, account_name, is_default')
+      .eq('courier_id', req.userId)
+      .order('is_default', { ascending: false })
+      .order('created_at', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      console.error('get /courier/payout-method error:', error);
+      throw new Error(error.message || 'Failed to load payout method');
+    }
+
+    return res.json({ payoutMethod: data || null });
+  } catch (error) {
+    console.error('get /courier/payout-method error:', error);
+    return res.status(500).json({
+      error: 'Failed to load payout method',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // POST /merchants/onboarding
 app.post('/merchants/onboarding', requireAuth, async (req, res) => {
   try {

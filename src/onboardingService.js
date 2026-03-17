@@ -150,6 +150,18 @@ export async function upsertCourierProfile({
     });
   }
 
+  // If we uploaded a profile photo, also persist it into user_profiles.profile_photo
+  if (uploads.profile_photo_url) {
+    try {
+      await supabase
+        .from('user_profiles')
+        .update({ profile_photo: uploads.profile_photo_url })
+        .eq('id', userId);
+    } catch (e) {
+      console.error('Failed to save courier profile photo to user_profiles:', e);
+    }
+  }
+
   return { success: true, uploads };
 }
 
