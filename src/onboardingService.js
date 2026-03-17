@@ -248,22 +248,10 @@ export async function saveCourierDriverLicense({
   if (!licenseNumber || !String(licenseNumber).trim()) throw new Error('licenseNumber is required');
   if (!frontBase64 || !backBase64 || !selfieBase64) throw new Error('All license photos are required');
 
-  // Save core fields on couriers table
-  let expIso = null;
-  if (expiryDate && String(expiryDate).trim()) {
-    const expRaw = String(expiryDate).trim();
-    expIso = expRaw;
-    const expMatch = expRaw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-    if (expMatch) {
-      expIso = `${expMatch[3]}-${expMatch[2]}-${expMatch[1]}`;
-    }
-  }
-
   const { error: courierUpdateError } = await supabase.from('couriers').upsert(
     {
       id: userId,
       drivers_license_number: String(licenseNumber).trim(),
-      drivers_license_expiry: expIso,
       verification_status: 'pending',
     },
     { onConflict: 'id' },
