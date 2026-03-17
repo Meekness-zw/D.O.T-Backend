@@ -2500,7 +2500,7 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
     const { data: courier, error: courierError } = await supabase
       .from('couriers')
       .select(
-        'id, city, national_id, date_of_birth, drivers_license_number, drivers_license_expiry, verification_status',
+        'id, city, national_id, date_of_birth, drivers_license_number, verification_status',
       )
       .eq('id', req.userId)
       .maybeSingle();
@@ -2533,8 +2533,7 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
 
     const hasDriverLicense =
       !!courier &&
-      !!courier.drivers_license_number &&
-      !!courier.drivers_license_expiry;
+      !!courier.drivers_license_number;
 
     let hasPayoutMethod = false;
     if (courier) {
