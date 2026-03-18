@@ -320,3 +320,231 @@ export async function getAdminCouriers(options = {}) {
   if (error) throw new Error(error.message || 'Failed to fetch couriers');
   return { couriers: data || [], total: count ?? 0 };
 }
+
+export async function getAdminPendingDocuments(options = {}) {
+  if (!supabase) throw new Error('Server not configured');
+  const { limit = 50, offset = 0 } = options;
+
+  const { data, error, count } = await supabase
+    .from('courier_documents')
+    .select(
+      `
+      id,
+      courier_id,
+      document_type,
+      document_url,
+      status,
+      created_at,
+      couriers (
+        id,
+        verification_status,
+        is_verified,
+        user_profiles ( full_name, email, phone )
+      )
+    `,
+      { count: 'exact' },
+    )
+    .eq('status', 'pending')
+    .order('created_at', { ascending: false })
+    .range(offset, offset + limit - 1);
+
+  if (error) throw new Error(error.message || 'Failed to fetch pending documents');
+  return { documents: data || [], total: count ?? 0 };
+}
+
+// Pending users (for "Approve Users" tab)
+export async function getAdminPendingUsers() {
+  if (!supabase) throw new Error('Server not configured');
+
+  const [couriersRes, merchantsRes] = await Promise.all([
+    supabase
+      .from('couriers')
+      .select(
+        `
+        id,
+        is_verified,
+        verification_status,
+        created_at,
+        user_profiles ( full_name, email, phone )
+      `,
+      )
+      .or('is_verified.eq.false,verification_status.neq.verified'),
+    supabase
+      .from('merchants')
+      .select(
+        `
+        id,
+        business_name,
+        is_verified,
+        is_active,
+        created_at,
+        user_profiles ( full_name, email, phone )
+      `,
+      )
+      .or('is_verified.eq.false,is_active.eq.false'),
+  ]);
+
+  if (couriersRes.error) {
+    throw new Error(couriersRes.error.message || 'Failed to fetch pending couriers');
+  }
+  if (merchantsRes.error) {
+    throw new Error(merchantsRes.error.message || 'Failed to fetch pending merchants');
+  }
+
+  return {
+    couriers: couriersRes.data || [],
+    merchants: merchantsRes.data || [],
+  };
+}
+
+// Approve a courier: mark verified and approve all their pending documents
+export async function approveCourier(courierId) {
+  if (!supabase) throw new Error('Server not configured');
+
+  const { data: courier, error } = await supabase
+    .from('couriers')
+    .update({ is_verified: true, verification_status: 'verified' })
+    .eq('id', courierId)
+    .select(
+      `
+      id,
+      is_verified,
+      verification_status,
+      user_profiles ( full_name, email, phone )
+    `,
+    )
+    .maybeSingle();
+
+  if (error) throw new Error(error.message || 'Failed to approve courier');
+  if (!courier) throw new Error('Courier not found');
+
+  // Mark all their pending documents as approved
+  await supabase
+    .from('courier_documents')
+    .update({ status: 'approved' })
+    .eq('courier_id', courierId)
+    .eq('status', 'pending');
+
+  return courier;
+}
+
+// Approve a merchant: mark verified & active
+export async function approveMerchant(merchantId) {
+  if (!supabase) throw new Error('Server not configured');
+
+  const { data: merchant, error } = await supabase
+    .from('merchants')
+    .update({ is_verified: true, is_active: true })
+    .eq('id', merchantId)
+    .select(
+      `
+      id,
+      business_name,
+      is_verified,
+      is_active,
+      user_profiles ( full_name, email, phone )
+    `,
+    )
+    .maybeSingle();
+
+  if (error) throw new Error(error.message || 'Failed to approve merchant');
+  if (!merchant) throw new Error('Merchant not found');
+
+  return merchant;
+}
+
+// Detailed view for a specific courier (for admin "Approve Users" modal)
+export async function getAdminCourierDetail(courierId) {
+  if (!supabase) throw new Error('Server not configured');
+
+  const [{ data: courier, error: courierError }, { data: vehicles, error: vehicleError }, { data: documents, error: docsError }] =
+    await Promise.all([
+      supabase
+        .from('couriers')
+        .select(
+          `
+          id,
+          drivers_license_number,
+          is_verified,
+          verification_status,
+          rating,
+          total_deliveries,
+          total_earnings,
+          account_balance,
+          created_at,
+          user_profiles ( full_name, email, phone, profile_photo )
+        `,
+        )
+        .eq('id', courierId)
+        .maybeSingle(),
+      supabase
+        .from('courier_vehicles')
+        .select('id, vehicle_type, brand, model, year, color, license_plate, vehicle_photo_url, registration_certificate_url, is_active')
+        .eq('courier_id', courierId)
+        .order('created_at', { ascending: false }),
+      supabase
+        .from('courier_documents')
+        .select('id, document_type, document_url, status, created_at')
+        .eq('courier_id', courierId)
+        .order('created_at', { ascending: true }),
+    ]);
+
+  if (courierError) throw new Error(courierError.message || 'Failed to load courier');
+  if (!courier) throw new Error('Courier not found');
+  if (vehicleError) throw new Error(vehicleError.message || 'Failed to load courier vehicles');
+  if (docsError) throw new Error(docsError.message || 'Failed to load courier documents');
+
+  return {
+    courier,
+    vehicles: vehicles || [],
+    documents: documents || [],
+  };
+}
+
+// Detailed view for a specific merchant (for admin "Approve Users" modal)
+export async function getAdminMerchantDetail(merchantId) {
+  if (!supabase) throw new Error('Server not configured');
+
+  const [
+    { data: merchant, error: merchantError },
+    { data: stores, error: storesError },
+    { data: documents, error: docsError },
+  ] = await Promise.all([
+    supabase
+      .from('merchants')
+      .select(
+        `
+        id,
+        business_name,
+        business_type,
+        is_verified,
+        is_active,
+        created_at,
+        user_profiles ( full_name, email, phone )
+      `,
+      )
+      .eq('id', merchantId)
+      .maybeSingle(),
+    supabase
+      .from('stores')
+      .select('id, store_name, logo, banner_url, city, address_line1, is_active')
+      .eq('merchant_id', merchantId)
+      .order('created_at', { ascending: false }),
+    supabase
+      .from('merchant_documents')
+      .select('id, document_type, document_url, status, created_at')
+      .eq('merchant_id', merchantId)
+      .order('created_at', { ascending: true }),
+  ]);
+
+  if (merchantError) throw new Error(merchantError.message || 'Failed to load merchant');
+  if (!merchant) throw new Error('Merchant not found');
+  if (storesError) throw new Error(storesError.message || 'Failed to load stores');
+  if (docsError) throw new Error(docsError.message || 'Failed to load merchant documents');
+
+  return {
+    merchant,
+    stores: stores || [],
+    documents: documents || [],
+  };
+}

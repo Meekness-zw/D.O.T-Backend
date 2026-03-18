@@ -24,6 +24,12 @@ import {
   getAdminStores,
   getAdminMerchants,
   getAdminCouriers,
+  getAdminPendingDocuments,
+  getAdminPendingUsers,
+  approveCourier,
+  approveMerchant,
+  getAdminCourierDetail,
+  getAdminMerchantDetail,
 } from './adminService.js';
 import { supabaseAdmin as publicSupabase } from './supabaseAdminClient.js';
 
@@ -373,6 +379,32 @@ app.get('/courier/payout-method', requireAuth, async (req, res) => {
     console.error('get /courier/payout-method error:', error);
     return res.status(500).json({
       error: 'Failed to load payout method',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// List all documents uploaded by the authenticated courier
+app.get('/courier/documents', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    const { data, error } = await supabase
+      .from('courier_documents')
+      .select('id, courier_id, document_type, document_url, status, created_at')
+      .eq('courier_id', req.userId)
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      console.error('get /courier/documents error:', error);
+      throw new Error(error.message || 'Failed to load documents');
+    }
+
+    return res.json({ documents: data || [] });
+  } catch (error) {
+    console.error('get /courier/documents error:', error);
+    return res.status(500).json({
+      error: 'Failed to load documents',
       details: error.message || 'Please try again later',
     });
   }
@@ -3468,6 +3500,80 @@ app.get('/admin/couriers', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('admin/couriers error:', error);
     return res.status(500).json({ error: 'Failed to load couriers', details: error.message || 'Try again later' });
+  }
+});
+
+app.get('/admin/documents/pending', requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const offset = parseInt(req.query.offset, 10) || 0;
+    const { documents, total } = await getAdminPendingDocuments({ limit, offset });
+    return res.json({ documents, total });
+  } catch (error) {
+    console.error('admin/documents/pending error:', error);
+    return res
+      .status(500)
+      .json({ error: 'Failed to load pending documents', details: error.message || 'Try again later' });
+  }
+});
+
+// "Approve Users" tab helpers
+// List all pending couriers and merchants
+app.get('/admin/users/pending', requireAdmin, async (req, res) => {
+  try {
+    const result = await getAdminPendingUsers();
+    return res.json(result);
+  } catch (error) {
+    console.error('admin/users/pending error:', error);
+    return res.status(500).json({ error: 'Failed to load pending users', details: error.message || 'Try again later' });
+  }
+});
+
+// Approve a courier by ID (marks verified + approves their pending documents)
+app.post('/admin/couriers/:id/approve', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const courier = await approveCourier(id);
+    return res.json({ courier });
+  } catch (error) {
+    console.error('admin/couriers/:id/approve error:', error);
+    return res.status(500).json({ error: 'Failed to approve courier', details: error.message || 'Try again later' });
+  }
+});
+
+// Approve a merchant by ID (marks verified + active)
+app.post('/admin/merchants/:id/approve', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const merchant = await approveMerchant(id);
+    return res.json({ merchant });
+  } catch (error) {
+    console.error('admin/merchants/:id/approve error:', error);
+    return res.status(500).json({ error: 'Failed to approve merchant', details: error.message || 'Try again later' });
+  }
+});
+
+// Detailed view of a single courier (profile + vehicles + documents)
+app.get('/admin/couriers/:id/detail', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const detail = await getAdminCourierDetail(id);
+    return res.json(detail);
+  } catch (error) {
+    console.error('admin/couriers/:id/detail error:', error);
+    return res.status(500).json({ error: 'Failed to load courier', details: error.message || 'Try again later' });
+  }
+});
+
+// Detailed view of a single merchant (profile + stores + documents)
+app.get('/admin/merchants/:id/detail', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const detail = await getAdminMerchantDetail(id);
+    return res.json(detail);
+  } catch (error) {
+    console.error('admin/merchants/:id/detail error:', error);
+    return res.status(500).json({ error: 'Failed to load merchant', details: error.message || 'Try again later' });
   }
 });
 
