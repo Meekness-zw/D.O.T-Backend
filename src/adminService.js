@@ -352,6 +352,43 @@ export async function getAdminPendingDocuments(options = {}) {
   return { documents: data || [], total: count ?? 0 };
 }
 
+function extractBucketAndPathFromSupabaseUrl(url) {
+  if (!url || typeof url !== 'string') return null;
+  try {
+    const u = new URL(url);
+    // Expected patterns:
+    // /storage/v1/object/public/<bucket>/<path>
+    // /storage/v1/object/<bucket>/<path>
+    const parts = u.pathname.split('/').filter(Boolean);
+    const objectIdx = parts.findIndex((p) => p === 'object');
+    if (objectIdx === -1) return null;
+    const afterObject = parts.slice(objectIdx + 1);
+    if (afterObject.length < 2) return null;
+
+    const bucket = afterObject[0] === 'public' ? afterObject[1] : afterObject[0];
+    const pathParts = afterObject[0] === 'public' ? afterObject.slice(2) : afterObject.slice(1);
+    const path = decodeURIComponent(pathParts.join('/'));
+    if (!bucket || !path) return null;
+    return { bucket, path };
+  } catch {
+    return null;
+  }
+}
+
+async function addSignedUrlToItem(item, urlKey, signedKey = 'signed_url', expiresInSeconds = 60 * 30) {
+  if (!item) return item;
+  const originalUrl = item[urlKey];
+  const extracted = extractBucketAndPathFromSupabaseUrl(originalUrl);
+  if (!extracted) return item;
+
+  const { data, error } = await supabase.storage
+    .from(extracted.bucket)
+    .createSignedUrl(extracted.path, expiresInSeconds);
+
+  if (error || !data?.signedUrl) return item;
+  return { ...item, [signedKey]: data.signedUrl };
+}
+
 // Pending users (for "Approve Users" tab)
 export async function getAdminPendingUsers() {
   if (!supabase) throw new Error('Server not configured');
@@ -494,10 +531,32 @@ export async function getAdminCourierDetail(courierId) {
   if (vehicleError) throw new Error(vehicleError.message || 'Failed to load courier vehicles');
   if (docsError) throw new Error(docsError.message || 'Failed to load courier documents');
 
+  const signedVehicles = await Promise.all(
+    (vehicles || []).map(async (v) => {
+      let out = v;
+      out = await addSignedUrlToItem(out, 'vehicle_photo_url', 'vehicle_photo_signed_url');
+      out = await addSignedUrlToItem(out, 'registration_certificate_url', 'registration_certificate_signed_url');
+      return out;
+    }),
+  );
+
+  const signedDocuments = await Promise.all(
+    (documents || []).map(async (d) => addSignedUrlToItem(d, 'document_url', 'document_signed_url')),
+  );
+
+  const courierWithSignedProfile = await addSignedUrlToItem(
+    { ...courier, profile_photo_url: courier.user_profiles?.profile_photo || null },
+    'profile_photo_url',
+    'profile_photo_signed_url',
+  );
+
   return {
-    courier,
-    vehicles: vehicles || [],
-    documents: documents || [],
+    courier: {
+      ...courier,
+      profile_photo_signed_url: courierWithSignedProfile?.profile_photo_signed_url || null,
+    },
+    vehicles: signedVehicles,
+    documents: signedDocuments,
   };
 }
 
@@ -542,9 +601,22 @@ export async function getAdminMerchantDetail(merchantId) {
   if (storesError) throw new Error(storesError.message || 'Failed to load stores');
   if (docsError) throw new Error(docsError.message || 'Failed to load merchant documents');
 
+  const signedStores = await Promise.all(
+    (stores || []).map(async (s) => {
+      let out = s;
+      out = await addSignedUrlToItem(out, 'logo', 'logo_signed_url');
+      out = await addSignedUrlToItem(out, 'banner_url', 'banner_signed_url');
+      return out;
+    }),
+  );
+
+  const signedDocuments = await Promise.all(
+    (documents || []).map(async (d) => addSignedUrlToItem(d, 'document_url', 'document_signed_url')),
+  );
+
   return {
     merchant,
-    stores: stores || [],
-    documents: documents || [],
+    stores: signedStores,
+    documents: signedDocuments,
   };
 }
