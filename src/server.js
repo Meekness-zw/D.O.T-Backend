@@ -316,6 +316,38 @@ app.post('/couriers/onboarding/vehicle', requireAuth, async (req, res) => {
   }
 });
 
+// GET /courier/vehicle — get the active vehicle for the logged-in courier
+app.get('/courier/vehicle', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    const { data, error } = await supabase
+      .from('courier_vehicles')
+      .select(
+        'id, courier_id, vehicle_type, brand, model, year, color, license_plate, vehicle_photo_url, registration_certificate_url, is_active, created_at, updated_at',
+      )
+      .eq('courier_id', req.userId)
+      .eq('is_active', true)
+      .order('created_at', { ascending: false })
+      .limit(1);
+
+    if (error) {
+      console.error('get /courier/vehicle error:', error);
+      throw new Error(error.message || 'Failed to load courier vehicle');
+    }
+
+    const vehicle = Array.isArray(data) && data.length > 0 ? data[0] : null;
+
+    return res.json({ vehicle });
+  } catch (error) {
+    console.error('get /courier/vehicle error:', error);
+    return res.status(500).json({
+      error: 'Failed to load courier vehicle',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // POST /couriers/onboarding/driver-license
 app.post('/couriers/onboarding/driver-license', requireAuth, async (req, res) => {
   try {
