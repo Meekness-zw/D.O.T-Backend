@@ -2,6 +2,11 @@ import { supabaseAdmin } from './supabaseAdminClient.js';
 
 const supabase = supabaseAdmin;
 
+// Bucket names (override via env to match your Supabase project)
+const COURIER_BUCKET = process.env.SUPABASE_COURIER_BUCKET || 'courier-documents';
+const MERCHANT_BUCKET = process.env.SUPABASE_MERCHANT_BUCKET || 'merchant-documents';
+const STORE_LOGOS_BUCKET = process.env.SUPABASE_STORE_LOGOS_BUCKET || 'store-logos';
+
 function requireSupabase() {
   if (!supabase) {
     throw new Error('Server not configured (missing SUPABASE_SERVICE_ROLE_KEY)');
@@ -118,7 +123,7 @@ export async function upsertCourierProfile({
   if (profilePhotoBase64) {
     const ext = extForMime(parseDataUrl(profilePhotoBase64)?.mime);
     const url = await uploadToBucket({
-      bucket: 'courier-documents',
+      bucket: COURIER_BUCKET,
       path: `couriers/${userId}/profile_photo.${ext}`,
       dataUrl: profilePhotoBase64,
     });
@@ -135,7 +140,7 @@ export async function upsertCourierProfile({
   if (nationalIdPhotoBase64) {
     const ext = extForMime(parseDataUrl(nationalIdPhotoBase64)?.mime);
     const url = await uploadToBucket({
-      bucket: 'courier-documents',
+      bucket: COURIER_BUCKET,
       path: `couriers/${userId}/national_id.${ext}`,
       dataUrl: nationalIdPhotoBase64,
     });
@@ -215,7 +220,7 @@ export async function saveCourierVehicle({
   if (vehiclePhotoBase64) {
     const ext = extForMime(parseDataUrl(vehiclePhotoBase64)?.mime);
     const url = await uploadToBucket({
-      bucket: 'courier-documents',
+      bucket: COURIER_BUCKET,
       path: `couriers/${userId}/vehicles/${vehicle.id}/vehicle_photo.${ext}`,
       dataUrl: vehiclePhotoBase64,
     });
@@ -226,7 +231,7 @@ export async function saveCourierVehicle({
   if (registrationCertificateBase64) {
     const ext = extForMime(parseDataUrl(registrationCertificateBase64)?.mime);
     const url = await uploadToBucket({
-      bucket: 'courier-documents',
+      bucket: COURIER_BUCKET,
       path: `couriers/${userId}/vehicles/${vehicle.id}/registration_certificate.${ext}`,
       dataUrl: registrationCertificateBase64,
     });
@@ -274,7 +279,7 @@ export async function saveCourierDriverLicense({
   const uploads = {};
 
   const frontUrl = await uploadToBucket({
-    bucket: 'courier-documents',
+    bucket: COURIER_BUCKET,
     path: `couriers/${userId}/driver_license/front.${extForMime(parseDataUrl(frontBase64)?.mime)}`,
     dataUrl: frontBase64,
   });
@@ -287,7 +292,7 @@ export async function saveCourierDriverLicense({
   });
 
   const backUrl = await uploadToBucket({
-    bucket: 'courier-documents',
+    bucket: COURIER_BUCKET,
     path: `couriers/${userId}/driver_license/back.${extForMime(parseDataUrl(backBase64)?.mime)}`,
     dataUrl: backBase64,
   });
@@ -300,7 +305,7 @@ export async function saveCourierDriverLicense({
   });
 
   const selfieUrl = await uploadToBucket({
-    bucket: 'courier-documents',
+    bucket: COURIER_BUCKET,
     path: `couriers/${userId}/driver_license/selfie.${extForMime(parseDataUrl(selfieBase64)?.mime)}`,
     dataUrl: selfieBase64,
   });
@@ -456,7 +461,7 @@ export async function upsertMerchantOnboarding({
   if (storeLogoBase64) {
     const ext = extForMime(parseDataUrl(storeLogoBase64)?.mime);
     const url = await uploadToBucket({
-      bucket: 'store-logos',
+      bucket: STORE_LOGOS_BUCKET,
       path: `stores/${storeId}/logo.${ext}`,
       dataUrl: storeLogoBase64,
     });
@@ -466,7 +471,7 @@ export async function upsertMerchantOnboarding({
   if (storeBannerBase64) {
     const ext = extForMime(parseDataUrl(storeBannerBase64)?.mime);
     const url = await uploadToBucket({
-      bucket: 'store-logos',
+      bucket: STORE_LOGOS_BUCKET,
       path: `stores/${storeId}/banner.${ext}`,
       dataUrl: storeBannerBase64,
     });
@@ -521,7 +526,7 @@ export async function upsertMerchantOnboarding({
   if (ownerIdBase64) {
     const ext = extForMime(parseDataUrl(ownerIdBase64)?.mime);
     const url = await uploadToBucket({
-      bucket: 'merchant-documents',
+      bucket: MERCHANT_BUCKET,
       path: `merchants/${userId}/owner_id.${ext}`,
       dataUrl: ownerIdBase64,
     });
@@ -536,7 +541,7 @@ export async function upsertMerchantOnboarding({
   if (businessCertificateBase64) {
     const ext = extForMime(parseDataUrl(businessCertificateBase64)?.mime);
     const url = await uploadToBucket({
-      bucket: 'merchant-documents',
+      bucket: MERCHANT_BUCKET,
       path: `merchants/${userId}/business_certificate.${ext}`,
       dataUrl: businessCertificateBase64,
     });
@@ -551,7 +556,7 @@ export async function upsertMerchantOnboarding({
   if (proofOfAddressBase64) {
     const ext = extForMime(parseDataUrl(proofOfAddressBase64)?.mime);
     const url = await uploadToBucket({
-      bucket: 'merchant-documents',
+      bucket: MERCHANT_BUCKET,
       path: `merchants/${userId}/proof_of_address.${ext}`,
       dataUrl: proofOfAddressBase64,
     });
