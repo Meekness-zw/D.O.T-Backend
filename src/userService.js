@@ -31,16 +31,23 @@ export async function getRoles(userId) {
   // Migration fallback: infer roles from the role tables themselves.
   // This keeps behavior correct even if user_roles hasn't been backfilled yet.
   try {
-    const [{ data: customerRow }, { data: merchantRow }, { data: courierRow }] =
-      await Promise.all([
-        supabase.from('customers').select('id').eq('id', userId).maybeSingle(),
-        supabase.from('merchants').select('id').eq('id', userId).maybeSingle(),
-        supabase.from('couriers').select('id').eq('id', userId).maybeSingle(),
-      ]);
+    const [
+      { data: customerRow },
+      { data: merchantRow },
+      { data: courierRow },
+      { data: storeRows },
+    ] = await Promise.all([
+      supabase.from('customers').select('id').eq('id', userId).maybeSingle(),
+      supabase.from('merchants').select('id').eq('id', userId).maybeSingle(),
+      supabase.from('couriers').select('id').eq('id', userId).maybeSingle(),
+      // If merchants table inference fails during migrations, stores (merchant_id) still tells us.
+      supabase.from('stores').select('id').eq('merchant_id', userId).limit(1),
+    ]);
 
     const inferred = [];
     if (customerRow) inferred.push('customer');
     if (merchantRow) inferred.push('merchant');
+    else if (Array.isArray(storeRows) && storeRows.length > 0) inferred.push('merchant');
     if (courierRow) inferred.push('courier');
 
     if (inferred.length > 0) return inferred;
