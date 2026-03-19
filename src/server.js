@@ -324,7 +324,7 @@ app.get('/courier/vehicle', requireAuth, async (req, res) => {
     const { data, error } = await supabase
       .from('courier_vehicles')
       .select(
-        'id, courier_id, vehicle_type, brand, model, year, color, license_plate, vehicle_photo_url, registration_certificate_url, is_active, created_at, updated_at',
+        'id, courier_id, vehicle_type, brand, model, year, color, license_plate, delivery_bag_available, vehicle_photo_url, registration_certificate_url, is_active, created_at, updated_at',
       )
       .eq('courier_id', req.userId)
       .eq('is_active', true)
@@ -336,7 +336,39 @@ app.get('/courier/vehicle', requireAuth, async (req, res) => {
       throw new Error(error.message || 'Failed to load courier vehicle');
     }
 
-    const vehicle = Array.isArray(data) && data.length > 0 ? data[0] : null;
+    let vehicle = Array.isArray(data) && data.length > 0 ? data[0] : null;
+
+    // Attempt to create a signed URL for the vehicle photo if we have a storage URL
+    if (vehicle?.vehicle_photo_url) {
+      try {
+        const originalUrl = vehicle.vehicle_photo_url;
+        const u = new URL(originalUrl);
+        const parts = u.pathname.split('/').filter(Boolean);
+        // Expected patterns:
+        // /storage/v1/object/public/<bucket>/<path>
+        // /storage/v1/object/<bucket>/<path>
+        const objectIdx = parts.findIndex((p) => p === 'object');
+        if (objectIdx !== -1) {
+          const afterObject = parts.slice(objectIdx + 1);
+          if (afterObject.length >= 2) {
+            const bucket = afterObject[0] === 'public' ? afterObject[1] : afterObject[0];
+            const pathParts =
+              afterObject[0] === 'public' ? afterObject.slice(2) : afterObject.slice(1);
+            const path = decodeURIComponent(pathParts.join('/'));
+            if (bucket && path) {
+              const { data: signed, error: signErr } = await supabase.storage
+                .from(bucket)
+                .createSignedUrl(path, 60 * 60); // 1 hour
+              if (!signErr && signed?.signedUrl) {
+                vehicle = { ...vehicle, vehicle_photo_signed_url: signed.signedUrl };
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.error('Failed to sign vehicle photo URL:', e);
+      }
+    }
 
     return res.json({ vehicle });
   } catch (error) {
