@@ -11,18 +11,44 @@ if (!supabase) {
  */
 export async function getRoles(userId) {
   if (!userId || !supabase) return [];
-  const { data: rows, error } = await supabase
-    .from('user_roles')
-    .select('role')
-    .eq('user_id', userId);
-  if (error) {
-    console.error('getRoles error:', error);
-    return [];
+
+  // Preferred: multi-role source of truth from user_roles table.
+  // If the table is empty/missing or the row isn't present, fall back to checking
+  // role-specific tables so login/orders can still work during migration windows.
+  try {
+    const { data: rows, error } = await supabase
+      .from('user_roles')
+      .select('role')
+      .eq('user_id', userId);
+
+    if (!error && Array.isArray(rows) && rows.length > 0) {
+      return rows.map((r) => r.role);
+    }
+  } catch (e) {
+    // Ignore: we'll fall back to checking the role tables below.
   }
-  if (Array.isArray(rows) && rows.length > 0) {
-    return rows.map((r) => r.role);
+
+  // Migration fallback: infer roles from the role tables themselves.
+  // This keeps behavior correct even if user_roles hasn't been backfilled yet.
+  try {
+    const [{ data: customerRow }, { data: merchantRow }, { data: courierRow }] =
+      await Promise.all([
+        supabase.from('customers').select('id').eq('id', userId).maybeSingle(),
+        supabase.from('merchants').select('id').eq('id', userId).maybeSingle(),
+        supabase.from('couriers').select('id').eq('id', userId).maybeSingle(),
+      ]);
+
+    const inferred = [];
+    if (customerRow) inferred.push('customer');
+    if (merchantRow) inferred.push('merchant');
+    if (courierRow) inferred.push('courier');
+
+    if (inferred.length > 0) return inferred;
+  } catch (e) {
+    // Ignore: final fallback to primary profile.role below.
   }
-  // Fallback: no user_roles (e.g. before migration) — use profile.role
+
+  // Final fallback: use profile.role only.
   const profile = await getProfile(userId);
   return profile?.role ? [profile.role] : [];
 }
