@@ -2665,12 +2665,115 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
   }
 });
 
+// GET /courier/settings — current courier app settings
+app.get('/courier/settings', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    const { data, error } = await supabase
+      .from('courier_settings')
+      .select(
+        'language, dark_mode, push_notifications, sound, vibration, preferred_map_app, auto_open_maps',
+      )
+      .eq('courier_id', req.userId)
+      .maybeSingle();
+
+    if (error) {
+      console.error('get /courier/settings error:', error);
+      throw new Error(error.message || 'Failed to load courier settings');
+    }
+
+    const settings = data || {};
+
+    return res.json({
+      language: settings.language || 'en',
+      dark_mode: settings.dark_mode ?? false,
+      push_notifications: settings.push_notifications ?? true,
+      sound: settings.sound ?? true,
+      vibration: settings.vibration ?? true,
+      preferred_map_app: settings.preferred_map_app || 'default',
+      auto_open_maps: settings.auto_open_maps ?? false,
+    });
+  } catch (error) {
+    console.error('get /courier/settings error:', error);
+    return res.status(500).json({
+      error: 'Failed to load courier settings',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// PUT /courier/settings — update courier app settings
+app.put('/courier/settings', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    const {
+      language,
+      dark_mode,
+      push_notifications,
+      sound,
+      vibration,
+      preferred_map_app,
+      auto_open_maps,
+    } = req.body || {};
+
+    const payload = {
+      courier_id: req.userId,
+    };
+
+    if (language !== undefined) payload.language = language || 'en';
+    if (dark_mode !== undefined) payload.dark_mode = !!dark_mode;
+    if (push_notifications !== undefined) payload.push_notifications = !!push_notifications;
+    if (sound !== undefined) payload.sound = !!sound;
+    if (vibration !== undefined) payload.vibration = !!vibration;
+    if (preferred_map_app !== undefined)
+      payload.preferred_map_app = preferred_map_app || 'default';
+    if (auto_open_maps !== undefined) payload.auto_open_maps = !!auto_open_maps;
+
+    const { data, error } = await supabase
+      .from('courier_settings')
+      .upsert(payload, { onConflict: 'courier_id' })
+      .select(
+        'language, dark_mode, push_notifications, sound, vibration, preferred_map_app, auto_open_maps',
+      )
+      .maybeSingle();
+
+    if (error) {
+      console.error('put /courier/settings error:', error);
+      throw new Error(error.message || 'Failed to save courier settings');
+    }
+
+    const settings = data || {};
+
+    return res.json({
+      language: settings.language || 'en',
+      dark_mode: settings.dark_mode ?? false,
+      push_notifications: settings.push_notifications ?? true,
+      sound: settings.sound ?? true,
+      vibration: settings.vibration ?? true,
+      preferred_map_app: settings.preferred_map_app || 'default',
+      auto_open_maps: settings.auto_open_maps ?? false,
+    });
+  } catch (error) {
+    console.error('put /courier/settings error:', error);
+    return res.status(500).json({
+      error: 'Failed to save courier settings',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // GET /courier/performance — summary metrics for current courier
+// Query: ?period=day|week|month (default: day)
 app.get('/courier/performance', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
 
     const courierId = req.userId;
+    const periodParam = String(req.query.period || 'day').toLowerCase();
+    const allowedPeriods = ['day', 'week', 'month'];
+    const period = allowedPeriods.includes(periodParam) ? periodParam : 'day';
 
     const [
       { data: courierRow, error: courierError },
@@ -2714,45 +2817,58 @@ app.get('/courier/performance', requireAuth, async (req, res) => {
         (earningsRows || []).reduce((sum, r) => sum + Number(r.amount || 0), 0),
     );
 
-    const today = new Date();
-    today.setUTCHours(0, 0, 0, 0);
-    const startOfDay = today.toISOString();
-    const endOfDay = new Date(today);
-    endOfDay.setUTCHours(23, 59, 59, 999);
-    const endOfDayIso = endOfDay.toISOString();
+    // Date range based on period
+    const now = new Date();
+    const start = new Date(now);
+    start.setUTCHours(0, 0, 0, 0);
 
-    const { data: todayOrders, error: todayOrdersError } = await supabase
+    if (period === 'week') {
+      start.setDate(start.getDate() - 6); // last 7 days including today
+    } else if (period === 'month') {
+      start.setDate(start.getDate() - 29); // last 30 days including today
+    }
+
+    const startIso = start.toISOString();
+    const end = new Date(now);
+    end.setUTCHours(23, 59, 59, 999);
+    const endIso = end.toISOString();
+
+    const { data: periodOrders, error: periodOrdersError } = await supabase
       .from('orders')
       .select('id, total_amount, created_at')
       .eq('courier_id', courierId)
       .eq('status', 'delivered')
-      .gte('created_at', startOfDay)
-      .lte('created_at', endOfDayIso);
+      .gte('created_at', startIso)
+      .lte('created_at', endIso);
 
-    if (todayOrdersError) {
-      console.error('courier performance today orders error:', todayOrdersError);
-      throw new Error(todayOrdersError.message || 'Failed to load today orders');
+    if (periodOrdersError) {
+      console.error('courier performance period orders error:', periodOrdersError);
+      throw new Error(periodOrdersError.message || 'Failed to load period orders');
     }
 
-    const dayOrdersCount = todayOrders?.length || 0;
-    const dayEarnings = (todayOrders || []).reduce(
+    const periodOrdersCount = periodOrders?.length || 0;
+    const periodEarnings = (periodOrders || []).reduce(
       (sum, o) => sum + Number(o.total_amount || 0),
       0,
     );
 
     const response = {
-      period: 'day',
-      dayEarnings,
-      dayOrdersCount,
+      period,
+      periodEarnings,
+      periodOrdersCount,
       totalDeliveries,
       totalEarnings,
       currency: 'USD',
       // Placeholders for now; can be enhanced later with real distance/fees
       mileageKm: null,
       perKmRate: null,
-      receivedFares: dayEarnings,
+      receivedFares: periodEarnings,
       serviceFeesAndTaxes: 0,
       generatedAt: new Date().toISOString(),
+      range: {
+        start: startIso,
+        end: endIso,
+      },
     };
 
     return res.json(response);
