@@ -2665,6 +2665,106 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
   }
 });
 
+// GET /courier/performance — summary metrics for current courier
+app.get('/courier/performance', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    const courierId = req.userId;
+
+    const [
+      { data: courierRow, error: courierError },
+      { data: completedOrders, error: ordersError },
+      { data: earningsRows, error: earningsError },
+    ] = await Promise.all([
+      supabase
+        .from('couriers')
+        .select('total_deliveries, total_earnings, created_at')
+        .eq('id', courierId)
+        .maybeSingle(),
+      supabase
+        .from('orders')
+        .select('id, total_amount, created_at')
+        .eq('courier_id', courierId)
+        .eq('status', 'delivered'),
+      supabase
+        .from('wallet_transactions')
+        .select('amount, created_at')
+        .eq('user_id', courierId)
+        .eq('user_type', 'courier')
+        .eq('transaction_type', 'earnings'),
+    ]);
+
+    if (courierError) {
+      console.error('courier performance courier error:', courierError);
+      throw new Error(courierError.message || 'Failed to load courier');
+    }
+    if (ordersError) {
+      console.error('courier performance orders error:', ordersError);
+      throw new Error(ordersError.message || 'Failed to load orders');
+    }
+    if (earningsError) {
+      console.error('courier performance earnings error:', earningsError);
+      throw new Error(earningsError.message || 'Failed to load earnings');
+    }
+
+    const totalDeliveries = courierRow?.total_deliveries ?? (completedOrders?.length || 0);
+    const totalEarnings = Number(
+      courierRow?.total_earnings ??
+        (earningsRows || []).reduce((sum, r) => sum + Number(r.amount || 0), 0),
+    );
+
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+    const startOfDay = today.toISOString();
+    const endOfDay = new Date(today);
+    endOfDay.setUTCHours(23, 59, 59, 999);
+    const endOfDayIso = endOfDay.toISOString();
+
+    const { data: todayOrders, error: todayOrdersError } = await supabase
+      .from('orders')
+      .select('id, total_amount, created_at')
+      .eq('courier_id', courierId)
+      .eq('status', 'delivered')
+      .gte('created_at', startOfDay)
+      .lte('created_at', endOfDayIso);
+
+    if (todayOrdersError) {
+      console.error('courier performance today orders error:', todayOrdersError);
+      throw new Error(todayOrdersError.message || 'Failed to load today orders');
+    }
+
+    const dayOrdersCount = todayOrders?.length || 0;
+    const dayEarnings = (todayOrders || []).reduce(
+      (sum, o) => sum + Number(o.total_amount || 0),
+      0,
+    );
+
+    const response = {
+      period: 'day',
+      dayEarnings,
+      dayOrdersCount,
+      totalDeliveries,
+      totalEarnings,
+      currency: 'USD',
+      // Placeholders for now; can be enhanced later with real distance/fees
+      mileageKm: null,
+      perKmRate: null,
+      receivedFares: dayEarnings,
+      serviceFeesAndTaxes: 0,
+      generatedAt: new Date().toISOString(),
+    };
+
+    return res.json(response);
+  } catch (error) {
+    console.error('get /courier/performance error:', error);
+    return res.status(500).json({
+      error: 'Failed to load courier performance',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // GET /users/me/notifications — notifications for current user
 app.get('/users/me/notifications', requireAuth, async (req, res) => {
   try {
