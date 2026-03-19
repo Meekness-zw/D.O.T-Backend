@@ -213,8 +213,22 @@ export async function getFullUserMe(userId) {
     result.store = store || null;
   }
   if (result.roles.includes('courier')) {
-    const { data } = await supabase.from('couriers').select('*').eq('id', userId).single();
-    result.courier = data || null;
+    const { data: courierRow } = await supabase.from('couriers').select('*').eq('id', userId).single();
+    result.courier = courierRow || null;
+
+    // Prefer courier-specific profile photo stored in courier_documents (courier storage folder)
+    const { data: courierDocs } = await supabase
+      .from('courier_documents')
+      .select('document_type, document_url, created_at')
+      .eq('courier_id', userId)
+      .eq('document_type', 'profile_photo')
+      .order('created_at', { ascending: false })
+      .limit(1);
+    const courierProfileDoc =
+      Array.isArray(courierDocs) && courierDocs.length > 0 ? courierDocs[0] : null;
+    if (courierProfileDoc?.document_url) {
+      result.courier_profile_photo_url = courierProfileDoc.document_url;
+    }
   }
 
   return result;

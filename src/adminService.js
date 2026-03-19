@@ -405,7 +405,7 @@ export async function getAdminPendingUsers() {
         user_profiles ( full_name, email, phone )
       `,
       )
-      .or('is_verified.eq.false,verification_status.neq.verified'),
+      .or('is_verified.eq.false,verification_status.neq.approved'),
     supabase
       .from('merchants')
       .select(
@@ -440,7 +440,7 @@ export async function approveCourier(courierId) {
 
   const { data: courier, error } = await supabase
     .from('couriers')
-    .update({ is_verified: true, verification_status: 'verified' })
+    .update({ is_verified: true, verification_status: 'approved' })
     .eq('id', courierId)
     .select(
       `
