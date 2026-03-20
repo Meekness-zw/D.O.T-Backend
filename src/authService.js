@@ -270,7 +270,25 @@ export async function loginWithPassword({ phone, password }) {
     profile = profileData;
   }
 
-  const roles = await getRoles(existingUser.id);
+  let roles = await getRoles(existingUser.id);
+
+  // Multi-role UI relies on user.roles. Guarantee "merchant" if DB says this user is a merchant
+  // (merchants row or owns a store), even when user_roles / getRoles drifted.
+  try {
+    if (supabaseAdmin && !roles.includes('merchant')) {
+      const [{ data: merchantRow }, { data: storeRows }] = await Promise.all([
+        supabaseAdmin.from('merchants').select('id').eq('id', existingUser.id).maybeSingle(),
+        supabaseAdmin.from('stores').select('id').eq('merchant_id', existingUser.id).limit(1),
+      ]);
+      if (merchantRow || (Array.isArray(storeRows) && storeRows.length > 0)) {
+        roles = [...roles, 'merchant'];
+      }
+    }
+  } catch (e) {
+    console.warn('loginWithPassword: could not expand merchant role:', e?.message || e);
+  }
+  roles = [...new Set(roles)];
+
   const primaryRole = profile?.role ?? (roles[0] ?? null);
 
   const sessionId = crypto.randomUUID();
