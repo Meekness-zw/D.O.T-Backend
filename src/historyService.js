@@ -9,17 +9,56 @@ import { getProfile, getRoles } from './userService.js';
 const supabase = supabaseAdmin;
 
 /**
+ * When the client passes ?role=merchant|courier|customer, honor it if the user can act in that role
+ * (DB capability), not only if user_roles array includes it — avoids empty merchant orders when
+ * profile.primaryRole is courier but the same user owns stores.
+ */
+async function resolveEffectiveRole(userId, requestedRole, userRoles, profile) {
+  if (!requestedRole || !['customer', 'merchant', 'courier'].includes(requestedRole)) {
+    return profile?.role ?? (userRoles?.length ? userRoles[0] : null);
+  }
+  if (userRoles.includes(requestedRole)) {
+    return requestedRole;
+  }
+  if (requestedRole === 'merchant') {
+    const [{ data: storeRows }, { data: merchantRow }] = await Promise.all([
+      supabase.from('stores').select('id').eq('merchant_id', userId).limit(1),
+      supabase.from('merchants').select('id').eq('id', userId).maybeSingle(),
+    ]);
+    if ((storeRows && storeRows.length > 0) || merchantRow) {
+      return 'merchant';
+    }
+  }
+  if (requestedRole === 'courier') {
+    const { data: courierRow } = await supabase
+      .from('couriers')
+      .select('id')
+      .eq('id', userId)
+      .maybeSingle();
+    if (courierRow) return 'courier';
+  }
+  if (requestedRole === 'customer') {
+    const { data: customerRow } = await supabase
+      .from('customers')
+      .select('id')
+      .eq('id', userId)
+      .maybeSingle();
+    if (customerRow) return 'customer';
+  }
+  return profile?.role ?? (userRoles?.length ? userRoles[0] : null);
+}
+
+/**
  * Get orders for the current user based on their role.
- * Supports multi-role: pass options.role to get orders for that role (must be in user's roles).
+ * Supports multi-role: pass options.role to fetch orders for that role; merchant is allowed if the
+ * user owns stores / has a merchants row even when JWT profile primary role is another role.
  */
 export async function getOrdersForUser(userId, options = {}) {
   if (!userId || !supabase) throw new Error('userId required and server must be configured');
 
   const profile = await getProfile(userId);
   const userRoles = await getRoles(userId);
-  const effectiveRole = options.role && userRoles.includes(options.role)
-    ? options.role
-    : (profile?.role ?? null);
+  const effectiveRole = await resolveEffectiveRole(userId, options.role, userRoles, profile);
   if (!effectiveRole) return { orders: [], role: null };
 
   const { limit = 50, offset = 0, status } = options;
