@@ -1,6 +1,15 @@
 /**
  * Store operating hours → whether customers can order right now.
- * Uses IANA timezone (default Africa/Harare) and per-day { open, close } in 24h "HH:MM".
+ * Normalizes JSON from `stores.operating_hours` (merchant onboarding, PATCH, or manual DB edits).
+ *
+ * Supported shapes:
+ * - { timezone?, monday: { open, close }, ... }  (from StoreDetailsScreen / onboarding)
+ * - { timezone?, weekly: { monday: {...} } } | { schedule: {...} } | { days: {...} }
+ * - { every_day: { open, close } } (applied to all weekdays present or all 7 if used alone)
+ * - Per-day string: "08:00-20:00" or { hours: "08:00-20:00" }
+ * - Aliases: opens_at/closes_at, start/end, from/to
+ * - JSON string (if driver returns string)
+ * - Array: [{ day: "monday", open, close }]
  */
 
 const DEFAULT_TZ = 'Africa/Harare';
@@ -15,8 +24,13 @@ const WEEKDAYS = [
   'saturday',
 ];
 
+function capitalizeDay(dayKey) {
+  return dayKey ? dayKey.charAt(0).toUpperCase() + dayKey.slice(1) : '';
+}
+
 function parseTimeToMinutes(str) {
-  if (!str || typeof str !== 'string') return null;
+  if (str == null) return null;
+  if (typeof str !== 'string') return null;
   const m = str.trim().match(/^(\d{1,2}):(\d{2})$/);
   if (!m) return null;
   const h = Number(m[1]);
@@ -25,6 +39,16 @@ function parseTimeToMinutes(str) {
     return null;
   }
   return h * 60 + min;
+}
+
+/** "08:00-20:00" or "08:00 - 20:00" */
+function parseHoursRangeString(str) {
+  if (!str || typeof str !== 'string') return { open: null, close: null };
+  const m = str
+    .trim()
+    .match(/^(\d{1,2}:\d{2})\s*[\u2013\-–]\s*(\d{1,2}:\d{2})$/);
+  if (!m) return { open: null, close: null };
+  return { open: m[1], close: m[2] };
 }
 
 function getWeekdayKey(date, timeZone) {
@@ -47,22 +71,142 @@ function getMinutesInTimezone(date, timeZone) {
   return h * 60 + m;
 }
 
-function getDaySchedule(operatingHours, dayKey) {
-  if (!operatingHours || typeof operatingHours !== 'object') return null;
-  const direct = operatingHours[dayKey];
-  if (direct && typeof direct === 'object') return direct;
-  const ed = operatingHours.every_day;
-  if (ed && typeof ed === 'object') return ed;
+function coerceRootObject(raw) {
+  if (raw == null) return null;
+  if (typeof raw === 'string') {
+    try {
+      const p = JSON.parse(raw);
+      return typeof p === 'object' && p !== null ? p : null;
+    } catch {
+      return null;
+    }
+  }
+  if (Array.isArray(raw)) {
+    const map = {};
+    let tz = null;
+    raw.forEach((row) => {
+      if (!row || typeof row !== 'object') return;
+      const dk = String(row.day || row.weekday || '').toLowerCase();
+      if (WEEKDAYS.includes(dk)) {
+        map[dk] = row;
+        if (row.timezone || row.tz) tz = row.timezone || row.tz;
+      }
+    });
+    if (Object.keys(map).length === 0) return null;
+    return { ...map, timezone: tz || undefined };
+  }
+  if (typeof raw === 'object') return raw;
   return null;
 }
 
-function hasStructuredSchedule(oh) {
-  if (!oh || typeof oh !== 'object') return false;
-  if (oh.every_day && typeof oh.every_day === 'object') return true;
-  return WEEKDAYS.some((d) => {
-    const s = oh[d];
-    return s && typeof s === 'object' && (s.open || s.close);
-  });
+/**
+ * Read one day's value from merged sources (flat + weekly + schedule + days).
+ */
+function pickDayRaw(oh, dayKey) {
+  if (!oh || typeof oh !== 'object') return undefined;
+  const cap = capitalizeDay(dayKey);
+  return (
+    oh[dayKey] ??
+    oh[cap] ??
+    oh.weekly?.[dayKey] ??
+    oh.weekly?.[cap] ??
+    oh.schedule?.[dayKey] ??
+    oh.schedule?.[cap] ??
+    oh.days?.[dayKey] ??
+    oh.days?.[cap]
+  );
+}
+
+/**
+ * @returns {{ open: string|null, close: string|null, closed: boolean }}
+ */
+function normalizeDaySlot(raw) {
+  if (raw == null) return { open: null, close: null, closed: false };
+
+  if (typeof raw === 'string') {
+    const r = parseHoursRangeString(raw);
+    if (r.open && r.close) return { open: r.open, close: r.close, closed: false };
+    return { open: null, close: null, closed: false };
+  }
+
+  if (typeof raw !== 'object') return { open: null, close: null, closed: false };
+
+  if (raw.closed === true || raw.is_closed === true) {
+    return { open: null, close: null, closed: true };
+  }
+
+  let open =
+    raw.open ??
+    raw.opens_at ??
+    raw.start ??
+    raw.from ??
+    null;
+  let close =
+    raw.close ??
+    raw.closes_at ??
+    raw.end ??
+    raw.to ??
+    null;
+
+  if (typeof raw.hours === 'string' && (!open || !close)) {
+    const r = parseHoursRangeString(raw.hours);
+    open = open || r.open;
+    close = close || r.close;
+  }
+
+  if (open != null && typeof open !== 'string') open = String(open);
+  if (close != null && typeof close !== 'string') close = String(close);
+
+  return {
+    open: open || null,
+    close: close || null,
+    closed: false,
+  };
+}
+
+/**
+ * Build per-day map from DB object. Returns null if nothing looks like a schedule.
+ */
+function buildDayMapFromOperatingHours(oh) {
+  const root = coerceRootObject(oh);
+  if (!root || typeof root !== 'object') return null;
+
+  const tz = String(root.timezone || root.tz || DEFAULT_TZ).trim() || DEFAULT_TZ;
+  const days = {};
+
+  const every = root.every_day;
+
+  if (every && typeof every === 'object' && every.closed === true) {
+    for (const d of WEEKDAYS) {
+      days[d] = { closed: true };
+    }
+    return { timezone: tz, days };
+  }
+
+  const useEvery =
+    every &&
+    typeof every === 'object' &&
+    !every.closed &&
+    (every.open || every.close || every.hours);
+
+  for (const d of WEEKDAYS) {
+    let raw = pickDayRaw(root, d);
+    if (raw === undefined && useEvery) raw = every;
+    if (raw === undefined) continue;
+
+    const slot = normalizeDaySlot(raw);
+    if (slot.closed) {
+      days[d] = { closed: true };
+      continue;
+    }
+    if (slot.open && slot.close) {
+      days[d] = { open: slot.open, close: slot.close };
+    }
+  }
+
+  if (Object.keys(days).length === 0) return null;
+
+  return { timezone: tz, days };
 }
 
 /**
@@ -83,11 +227,9 @@ export function getStoreOrderEligibility(store, now = new Date()) {
     };
   }
 
-  const oh = store.operating_hours;
-  const tz =
-    (oh && typeof oh === 'object' && oh.timezone && String(oh.timezone).trim()) || DEFAULT_TZ;
+  const normalized = buildDayMapFromOperatingHours(store.operating_hours);
 
-  if (!hasStructuredSchedule(oh)) {
+  if (!normalized) {
     const accepting = store.is_open !== false;
     return {
       accepting,
@@ -96,10 +238,12 @@ export function getStoreOrderEligibility(store, now = new Date()) {
     };
   }
 
+  const { timezone: tz, days } = normalized;
   const dayKey = getWeekdayKey(now, tz);
-  const schedule = getDaySchedule(oh, dayKey);
+  const day = days[dayKey];
 
-  if (schedule && schedule.closed === true) {
+  // Schedule exists for the week but this weekday has no row → treat as closed (not legacy is_open).
+  if (day === undefined && Object.keys(days).length > 0) {
     return {
       accepting: false,
       reason: 'outside_hours',
@@ -107,10 +251,25 @@ export function getStoreOrderEligibility(store, now = new Date()) {
     };
   }
 
-  const openStr = schedule?.open ?? oh.open;
-  const closeStr = schedule?.close ?? oh.close;
-  const openM = parseTimeToMinutes(openStr);
-  const closeM = parseTimeToMinutes(closeStr);
+  if (day === undefined) {
+    const accepting = store.is_open !== false;
+    return {
+      accepting,
+      reason: accepting ? null : 'manual_closed',
+      message: accepting ? '' : 'This store is closed right now.',
+    };
+  }
+
+  if (day.closed === true) {
+    return {
+      accepting: false,
+      reason: 'outside_hours',
+      message: 'This store is closed today.',
+    };
+  }
+
+  const openM = parseTimeToMinutes(day.open);
+  const closeM = parseTimeToMinutes(day.close);
 
   if (openM == null || closeM == null) {
     const accepting = store.is_open !== false;
@@ -126,7 +285,6 @@ export function getStoreOrderEligibility(store, now = new Date()) {
   if (closeM > openM) {
     inside = cur >= openM && cur < closeM;
   } else {
-    // Overnight window (e.g. 22:00–02:00)
     inside = cur >= openM || cur < closeM;
   }
 
@@ -139,6 +297,11 @@ export function getStoreOrderEligibility(store, now = new Date()) {
   }
 
   return { accepting: true, reason: null, message: '' };
+}
+
+/** @deprecated internal — exported for tests */
+export function _testNormalizeOperatingHours(oh) {
+  return buildDayMapFromOperatingHours(oh);
 }
 
 export function enrichStoreForCustomerListing(store, now = new Date()) {
