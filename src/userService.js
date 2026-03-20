@@ -12,24 +12,32 @@ if (!supabase) {
 export async function getRoles(userId) {
   if (!userId || !supabase) return [];
 
-  // Preferred: multi-role source of truth from user_roles table.
-  // If the table is empty/missing or the row isn't present, fall back to checking
-  // role-specific tables so login/orders can still work during migration windows.
+  const uniqueRoles = (list) => {
+    const out = [];
+    for (const r of list) {
+      if (r && !out.includes(r)) out.push(r);
+    }
+    return out;
+  };
+
+  // 1) Roles explicitly stored in user_roles (may be incomplete: e.g. only courier after
+  // adding a second role — merchant might exist in merchants/stores but never got a row).
+  let fromUserRoles = [];
   try {
     const { data: rows, error } = await supabase
       .from('user_roles')
       .select('role')
       .eq('user_id', userId);
-
     if (!error && Array.isArray(rows) && rows.length > 0) {
-      return rows.map((r) => r.role);
+      fromUserRoles = rows.map((r) => r.role).filter(Boolean);
     }
-  } catch (e) {
-    // Ignore: we'll fall back to checking the role tables below.
+  } catch (_) {
+    fromUserRoles = [];
   }
 
-  // Migration fallback: infer roles from the role tables themselves.
-  // This keeps behavior correct even if user_roles hasn't been backfilled yet.
+  // 2) Always infer from role tables + stores so we never return only ['courier'] when
+  // the same user also has a merchant row or owns a store.
+  let inferred = [];
   try {
     const [
       { data: customerRow },
@@ -40,20 +48,19 @@ export async function getRoles(userId) {
       supabase.from('customers').select('id').eq('id', userId).maybeSingle(),
       supabase.from('merchants').select('id').eq('id', userId).maybeSingle(),
       supabase.from('couriers').select('id').eq('id', userId).maybeSingle(),
-      // If merchants table inference fails during migrations, stores (merchant_id) still tells us.
       supabase.from('stores').select('id').eq('merchant_id', userId).limit(1),
     ]);
 
-    const inferred = [];
     if (customerRow) inferred.push('customer');
     if (merchantRow) inferred.push('merchant');
     else if (Array.isArray(storeRows) && storeRows.length > 0) inferred.push('merchant');
     if (courierRow) inferred.push('courier');
-
-    if (inferred.length > 0) return inferred;
-  } catch (e) {
-    // Ignore: final fallback to primary profile.role below.
+  } catch (_) {
+    inferred = [];
   }
+
+  const merged = uniqueRoles([...fromUserRoles, ...inferred]);
+  if (merged.length > 0) return merged;
 
   // Final fallback: use profile.role only.
   const profile = await getProfile(userId);
