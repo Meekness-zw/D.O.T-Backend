@@ -32,6 +32,7 @@ import {
   getAdminMerchantDetail,
 } from './adminService.js';
 import { supabaseAdmin as publicSupabase } from './supabaseAdminClient.js';
+import { enrichStoreForCustomerListing, assertStoreAcceptingOrders } from './storeHours.js';
 
 const app = express();
 const supabase = supabaseAdmin;
@@ -185,7 +186,8 @@ app.get('/stores', async (req, res) => {
           rating,
           total_reviews,
           is_open,
-          is_active
+          is_active,
+          operating_hours
         `,
       )
       .eq('is_active', true)
@@ -239,6 +241,8 @@ app.get('/stores', async (req, res) => {
         return { ...s, distance_km: null, eta_minutes: null };
       });
     }
+
+    stores = stores.map((s) => enrichStoreForCustomerListing(s));
 
     return res.json({ stores });
   } catch (error) {
@@ -663,12 +667,17 @@ app.get('/stores/:storeId/menu', async (req, res) => {
 
     const { data: store, error: storeError } = await supabase
       .from('stores')
-      .select('id, is_active')
+      .select('id, is_active, is_open, operating_hours')
       .eq('id', storeId)
       .maybeSingle();
 
     if (storeError || !store || store.is_active === false) {
       return res.status(404).json({ error: 'Store not found' });
+    }
+
+    const closed = assertStoreAcceptingOrders(store);
+    if (!closed.ok) {
+      return res.status(closed.status).json(closed.body);
     }
 
     const { data: productsData, error: productsError } = await supabase
@@ -818,7 +827,8 @@ app.get('/merchant/stores', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
     let data, error;
-    const fullSelect = 'id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country, latitude, longitude, is_open';
+    const fullSelect =
+      'id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country, latitude, longitude, is_open, operating_hours';
     const minimalSelect = 'id, store_name, logo, merchant_id, created_at';
     let result = await supabase
       .from('stores')
@@ -897,6 +907,7 @@ app.patch('/merchant/stores/:id', requireAuth, async (req, res) => {
       latitude,
       longitude,
       is_open,
+      operating_hours,
     } = req.body || {};
     const update = {};
     if (store_name !== undefined && String(store_name).trim()) update.store_name = String(store_name).trim();
@@ -914,6 +925,10 @@ app.patch('/merchant/stores/:id', requireAuth, async (req, res) => {
     if (latitude !== undefined && latitude !== null && latitude !== '') update.latitude = Number(latitude);
     if (longitude !== undefined && longitude !== null && longitude !== '') update.longitude = Number(longitude);
     if (is_open !== undefined) update.is_open = !!is_open;
+    if (operating_hours !== undefined) {
+      if (operating_hours === null) update.operating_hours = null;
+      else if (typeof operating_hours === 'object') update.operating_hours = operating_hours;
+    }
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ error: 'No fields to update', details: 'Provide at least one updatable field' });
     }
@@ -2310,10 +2325,12 @@ app.post('/orders', requireAuth, async (req, res) => {
       }
     }
 
-    // Fetch store for pickup address/coordinates
+    // Fetch store for pickup address/coordinates + hours / open flag
     const { data: store, error: storeError } = await supabase
       .from('stores')
-      .select('id, store_name, address_line1, city, latitude, longitude')
+      .select(
+        'id, store_name, address_line1, city, latitude, longitude, is_active, is_open, operating_hours',
+      )
       .eq('id', store_id)
       .maybeSingle();
 
@@ -2327,6 +2344,11 @@ app.post('/orders', requireAuth, async (req, res) => {
         error: 'Invalid store',
         details: 'Store not found',
       });
+    }
+
+    const orderEligibility = assertStoreAcceptingOrders(store);
+    if (!orderEligibility.ok) {
+      return res.status(orderEligibility.status).json(orderEligibility.body);
     }
 
     if (
