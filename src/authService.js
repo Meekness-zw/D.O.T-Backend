@@ -3,7 +3,7 @@ import twilio from 'twilio';
 import bcrypt from 'bcryptjs';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { createSupabaseAccessToken } from './sessionToken.js';
-import { getRoles } from './userService.js';
+import { getRoles, syncUserRolesFromRoleTables } from './userService.js';
 
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
@@ -270,10 +270,12 @@ export async function loginWithPassword({ phone, password }) {
     profile = profileData;
   }
 
+  // Repair user_roles from role tables (e.g. only "courier" was inserted when adding courier).
+  await syncUserRolesFromRoleTables(existingUser.id);
+
   let roles = await getRoles(existingUser.id);
 
-  // Multi-role UI relies on user.roles. Guarantee "merchant" if DB says this user is a merchant
-  // (merchants row or owns a store), even when user_roles / getRoles drifted.
+  // Belt-and-suspenders: guarantee merchant in roles[] if merchants row or store exists.
   try {
     if (supabaseAdmin && !roles.includes('merchant')) {
       const [{ data: merchantRow }, { data: storeRows }] = await Promise.all([
@@ -285,7 +287,7 @@ export async function loginWithPassword({ phone, password }) {
       }
     }
   } catch (e) {
-    console.warn('loginWithPassword: could not expand merchant role:', e?.message || e);
+    console.warn('loginWithPassword: merchant role expand:', e?.message || e);
   }
   roles = [...new Set(roles)];
 

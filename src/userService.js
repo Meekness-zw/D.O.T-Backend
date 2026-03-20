@@ -68,6 +68,38 @@ export async function getRoles(userId) {
 }
 
 /**
+ * Keep user_roles aligned with customers / merchants / couriers / stores.
+ * When courier is added, user_roles used to only get "courier" — merchant was missing even though
+ * the merchants row + store still exist → login returned roles: [courier] and the app showed a false conflict.
+ */
+export async function syncUserRolesFromRoleTables(userId) {
+  if (!userId || !supabase) return;
+  try {
+    const [{ data: customerRow }, { data: merchantRow }, { data: courierRow }, { data: storeRows }] =
+      await Promise.all([
+        supabase.from('customers').select('id').eq('id', userId).maybeSingle(),
+        supabase.from('merchants').select('id').eq('id', userId).maybeSingle(),
+        supabase.from('couriers').select('id').eq('id', userId).maybeSingle(),
+        supabase.from('stores').select('id').eq('merchant_id', userId).limit(1),
+      ]);
+    const rolesToEnsure = [];
+    if (customerRow) rolesToEnsure.push('customer');
+    if (merchantRow || (Array.isArray(storeRows) && storeRows.length > 0)) rolesToEnsure.push('merchant');
+    if (courierRow) rolesToEnsure.push('courier');
+    for (const r of rolesToEnsure) {
+      const { error } = await supabase
+        .from('user_roles')
+        .upsert({ user_id: userId, role: r }, { onConflict: 'user_id,role' });
+      if (error) {
+        console.warn(`syncUserRolesFromRoleTables upsert ${r}:`, error.message);
+      }
+    }
+  } catch (e) {
+    console.warn('syncUserRolesFromRoleTables:', e?.message || e);
+  }
+}
+
+/**
  * Ensures the user has a profile and a row in the correct role table.
  * Supports multiple roles: adding a role does not remove existing roles or overwrite profile details.
  *
@@ -190,6 +222,8 @@ export async function ensureUserProfile({
       console.error(`${role} table creation error:`, roleError);
       throw new Error(`Failed to create ${role} profile: ${roleError.message}`);
     }
+
+    await syncUserRolesFromRoleTables(userId);
 
     console.log(`✅ User profile created successfully for ${role}: ${userId}`);
     return true;
