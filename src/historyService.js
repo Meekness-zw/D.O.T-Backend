@@ -84,7 +84,10 @@ export async function getOrdersForUser(userId, options = {}) {
         stores ( store_name ),
         order_items (
           product_name,
-          quantity
+          quantity,
+          products (
+            image_url
+          )
         )
       `)
       .eq('customer_id', userId)
