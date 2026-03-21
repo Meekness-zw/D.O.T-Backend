@@ -33,6 +33,8 @@ import {
 } from './adminService.js';
 import { supabaseAdmin as publicSupabase } from './supabaseAdminClient.js';
 import { enrichStoreForCustomerListing, assertStoreAcceptingOrders } from './storeHours.js';
+import { getMerchantHelpPayload } from './merchantHelpContent.js';
+import crypto from 'crypto';
 
 const app = express();
 const supabase = supabaseAdmin;
@@ -1080,6 +1082,171 @@ app.put('/merchant/settings', requireAuth, async (req, res) => {
     console.error('put /merchant/settings error:', error);
     return res.status(500).json({
       error: 'Failed to save merchant settings',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// GET /merchant/help — contact info + FAQs + quick actions (server-driven copy)
+app.get('/merchant/help', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { data: merchantRow, error: merchantError } = await supabase
+      .from('merchants')
+      .select('id')
+      .eq('id', req.userId)
+      .maybeSingle();
+    if (merchantError) {
+      console.error('get /merchant/help merchant lookup:', merchantError);
+      throw new Error(merchantError.message || 'Failed to verify merchant');
+    }
+    if (!merchantRow) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Merchant profile required' });
+    }
+    const { quickActions, faqs } = getMerchantHelpPayload();
+    return res.json({
+      contact: {
+        phone: process.env.SUPPORT_PHONE || null,
+        email: process.env.SUPPORT_EMAIL || null,
+        whatsappUrl: process.env.SUPPORT_WHATSAPP_URL || null,
+        hours: process.env.SUPPORT_HOURS || 'Mon–Fri 8:00–18:00',
+      },
+      quickActions,
+      faqs,
+    });
+  } catch (error) {
+    console.error('get /merchant/help error:', error);
+    return res.status(500).json({
+      error: 'Failed to load help',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// GET /merchant/support-tickets — current merchant’s requests
+app.get('/merchant/support-tickets', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { data: merchantRow, error: merchantError } = await supabase
+      .from('merchants')
+      .select('id')
+      .eq('id', req.userId)
+      .maybeSingle();
+    if (merchantError) throw new Error(merchantError.message || 'Failed to verify merchant');
+    if (!merchantRow) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Merchant profile required' });
+    }
+
+    const { data, error } = await supabase
+      .from('support_tickets')
+      .select('id, reference_code, subject, category, status, created_at')
+      .eq('user_id', req.userId)
+      .eq('role_context', 'merchant')
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    if (error) {
+      console.error('get /merchant/support-tickets error:', error);
+      throw new Error(error.message || 'Failed to load tickets');
+    }
+
+    return res.json({ tickets: data || [] });
+  } catch (error) {
+    console.error('get /merchant/support-tickets error:', error);
+    return res.status(500).json({
+      error: 'Failed to load support tickets',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// GET /merchant/support-tickets/:id — single ticket (must belong to user)
+app.get('/merchant/support-tickets/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('support_tickets')
+      .select(
+        'id, reference_code, subject, category, message, status, created_at, updated_at',
+      )
+      .eq('id', id)
+      .eq('user_id', req.userId)
+      .eq('role_context', 'merchant')
+      .maybeSingle();
+
+    if (error) {
+      console.error('get /merchant/support-tickets/:id error:', error);
+      throw new Error(error.message || 'Failed to load ticket');
+    }
+    if (!data) {
+      return res.status(404).json({ error: 'Not found', details: 'Ticket not found' });
+    }
+    return res.json(data);
+  } catch (error) {
+    console.error('get /merchant/support-tickets/:id error:', error);
+    return res.status(500).json({
+      error: 'Failed to load ticket',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /merchant/support-tickets — create a help request
+app.post('/merchant/support-tickets', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { data: merchantRow, error: merchantError } = await supabase
+      .from('merchants')
+      .select('id')
+      .eq('id', req.userId)
+      .maybeSingle();
+    if (merchantError) throw new Error(merchantError.message || 'Failed to verify merchant');
+    if (!merchantRow) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Merchant profile required' });
+    }
+
+    const { category, subject, message } = req.body || {};
+    const subj = subject != null ? String(subject).trim() : '';
+    const msg = message != null ? String(message).trim() : '';
+    if (!subj || !msg) {
+      return res.status(400).json({
+        error: 'Missing fields',
+        details: 'subject and message are required',
+      });
+    }
+
+    let reference_code = `M-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const { data: created, error: insertError } = await supabase
+        .from('support_tickets')
+        .insert({
+          user_id: req.userId,
+          role_context: 'merchant',
+          category: category ? String(category).trim() : null,
+          subject: subj,
+          message: msg,
+          status: 'open',
+          reference_code,
+        })
+        .select('id, reference_code, subject, category, status, created_at')
+        .single();
+
+      if (!insertError && created) {
+        return res.status(201).json(created);
+      }
+      if (insertError?.code === '23505') {
+        reference_code = `M-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+        continue;
+      }
+      console.error('post /merchant/support-tickets error:', insertError);
+      throw new Error(insertError?.message || 'Failed to create ticket');
+    }
+    throw new Error('Could not allocate a unique ticket reference');
+  } catch (error) {
+    console.error('post /merchant/support-tickets error:', error);
+    return res.status(500).json({
+      error: 'Failed to create support ticket',
       details: error.message || 'Please try again later',
     });
   }
