@@ -247,7 +247,9 @@ export async function getFullUserMe(userId) {
     result.merchant = merchant || null;
     const { data: store } = await supabase
       .from('stores')
-      .select('id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country, latitude, longitude, is_open')
+      .select(
+        'id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country, latitude, longitude, is_open, is_active, operating_hours',
+      )
       .eq('merchant_id', userId)
       .order('created_at', { ascending: false })
       .limit(1)

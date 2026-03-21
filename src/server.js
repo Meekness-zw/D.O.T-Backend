@@ -828,7 +828,7 @@ app.get('/merchant/stores', requireAuth, async (req, res) => {
     if (!supabase) throw new Error('Server not configured');
     let data, error;
     const fullSelect =
-      'id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country, latitude, longitude, is_open, operating_hours';
+      'id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country, latitude, longitude, is_open, is_active, operating_hours';
     const minimalSelect = 'id, store_name, logo, merchant_id, created_at';
     let result = await supabase
       .from('stores')
@@ -907,6 +907,7 @@ app.patch('/merchant/stores/:id', requireAuth, async (req, res) => {
       latitude,
       longitude,
       is_open,
+      is_active,
       operating_hours,
     } = req.body || {};
     const update = {};
@@ -925,6 +926,7 @@ app.patch('/merchant/stores/:id', requireAuth, async (req, res) => {
     if (latitude !== undefined && latitude !== null && latitude !== '') update.latitude = Number(latitude);
     if (longitude !== undefined && longitude !== null && longitude !== '') update.longitude = Number(longitude);
     if (is_open !== undefined) update.is_open = !!is_open;
+    if (is_active !== undefined) update.is_active = !!is_active;
     if (operating_hours !== undefined) {
       if (operating_hours === null) update.operating_hours = null;
       else if (typeof operating_hours === 'object') update.operating_hours = operating_hours;
@@ -944,6 +946,140 @@ app.patch('/merchant/stores/:id', requireAuth, async (req, res) => {
     console.error('patch /merchant/stores/:id error:', error);
     return res.status(500).json({
       error: 'Failed to update store',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// GET /merchant/settings — app preferences for current merchant (stored in merchant_settings)
+app.get('/merchant/settings', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    const { data: merchantRow, error: merchantError } = await supabase
+      .from('merchants')
+      .select('id')
+      .eq('id', req.userId)
+      .maybeSingle();
+
+    if (merchantError) {
+      console.error('get /merchant/settings merchant lookup:', merchantError);
+      throw new Error(merchantError.message || 'Failed to verify merchant');
+    }
+    if (!merchantRow) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Merchant profile required' });
+    }
+
+    const { data, error } = await supabase
+      .from('merchant_settings')
+      .select(
+        'new_order_sound, vibration_alerts, auto_accept_orders, default_prep_time, rider_arrived_notification, customer_messages_notification, promotions_notification',
+      )
+      .eq('merchant_id', req.userId)
+      .maybeSingle();
+
+    if (error) {
+      console.error('get /merchant/settings error:', error);
+      throw new Error(error.message || 'Failed to load merchant settings');
+    }
+
+    const s = data || {};
+    return res.json({
+      new_order_sound: s.new_order_sound ?? true,
+      vibration_alerts: s.vibration_alerts ?? true,
+      auto_accept_orders: s.auto_accept_orders ?? false,
+      default_prep_time: typeof s.default_prep_time === 'number' ? s.default_prep_time : 15,
+      rider_arrived_notification: s.rider_arrived_notification ?? true,
+      customer_messages_notification: s.customer_messages_notification ?? true,
+      promotions_notification: s.promotions_notification ?? true,
+    });
+  } catch (error) {
+    console.error('get /merchant/settings error:', error);
+    return res.status(500).json({
+      error: 'Failed to load merchant settings',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// PUT /merchant/settings — upsert merchant app preferences
+app.put('/merchant/settings', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    const { data: merchantRow, error: merchantError } = await supabase
+      .from('merchants')
+      .select('id')
+      .eq('id', req.userId)
+      .maybeSingle();
+
+    if (merchantError) {
+      console.error('put /merchant/settings merchant lookup:', merchantError);
+      throw new Error(merchantError.message || 'Failed to verify merchant');
+    }
+    if (!merchantRow) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Merchant profile required' });
+    }
+
+    const {
+      new_order_sound,
+      vibration_alerts,
+      auto_accept_orders,
+      default_prep_time,
+      rider_arrived_notification,
+      customer_messages_notification,
+      promotions_notification,
+    } = req.body || {};
+
+    const payload = { merchant_id: req.userId };
+
+    if (new_order_sound !== undefined) payload.new_order_sound = !!new_order_sound;
+    if (vibration_alerts !== undefined) payload.vibration_alerts = !!vibration_alerts;
+    if (auto_accept_orders !== undefined) payload.auto_accept_orders = !!auto_accept_orders;
+    if (default_prep_time !== undefined && default_prep_time !== null && default_prep_time !== '') {
+      const n = Number(default_prep_time);
+      if (!Number.isNaN(n) && n >= 1 && n <= 180) payload.default_prep_time = Math.round(n);
+    }
+    if (rider_arrived_notification !== undefined)
+      payload.rider_arrived_notification = !!rider_arrived_notification;
+    if (customer_messages_notification !== undefined)
+      payload.customer_messages_notification = !!customer_messages_notification;
+    if (promotions_notification !== undefined) payload.promotions_notification = !!promotions_notification;
+
+    if (Object.keys(payload).length <= 1) {
+      return res.status(400).json({
+        error: 'No settings to update',
+        details: 'Provide at least one setting field',
+      });
+    }
+
+    const { data, error } = await supabase
+      .from('merchant_settings')
+      .upsert(payload, { onConflict: 'merchant_id' })
+      .select(
+        'new_order_sound, vibration_alerts, auto_accept_orders, default_prep_time, rider_arrived_notification, customer_messages_notification, promotions_notification',
+      )
+      .maybeSingle();
+
+    if (error) {
+      console.error('put /merchant/settings error:', error);
+      throw new Error(error.message || 'Failed to save merchant settings');
+    }
+
+    const s = data || {};
+    return res.json({
+      new_order_sound: s.new_order_sound ?? true,
+      vibration_alerts: s.vibration_alerts ?? true,
+      auto_accept_orders: s.auto_accept_orders ?? false,
+      default_prep_time: typeof s.default_prep_time === 'number' ? s.default_prep_time : 15,
+      rider_arrived_notification: s.rider_arrived_notification ?? true,
+      customer_messages_notification: s.customer_messages_notification ?? true,
+      promotions_notification: s.promotions_notification ?? true,
+    });
+  } catch (error) {
+    console.error('put /merchant/settings error:', error);
+    return res.status(500).json({
+      error: 'Failed to save merchant settings',
       details: error.message || 'Please try again later',
     });
   }
