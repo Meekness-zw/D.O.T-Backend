@@ -2,7 +2,7 @@ import 'dotenv/config.js';
 import express from 'express';
 import cors from 'cors';
 import { sendOtpToPhone, verifyPhoneOtp, loginWithPassword, checkPhoneRegistered, deleteUserById } from './authService.js';
-import { ensureUserProfile, getProfile, updateProfile, uploadProfilePhoto } from './userService.js';
+import { ensureUserProfile, getProfile, getRoles, updateProfile, uploadProfilePhoto } from './userService.js';
 import { getOrdersForUser, getWalletTransactionsForUser, getPaymentsForUser, getFullUserMe, getMerchantDashboardStats } from './historyService.js';
 import { createPesepayTransaction, handlePesepayCallback } from './paymentService.js';
 import { verifyAccessToken } from './sessionToken.js';
@@ -2231,6 +2231,41 @@ app.get('/users/profile', requireAuth, async (req, res) => {
     console.error('get profile error:', error);
     return res.status(500).json({
       error: 'Failed to load profile',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /users/me/add-role — add customer | merchant | courier to current account (multi-role; does not remove others)
+app.post('/users/me/add-role', requireAuth, async (req, res) => {
+  try {
+    const { role } = req.body || {};
+    const valid = ['customer', 'merchant', 'courier'];
+    if (!valid.includes(role)) {
+      return res.status(400).json({
+        error: 'Invalid role',
+        details: `role must be one of: ${valid.join(', ')}`,
+      });
+    }
+    const profile = await getProfile(req.userId);
+    if (!profile) {
+      return res.status(404).json({ error: 'Profile not found', details: 'No profile for this user' });
+    }
+
+    await ensureUserProfile({
+      userId: req.userId,
+      email: profile.email,
+      phone: profile.phone,
+      fullName: profile.full_name,
+      role,
+    });
+
+    const roles = await getRoles(req.userId);
+    return res.json({ success: true, roles: roles.length > 0 ? roles : [role] });
+  } catch (error) {
+    console.error('post /users/me/add-role error:', error);
+    return res.status(500).json({
+      error: 'Failed to add role',
       details: error.message || 'Please try again later',
     });
   }
