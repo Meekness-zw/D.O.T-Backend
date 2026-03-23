@@ -2462,6 +2462,55 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
   }
 });
 
+// DELETE /orders/:id — customer removes a finished order from their history (DB delete; cascades to order_items, etc.)
+app.delete('/orders/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { data: order, error } = await supabase
+      .from('orders')
+      .select('id, customer_id, status')
+      .eq('id', id)
+      .maybeSingle();
+    if (error) {
+      console.error('delete /orders/:id select error:', error);
+      throw new Error(error.message || 'Failed to load order');
+    }
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    if (order.customer_id !== req.userId) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        details: 'You can only delete your own orders',
+      });
+    }
+    const terminal = new Set(['delivered', 'cancelled', 'refunded', 'completed']);
+    const statusNorm = String(order.status || '')
+      .toLowerCase()
+      .replace(/\s+/g, '_');
+    if (!terminal.has(statusNorm)) {
+      return res.status(400).json({
+        error: 'Cannot delete this order',
+        details:
+          'Only completed orders (delivered, cancelled, or refunded) can be removed from your history.',
+      });
+    }
+    const { error: delError } = await supabase.from('orders').delete().eq('id', id);
+    if (delError) {
+      console.error('delete /orders/:id error:', delError);
+      throw new Error(delError.message || 'Failed to delete order');
+    }
+    return res.json({ ok: true, id });
+  } catch (error) {
+    console.error('delete /orders/:id error:', error);
+    return res.status(500).json({
+      error: 'Failed to delete order',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // GET /courier/jobs/open — list ready orders with no courier assigned
 app.get('/courier/jobs/open', requireAuth, async (req, res) => {
   try {
@@ -3653,9 +3702,16 @@ app.get('/users/me/payment-methods', requireAuth, async (req, res) => {
 
     if (error) {
       console.error('get payment-methods error:', error);
+      const detailParts = [
+        error.message,
+        error.code && `code=${error.code}`,
+        error.details,
+        error.hint && `hint=${error.hint}`,
+      ].filter(Boolean);
+      const details = detailParts.length ? detailParts.join(' | ') : 'Database error';
       return res.status(500).json({
         error: 'Failed to load payment methods',
-        details: error.message || 'Database error',
+        details,
       });
     }
 
