@@ -113,6 +113,7 @@ export async function getOrdersForUser(userId, options = {}) {
         total_amount,
         payment_method,
         delivery_address,
+        delivery_notes,
         created_at,
         updated_at,
         store_id,

@@ -3,6 +3,7 @@ import https from 'https';
 import CryptoJS from 'crypto-js';
 import { getPesepayConfig } from './pesepayConfig.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
+import { computeSubtotalSplit, recordMerchantEarningsForOrderPayment } from './orderPaymentSplit.js';
 
 const supabase = supabaseAdmin;
 
@@ -166,9 +167,9 @@ export async function createPesepayTransaction({
     throw new Error(paymentError.message || 'Failed to save payment');
   }
 
-  // For now, only create a wallet transaction when immediately successful.
+  // Wallet top-up only (no order): credit customer wallet when gateway returns success immediately.
   let walletTx = null;
-  if (paymentStatus === 'completed') {
+  if (paymentStatus === 'completed' && !orderId) {
     walletTx = await createWalletTransactionForPayment({
       userId,
       amount,
@@ -260,6 +261,22 @@ export async function handlePesepayCallback(callbackBody) {
     return { transaction, payment: null, walletTransaction: null };
   }
 
+  // Order checkout: update order + merchant ledger — never credit customer wallet for order payments.
+  if (payment.order_id) {
+    const orderResult = await finalizeOrderPaymentFromPesepay({
+      payment,
+      paymentStatus,
+      transaction,
+    });
+    return {
+      transaction,
+      payment,
+      walletTransaction: orderResult?.walletTransaction ?? null,
+      order: orderResult?.order ?? null,
+    };
+  }
+
+  // Wallet top-up (no order row)
   let walletTx = null;
   if (paymentStatus === 'completed') {
     walletTx = await createWalletTransactionForPayment({
@@ -271,5 +288,82 @@ export async function handlePesepayCallback(callbackBody) {
   }
 
   return { transaction, payment, walletTransaction: walletTx };
+}
+
+/**
+ * After Pesepay confirms a payment linked to an order: mark order paid, apply merchant split.
+ */
+async function finalizeOrderPaymentFromPesepay({ payment, paymentStatus, transaction }) {
+  if (!supabase || !payment?.order_id) return null;
+
+  const { data: order, error: orderLoadError } = await supabase
+    .from('orders')
+    .select(
+      'id, order_number, customer_id, store_id, status, subtotal, delivery_fee, total_amount, payment_status, payment_method',
+    )
+    .eq('id', payment.order_id)
+    .maybeSingle();
+
+  if (orderLoadError || !order) {
+    console.error('[Pesepay] Failed to load order for callback:', orderLoadError);
+    return null;
+  }
+
+  if (paymentStatus === 'completed') {
+    if (order.payment_status === 'paid') {
+      return { order, walletTransaction: null, skipped: true };
+    }
+
+    const { platformCommission, merchantEarnings } = computeSubtotalSplit(order.subtotal);
+
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('merchant_id')
+      .eq('id', order.store_id)
+      .maybeSingle();
+
+    if (storeError || !store?.merchant_id) {
+      console.error('[Pesepay] Order callback: store/merchant missing:', storeError);
+    }
+
+    const { data: updatedOrder, error: orderUpdateError } = await supabase
+      .from('orders')
+      .update({
+        payment_status: 'paid',
+        status: 'pending',
+        platform_commission_amount: platformCommission,
+        merchant_earnings_amount: merchantEarnings,
+      })
+      .eq('id', order.id)
+      .select('*')
+      .single();
+
+    if (orderUpdateError) {
+      console.error('[Pesepay] Failed to mark order paid:', orderUpdateError);
+      throw new Error(orderUpdateError.message || 'Failed to update order');
+    }
+
+    let merchantTx = null;
+    if (store?.merchant_id && merchantEarnings > 0) {
+      merchantTx = await recordMerchantEarningsForOrderPayment({
+        merchantUserId: store.merchant_id,
+        paymentId: payment.id,
+        amount: merchantEarnings,
+        orderNumber: order.order_number,
+      });
+    }
+
+    return { order: updatedOrder, walletTransaction: merchantTx };
+  }
+
+  if (paymentStatus === 'failed') {
+    await supabase
+      .from('orders')
+      .update({ payment_status: 'failed' })
+      .eq('id', order.id)
+      .eq('payment_status', 'pending');
+  }
+
+  return { order, walletTransaction: null };
 }
 

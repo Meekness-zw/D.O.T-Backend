@@ -2352,7 +2352,7 @@ app.patch('/orders/:id', requireAuth, async (req, res) => {
     }
     const { data: order, error: orderError } = await supabase
       .from('orders')
-      .select('id, store_id')
+      .select('id, store_id, status, payment_status, payment_method')
       .eq('id', id)
       .maybeSingle();
     if (orderError || !order) return res.status(404).json({ error: 'Order not found' });
@@ -2364,6 +2364,21 @@ app.patch('/orders/:id', requireAuth, async (req, res) => {
     if (storeError || !store || store.merchant_id !== req.userId) {
       return res.status(403).json({ error: 'Forbidden', details: 'Cannot update this order' });
     }
+
+    if (order.status === 'awaiting_payment') {
+      return res.status(400).json({
+        error: 'Payment not confirmed',
+        details:
+          'This order is still awaiting online payment. You can view it but cannot act until payment succeeds.',
+      });
+    }
+    if (order.payment_method === 'pesepay' && order.payment_status !== 'paid') {
+      return res.status(400).json({
+        error: 'Payment not confirmed',
+        details: 'Online payment must complete before you can update this order.',
+      });
+    }
+
     const { data: updated, error: updateError } = await supabase
       .from('orders')
       .update({ status })
@@ -2409,13 +2424,19 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
         store_id,
         courier_id,
         status,
+        subtotal,
+        delivery_fee,
+        tax,
         total_amount,
+        payment_method,
+        payment_status,
         pickup_address,
         pickup_latitude,
         pickup_longitude,
         delivery_address,
         delivery_latitude,
         delivery_longitude,
+        delivery_notes,
         created_at,
         updated_at
       `,
@@ -2681,10 +2702,10 @@ app.post('/orders', requireAuth, async (req, res) => {
       });
     }
 
-    if (!['cash', 'wallet'].includes(payment_method)) {
+    if (!['cash', 'wallet', 'pesepay'].includes(payment_method)) {
       return res.status(400).json({
         error: 'Invalid payment_method',
-        details: 'payment_method must be cash or wallet',
+        details: 'payment_method must be cash, wallet, or pesepay',
       });
     }
 
@@ -2753,7 +2774,7 @@ app.post('/orders', requireAuth, async (req, res) => {
     // Fetch default delivery address for customer
     const { data: addresses, error: addressesError } = await supabase
       .from('customer_addresses')
-      .select('id, label, address_line1, city, latitude, longitude')
+      .select('id, label, address_line1, city, latitude, longitude, is_default')
       .eq('customer_id', req.userId)
       .order('created_at', { ascending: false });
 
@@ -2798,7 +2819,12 @@ app.post('/orders', requireAuth, async (req, res) => {
 
     // If paying by wallet, ensure sufficient balance and create a debit transaction
     let paymentStatus = 'pending';
-    if (payment_method === 'wallet') {
+    let orderStatus = 'pending';
+
+    if (payment_method === 'pesepay') {
+      orderStatus = 'awaiting_payment';
+      paymentStatus = 'pending';
+    } else if (payment_method === 'wallet') {
       const { data: lastTx } = await supabase
         .from('wallet_transactions')
         .select('balance_after')
@@ -2828,7 +2854,7 @@ app.post('/orders', requireAuth, async (req, res) => {
         order_number: orderNumber,
         customer_id: req.userId,
         store_id,
-        status: 'pending',
+        status: orderStatus,
         subtotal: subtotal,
         delivery_fee: deliveryFee,
         tax,
@@ -3601,7 +3627,7 @@ app.post('/payments/pesepay/start', requireAuth, async (req, res) => {
     const {
       amount,
       currencyCode,
-      paymentMethodCode,
+      paymentMethodCode: bodyPaymentMethodCode,
       reasonForPayment,
       merchantReference,
       orderId,
@@ -3614,13 +3640,6 @@ app.post('/payments/pesepay/start', requireAuth, async (req, res) => {
       return res.status(400).json({
         error: 'Invalid amount',
         details: 'amount must be greater than 0',
-      });
-    }
-
-    if (!paymentMethodCode) {
-      return res.status(400).json({
-        error: 'Missing paymentMethodCode',
-        details: 'Provide a valid Pesepay paymentMethodCode',
       });
     }
 
@@ -3645,14 +3664,66 @@ app.post('/payments/pesepay/start', requireAuth, async (req, res) => {
       });
     }
 
+    let resolvedOrderId = orderId || null;
+    let paymentMethodCode = bodyPaymentMethodCode;
+    let resolvedMerchantReference = merchantReference;
+    let resolvedReason = reasonForPayment;
+
+    if (orderId) {
+      const { data: ord, error: ordErr } = await supabase
+        .from('orders')
+        .select(
+          'id, customer_id, order_number, status, payment_method, payment_status, total_amount',
+        )
+        .eq('id', orderId)
+        .maybeSingle();
+
+      if (ordErr || !ord) {
+        return res.status(404).json({ error: 'Order not found', details: 'Invalid orderId' });
+      }
+      if (ord.customer_id !== req.userId) {
+        return res.status(403).json({ error: 'Forbidden', details: 'Not your order' });
+      }
+      if (ord.payment_method !== 'pesepay' || ord.status !== 'awaiting_payment') {
+        return res.status(400).json({
+          error: 'Invalid order state',
+          details: 'Order must be awaiting Pesepay payment',
+        });
+      }
+      const expected = Number(ord.total_amount);
+      const got = Number(amount);
+      if (!Number.isFinite(expected) || Math.abs(expected - got) > 0.02) {
+        return res.status(400).json({
+          error: 'Amount mismatch',
+          details: 'amount must match the order total',
+        });
+      }
+
+      paymentMethodCode =
+        bodyPaymentMethodCode ||
+        process.env.PESEPAY_USD_PAYMENT_METHOD_CODE ||
+        process.env.PAYMENT_USD_METHOD_CODE;
+      resolvedMerchantReference = resolvedMerchantReference || ord.order_number;
+      resolvedReason = resolvedReason || `Order ${ord.order_number}`;
+      resolvedOrderId = ord.id;
+    }
+
+    if (!paymentMethodCode) {
+      return res.status(400).json({
+        error: 'Missing paymentMethodCode',
+        details:
+          'Provide paymentMethodCode or set PESEPAY_USD_PAYMENT_METHOD_CODE for USD checkout',
+      });
+    }
+
     const data = await createPesepayTransaction({
       userId: req.userId,
       amount,
       currencyCode: currencyCode || 'USD',
       paymentMethodCode,
-      reasonForPayment,
-      merchantReference,
-      orderId,
+      reasonForPayment: resolvedReason,
+      merchantReference: resolvedMerchantReference,
+      orderId: resolvedOrderId,
       resultUrl,
       returnUrl,
       customer,
@@ -3666,6 +3737,19 @@ app.post('/payments/pesepay/start', requireAuth, async (req, res) => {
       details: error.message || 'Please try again later',
     });
   }
+});
+
+// GET /payments/pesepay/return — browser redirect after Pesepay hosted page; forwards to app deep link
+app.get('/payments/pesepay/return', (req, res) => {
+  const scheme = process.env.APP_PAYMENT_DEEP_LINK_SCHEME || 'dotdeliveryontime';
+  const q = new URLSearchParams(req.query || {});
+  const target = `${scheme}://payment-return?${q.toString()}`;
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Returning to app</title>
+<meta http-equiv="refresh" content="0;url=${target.replace(/"/g, '&quot;')}">
+<script>window.location.replace(${JSON.stringify(target)});</script></head>
+<body><p>Returning to the app…</p></body></html>`;
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  return res.status(200).send(html);
 });
 
 // POST /payments/pesepay/callback — Pesepay resultUrl callback (no auth, called by Pesepay)
