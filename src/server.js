@@ -5,6 +5,7 @@ import { sendOtpToPhone, verifyPhoneOtp, loginWithPassword, checkPhoneRegistered
 import { ensureUserProfile, getProfile, getRoles, updateProfile, uploadProfilePhoto } from './userService.js';
 import { getOrdersForUser, getWalletTransactionsForUser, getPaymentsForUser, getFullUserMe, getMerchantDashboardStats } from './historyService.js';
 import { createPesepayTransaction, handlePesepayCallback } from './paymentService.js';
+import { buildPhoneForPesepayCustomer, resolvePesepayPaymentMethodCode } from './pesepayMethodMap.js';
 import { verifyAccessToken } from './sessionToken.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import {
@@ -3631,6 +3632,7 @@ app.post('/payments/pesepay/start', requireAuth, async (req, res) => {
       reasonForPayment,
       merchantReference,
       orderId,
+      paymentMethodId,
       resultUrl,
       returnUrl,
       customer,
@@ -3640,13 +3642,6 @@ app.post('/payments/pesepay/start', requireAuth, async (req, res) => {
       return res.status(400).json({
         error: 'Invalid amount',
         details: 'amount must be greater than 0',
-      });
-    }
-
-    if (!customer?.phoneNumber) {
-      return res.status(400).json({
-        error: 'Missing customer phoneNumber',
-        details: 'customer.phoneNumber is required for Pesepay',
       });
     }
 
@@ -3668,6 +3663,71 @@ app.post('/payments/pesepay/start', requireAuth, async (req, res) => {
     let paymentMethodCode = bodyPaymentMethodCode;
     let resolvedMerchantReference = merchantReference;
     let resolvedReason = reasonForPayment;
+    let resolvedCustomer = customer;
+    let resolvedPaymentMethodId = null;
+
+    if (paymentMethodId) {
+      const { data: pm, error: pmErr } = await supabase
+        .from('customer_payment_methods')
+        .select('id, customer_id, type, provider, phone_country_code, phone_number, is_active')
+        .eq('id', paymentMethodId)
+        .eq('customer_id', req.userId)
+        .maybeSingle();
+
+      if (pmErr || !pm) {
+        return res.status(404).json({
+          error: 'Payment method not found',
+          details: 'Invalid paymentMethodId or not your method',
+        });
+      }
+      if (pm.is_active === false) {
+        return res.status(400).json({
+          error: 'Inactive payment method',
+          details: 'Choose another payment method',
+        });
+      }
+
+      let phone = buildPhoneForPesepayCustomer(pm);
+      if (!phone && pm.type === 'card' && customer?.phoneNumber) {
+        phone = String(customer.phoneNumber).trim();
+      }
+      if (!phone) {
+        return res.status(400).json({
+          error: 'Phone required for Pesepay',
+          details:
+            'Your saved card has no mobile number — add a phone on your profile, or use a saved mobile money method.',
+        });
+      }
+
+      resolvedPaymentMethodId = pm.id;
+      resolvedCustomer = {
+        phoneNumber: phone,
+        email: customer?.email || '',
+        name: customer?.name || 'Customer',
+      };
+
+      if (!paymentMethodCode) {
+        paymentMethodCode = resolvePesepayPaymentMethodCode({
+          currencyCode: currencyCode || 'USD',
+          type: pm.type,
+          provider: pm.provider,
+        });
+      }
+    }
+
+    if (!paymentMethodCode) {
+      paymentMethodCode =
+        process.env.PESEPAY_USD_PAYMENT_METHOD_CODE ||
+        process.env.PAYMENT_USD_METHOD_CODE;
+    }
+
+    if (!resolvedCustomer?.phoneNumber) {
+      return res.status(400).json({
+        error: 'Missing customer phoneNumber',
+        details:
+          'Provide customer.phoneNumber or paymentMethodId (saved method with phone / profile phone for cards)',
+      });
+    }
 
     if (orderId) {
       const { data: ord, error: ordErr } = await supabase
@@ -3699,10 +3759,6 @@ app.post('/payments/pesepay/start', requireAuth, async (req, res) => {
         });
       }
 
-      paymentMethodCode =
-        bodyPaymentMethodCode ||
-        process.env.PESEPAY_USD_PAYMENT_METHOD_CODE ||
-        process.env.PAYMENT_USD_METHOD_CODE;
       resolvedMerchantReference = resolvedMerchantReference || ord.order_number;
       resolvedReason = resolvedReason || `Order ${ord.order_number}`;
       resolvedOrderId = ord.id;
@@ -3712,7 +3768,7 @@ app.post('/payments/pesepay/start', requireAuth, async (req, res) => {
       return res.status(400).json({
         error: 'Missing paymentMethodCode',
         details:
-          'Provide paymentMethodCode or set PESEPAY_USD_PAYMENT_METHOD_CODE for USD checkout',
+          'Set PESEPAY_USD_PAYMENT_METHOD_CODE on the server (or EXPO_PUBLIC_PESEPAY_USD_PAYMENT_METHOD_CODE in the app .env), or pass paymentMethodCode in the request body. Use the code from your Pesepay sandbox dashboard for the channel you want (e.g. EcoCash / card).',
       });
     }
 
@@ -3726,7 +3782,8 @@ app.post('/payments/pesepay/start', requireAuth, async (req, res) => {
       orderId: resolvedOrderId,
       resultUrl,
       returnUrl,
-      customer,
+      customer: resolvedCustomer,
+      customerPaymentMethodId: resolvedPaymentMethodId,
     });
 
     return res.json(data);

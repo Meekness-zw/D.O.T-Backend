@@ -1,0 +1,109 @@
+{
+  "info": {
+    "name": "DOT — Pesepay sandbox tests",
+    "description": "Test your backend with Pesepay sandbox keys in .env (PAYMENT_INTEGRATION_ID, PAYMENT_ENCRYPTION_KEY).\n\n**Auth:** Login returns `session.access_token`. The Login request saves it to the collection variable `accessToken` automatically.\n\n**Pesepay URLs:** `resultUrl` must be an **HTTPS** URL that Pesepay can reach (your deployed API + `/payments/pesepay/callback`). For local dev use ngrok/Cloudflare Tunnel and set `baseUrl` to that HTTPS origin.\n\n**Sandbox:** Use Pesepay’s **sandbox integration + encryption keys** and the **payment method code** they document for sandbox (set `PESEPAY_USD_PAYMENT_METHOD_CODE` on the server or pass `paymentMethodCode` in the body).\n\n**Callback:** You cannot fake `POST /payments/pesepay/callback` in Postman without Pesepay’s encrypted `payload`. Complete a payment in the hosted page (redirect URL from start response) to trigger the real callback.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:4000" },
+    { "key": "accessToken", "value": "" },
+    { "key": "phone", "value": "+263771234567" },
+    { "key": "password", "value": "your-password" },
+    { "key": "storeId", "value": "REPLACE_WITH_STORE_UUID" },
+    { "key": "orderId", "value": "REPLACE_AFTER_CREATE_ORDER" },
+    { "key": "publicHttpsBase", "value": "https://YOUR-NGROK-OR-DEPLOYED-API.example.com" }
+  ],
+  "item": [
+    {
+      "name": "1 — Health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": "{{baseUrl}}/"
+      }
+    },
+    {
+      "name": "2 — Auth — login (password)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "const j = pm.response.json();",
+              "if (j.session && j.session.access_token) {",
+              "  pm.collectionVariables.set('accessToken', j.session.access_token);",
+              "  console.log('Saved accessToken to collection');",
+              "}"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"phone\": \"{{phone}}\",\n  \"password\": \"{{password}}\"\n}"
+        },
+        "url": "{{baseUrl}}/auth/login-password"
+      }
+    },
+    {
+      "name": "3 — Pesepay start (wallet-style, no order)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{accessToken}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"amount\": 1.5,\n  \"currencyCode\": \"USD\",\n  \"paymentMethodCode\": \"REPLACE_WITH_SANDBOX_CODE\",\n  \"reasonForPayment\": \"Postman sandbox test\",\n  \"merchantReference\": \"POSTMAN-{{$timestamp}}\",\n  \"resultUrl\": \"{{publicHttpsBase}}/payments/pesepay/callback\",\n  \"returnUrl\": \"{{publicHttpsBase}}/payments/pesepay/return\",\n  \"customer\": {\n    \"phoneNumber\": \"{{phone}}\",\n    \"email\": \"test@example.com\",\n    \"name\": \"Postman User\"\n  }\n}"
+        },
+        "url": "{{baseUrl}}/payments/pesepay/start"
+      },
+      "description": "Simplest sandbox check: if this returns JSON with `transaction.redirectUrl`, your keys and Pesepay API path work. Replace `paymentMethodCode` with the code Pesepay gives you for sandbox USD (or ZWL if you switch currency). `publicHttpsBase` must be reachable by Pesepay (not localhost)."
+    },
+    {
+      "name": "4 — Create order (pesepay)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{accessToken}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"store_id\": \"{{storeId}}\",\n  \"payment_method\": \"pesepay\",\n  \"delivery_notes\": \"Postman test\",\n  \"items\": [\n    {\n      \"product_id\": \"REPLACE_PRODUCT_UUID\",\n      \"product_name\": \"Test item\",\n      \"product_price\": 1.5,\n      \"quantity\": 1,\n      \"unit\": \"item\",\n      \"weight_kg\": null,\n      \"subtotal\": 1.5\n    }\n  ]\n}"
+        },
+        "url": "{{baseUrl}}/orders"
+      },
+      "description": "Requires: real `store_id` and `product_id` from your DB, default customer address with coordinates, store open. Copy `order.id` from response into collection variable `orderId` for request 5."
+    },
+    {
+      "name": "5 — Pesepay start (order checkout)",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Authorization", "value": "Bearer {{accessToken}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"orderId\": \"{{orderId}}\",\n  \"amount\": 1.5,\n  \"currencyCode\": \"USD\",\n  \"reasonForPayment\": \"Order checkout test\",\n  \"merchantReference\": \"ORDER-TEST\",\n  \"resultUrl\": \"{{publicHttpsBase}}/payments/pesepay/callback\",\n  \"returnUrl\": \"{{publicHttpsBase}}/payments/pesepay/return?orderId={{orderId}}\",\n  \"customer\": {\n    \"phoneNumber\": \"{{phone}}\",\n    \"email\": \"test@example.com\",\n    \"name\": \"Postman User\"\n  }\n}"
+        },
+        "url": "{{baseUrl}}/payments/pesepay/start"
+      },
+      "description": "`amount` must match `order.total_amount`. Server can fill `paymentMethodCode` from `PESEPAY_USD_PAYMENT_METHOD_CODE` when omitted."
+    },
+    {
+      "name": "6 — GET order (poll payment status)",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }],
+        "url": "{{baseUrl}}/orders/{{orderId}}"
+      }
+    }
+  ]
+}

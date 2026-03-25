@@ -85,6 +85,7 @@ function mapPesepayStatusToPaymentStatus(transactionStatus) {
  * - resultUrl: HTTPS URL Pesepay will POST result to (your backend endpoint)
  * - returnUrl: optional URL app/web will be redirected to after payment
  * - customer: { phoneNumber, email?, name? }
+ * - customerPaymentMethodId: optional UUID linking to customer_payment_methods
  */
 export async function createPesepayTransaction({
   userId,
@@ -97,6 +98,7 @@ export async function createPesepayTransaction({
   returnUrl,
   customer,
   orderId = null,
+  customerPaymentMethodId = null,
 }) {
   if (!supabase) {
     throw new Error('Supabase admin client not configured');
@@ -146,6 +148,12 @@ export async function createPesepayTransaction({
 
   const paymentStatus = mapPesepayStatusToPaymentStatus(transaction.transactionStatus);
 
+  const metadataBase =
+    transaction && typeof transaction === 'object' ? { ...transaction } : { gatewayPayload: transaction };
+  if (customerPaymentMethodId) {
+    metadataBase.customer_payment_method_id = customerPaymentMethodId;
+  }
+
   const { data: insertedPayment, error: paymentError } = await supabase
     .from('payments')
     .insert({
@@ -157,7 +165,7 @@ export async function createPesepayTransaction({
       payment_provider: 'Pesepay',
       transaction_id: transaction.referenceNumber,
       status: paymentStatus,
-      metadata: transaction,
+      metadata: metadataBase,
     })
     .select('*')
     .single();
@@ -241,11 +249,22 @@ export async function handlePesepayCallback(callbackBody) {
 
   const paymentStatus = mapPesepayStatusToPaymentStatus(transaction.transactionStatus);
 
+  const { data: prevPay } = await supabase
+    .from('payments')
+    .select('metadata')
+    .eq('transaction_id', transaction.referenceNumber)
+    .maybeSingle();
+
+  const mergedMeta = {
+    ...(prevPay?.metadata && typeof prevPay.metadata === 'object' ? prevPay.metadata : {}),
+    ...(typeof transaction === 'object' && transaction !== null ? transaction : { result: transaction }),
+  };
+
   const { data: payment, error: updateError } = await supabase
     .from('payments')
     .update({
       status: paymentStatus,
-      metadata: transaction,
+      metadata: mergedMeta,
     })
     .eq('transaction_id', transaction.referenceNumber)
     .select('*')
