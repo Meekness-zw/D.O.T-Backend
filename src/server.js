@@ -2366,17 +2366,24 @@ app.patch('/orders/:id', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden', details: 'Cannot update this order' });
     }
 
-    if (order.status === 'awaiting_payment') {
+    // Merchants may cancel/reject unpaid orders; payment gate applies to other transitions only.
+    const isCancelling = status === 'cancelled';
+    if (!isCancelling && order.status === 'awaiting_payment') {
       return res.status(400).json({
         error: 'Payment not confirmed',
         details:
-          'This order is still awaiting online payment. You can view it but cannot act until payment succeeds.',
+          'This order is still awaiting online payment. Accept becomes available after payment succeeds; you can still cancel.',
       });
     }
-    if (order.payment_method === 'pesepay' && order.payment_status !== 'paid') {
+    if (
+      !isCancelling &&
+      order.payment_method === 'pesepay' &&
+      order.payment_status !== 'paid'
+    ) {
       return res.status(400).json({
         error: 'Payment not confirmed',
-        details: 'Online payment must complete before you can update this order.',
+        details:
+          'Online payment must complete before you can accept or progress this order; you can still cancel.',
       });
     }
 
@@ -4466,6 +4473,11 @@ app.listen(PORT, () => {
   console.log(`📍 Server: http://localhost:${PORT}`);
   console.log(`🌍 Environment: ${NODE_ENV}`);
   console.log(`🔒 CORS allowed origins:`, allowedOrigins);
+  if (!process.env.PESEPAY_USD_PAYMENT_METHOD_CODE && !process.env.PAYMENT_USD_METHOD_CODE) {
+    console.warn(
+      '[Pesepay] PESEPAY_USD_PAYMENT_METHOD_CODE is not set. USD order payments will fail until you add it to backend/.env (copy the payment method code from your Pesepay sandbox or live dashboard).',
+    );
+  }
   runScheduledPromotions();
   setInterval(runScheduledPromotions, 15 * 60 * 1000);
 });

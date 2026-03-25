@@ -279,6 +279,55 @@ export async function getFullUserMe(userId) {
   return result;
 }
 
+const TERMINAL_ORDER_STATUSES = new Set(['delivered', 'cancelled', 'refunded']);
+
+/** Sum total_amount across all orders for stores (paginated; accurate for KPIs). */
+async function sumOrderTotalsForStores(storeIds) {
+  if (!storeIds.length || !supabase) return 0;
+  let total = 0;
+  let from = 0;
+  const pageSize = 2000;
+  for (;;) {
+    const { data, error } = await supabase
+      .from('orders')
+      .select('total_amount')
+      .in('store_id', storeIds)
+      .range(from, from + pageSize - 1);
+    if (error) throw new Error(error.message || 'Failed to sum order totals');
+    const rows = data || [];
+    for (const row of rows) {
+      total += Number(row.total_amount) || 0;
+    }
+    if (rows.length < pageSize) break;
+    from += pageSize;
+  }
+  return total;
+}
+
+/** Count non-terminal orders for stores (paginated). */
+async function countOpenOrdersForStores(storeIds) {
+  if (!storeIds.length || !supabase) return 0;
+  let open = 0;
+  let from = 0;
+  const pageSize = 2000;
+  for (;;) {
+    const { data, error } = await supabase
+      .from('orders')
+      .select('status')
+      .in('store_id', storeIds)
+      .range(from, from + pageSize - 1);
+    if (error) throw new Error(error.message || 'Failed to count open orders');
+    const rows = data || [];
+    for (const row of rows) {
+      const s = String(row.status ?? '').toLowerCase();
+      if (s && !TERMINAL_ORDER_STATUSES.has(s)) open += 1;
+    }
+    if (rows.length < pageSize) break;
+    from += pageSize;
+  }
+  return open;
+}
+
 /**
  * Dashboard stats for merchant: KPIs, revenue by day, best-selling products, category counts.
  * All data from DB for the merchant's stores.
@@ -286,19 +335,8 @@ export async function getFullUserMe(userId) {
 export async function getMerchantDashboardStats(userId) {
   if (!userId || !supabase) throw new Error('userId required and server must be configured');
 
-  const profile = await getProfile(userId);
-  if (profile?.role !== 'merchant') {
-    return {
-      totalSales: 0,
-      totalOrders: 0,
-      avgOrderValue: 0,
-      openOrders: 0,
-      revenueByDay: [],
-      bestProducts: [],
-      categoryCounts: [],
-    };
-  }
-
+  // Match /users/me/orders?role=merchant: capability is store ownership, not user_profiles.role.
+  // Multi-role users (e.g. primary role courier) still own stores and must see real KPIs.
   const { data: storeRows } = await supabase
     .from('stores')
     .select('id')
@@ -316,11 +354,18 @@ export async function getMerchantDashboardStats(userId) {
     };
   }
 
-  const now = new Date();
-  const ninetyDaysAgo = new Date(now);
-  ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
-  const fromIso = ninetyDaysAgo.toISOString();
+  const [{ count: orderCountExact, error: countError }, totalSales, openOrders] = await Promise.all([
+    supabase.from('orders').select('id', { count: 'exact', head: true }).in('store_id', storeIds),
+    sumOrderTotalsForStores(storeIds),
+    countOpenOrdersForStores(storeIds),
+  ]);
 
+  if (countError) throw new Error(countError.message || 'Failed to count orders for dashboard');
+
+  const totalOrders = typeof orderCountExact === 'number' ? orderCountExact : 0;
+  const avgOrderValue = totalOrders > 0 ? totalSales / totalOrders : 0;
+
+  // Recent orders for charts & best sellers (no 90-day cutoff — that hid real totals vs order queue).
   const { data: orders, error: ordersError } = await supabase
     .from('orders')
     .select(
@@ -336,19 +381,11 @@ export async function getMerchantDashboardStats(userId) {
     `
     )
     .in('store_id', storeIds)
-    .gte('created_at', fromIso)
     .order('created_at', { ascending: false })
-    .limit(1000);
+    .limit(8000);
 
   if (ordersError) throw new Error(ordersError.message || 'Failed to fetch orders for dashboard');
   const orderList = orders || [];
-
-  const totalSales = orderList.reduce((sum, o) => sum + (Number(o.total_amount) || 0), 0);
-  const totalOrders = orderList.length;
-  const avgOrderValue = totalOrders > 0 ? totalSales / totalOrders : 0;
-  const openOrders = orderList.filter((o) =>
-    ['pending', 'confirmed', 'preparing'].includes(o.status)
-  ).length;
 
   const revenueByDay = buildRevenueByDay(orderList);
 
