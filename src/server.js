@@ -2608,6 +2608,8 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
         courier_latitude,
         courier_longitude,
         courier_location_updated_at,
+        estimated_prep_time,
+        estimated_delivery_time,
         created_at,
         updated_at
       `,
@@ -2654,11 +2656,24 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
       courier_full_name = cp?.full_name || null;
     }
 
+    let courier_vehicle_type = null;
+    if (order.courier_id) {
+      const { data: vehicle } = await supabase
+        .from('courier_vehicles')
+        .select('vehicle_type')
+        .eq('courier_id', order.courier_id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      courier_vehicle_type = vehicle?.vehicle_type || null;
+    }
+
     return res.json({
       order: {
         ...order,
         store_name: store?.store_name || null,
         courier_full_name,
+        courier_vehicle_type,
       },
     });
   } catch (error) {
@@ -2719,6 +2734,62 @@ app.delete('/orders/:id', requireAuth, async (req, res) => {
   }
 });
 
+const COURIER_ACTIVE_STATUSES = ['assigned', 'picked_up', 'in_transit'];
+
+// GET /courier/orders/active — delivery in progress for this courier (resume after app restart)
+app.get('/courier/orders/active', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    const me = await getFullUserMe(req.userId);
+    if (!me?.roles?.includes('courier')) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        details: 'User is not a courier',
+      });
+    }
+
+    const { data: row, error } = await supabase
+      .from('orders')
+      .select(
+        `
+        id,
+        order_number,
+        total_amount,
+        status,
+        pickup_address,
+        pickup_latitude,
+        pickup_longitude,
+        delivery_address,
+        delivery_latitude,
+        delivery_longitude,
+        stores (
+          store_name,
+          city
+        )
+      `,
+      )
+      .eq('courier_id', req.userId)
+      .in('status', COURIER_ACTIVE_STATUSES)
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      console.error('get /courier/orders/active error:', error);
+      throw new Error(error.message || 'Failed to load active order');
+    }
+
+    return res.json({ order: row || null });
+  } catch (error) {
+    console.error('get /courier/orders/active error:', error);
+    return res.status(500).json({
+      error: 'Failed to load active order',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // GET /courier/jobs/open — list ready orders with no courier assigned
 app.get('/courier/jobs/open', requireAuth, async (req, res) => {
   try {
@@ -2733,6 +2804,18 @@ app.get('/courier/jobs/open', requireAuth, async (req, res) => {
       });
     }
 
+    const { data: busyRow } = await supabase
+      .from('orders')
+      .select('id')
+      .eq('courier_id', req.userId)
+      .in('status', COURIER_ACTIVE_STATUSES)
+      .limit(1)
+      .maybeSingle();
+
+    if (busyRow?.id) {
+      return res.json({ jobs: [], hasActiveJob: true });
+    }
+
     const { data, error } = await supabase
       .from('orders')
       .select(
@@ -2742,7 +2825,11 @@ app.get('/courier/jobs/open', requireAuth, async (req, res) => {
         total_amount,
         status,
         pickup_address,
+        pickup_latitude,
+        pickup_longitude,
         delivery_address,
+        delivery_latitude,
+        delivery_longitude,
         stores (
           store_name,
           city
@@ -2780,6 +2867,21 @@ app.post('/courier/jobs/:id/accept', requireAuth, async (req, res) => {
       return res.status(403).json({
         error: 'Forbidden',
         details: 'User is not a courier',
+      });
+    }
+
+    const { data: existingActive } = await supabase
+      .from('orders')
+      .select('id')
+      .eq('courier_id', req.userId)
+      .in('status', COURIER_ACTIVE_STATUSES)
+      .limit(1)
+      .maybeSingle();
+
+    if (existingActive?.id) {
+      return res.status(400).json({
+        error: 'Already on a delivery',
+        details: 'Finish your current delivery before accepting another job.',
       });
     }
 
