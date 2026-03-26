@@ -2647,13 +2647,15 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
     }
 
     let courier_full_name = null;
+    let courier_phone = null;
     if (order.courier_id) {
       const { data: cp } = await supabase
         .from('user_profiles')
-        .select('full_name')
+        .select('full_name, phone')
         .eq('id', order.courier_id)
         .maybeSingle();
       courier_full_name = cp?.full_name || null;
+      courier_phone = cp?.phone || null;
     }
 
     let courier_vehicle_type = null;
@@ -2674,6 +2676,7 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
         store_name: store?.store_name || null,
         courier_full_name,
         courier_vehicle_type,
+        courier_phone,
       },
     });
   } catch (error) {
