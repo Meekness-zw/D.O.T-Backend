@@ -2,7 +2,14 @@ import 'dotenv/config.js';
 import express from 'express';
 import cors from 'cors';
 import { sendOtpToPhone, verifyPhoneOtp, loginWithPassword, checkPhoneRegistered, deleteUserById } from './authService.js';
-import { ensureUserProfile, getProfile, getRoles, updateProfile, uploadProfilePhoto } from './userService.js';
+import {
+  ensureUserProfile,
+  getProfile,
+  getRoles,
+  updateProfile,
+  uploadProfilePhoto,
+  recordCourierProfilePhotoDocument,
+} from './userService.js';
 import { getOrdersForUser, getWalletTransactionsForUser, getPaymentsForUser, getFullUserMe, getMerchantDashboardStats } from './historyService.js';
 import { createPesepayTransaction, handlePesepayCallback } from './paymentService.js';
 import { buildPhoneForPesepayCustomer, resolvePesepayPaymentMethodCode } from './pesepayMethodMap.js';
@@ -41,6 +48,7 @@ import {
   notifyCustomerOrderPlaced,
   notifyCustomerOrderSelfCancelled,
 } from './orderNotifications.js';
+import { recordCourierDeliveryEarnings } from './orderPaymentSplit.js';
 import crypto from 'crypto';
 
 const app = express();
@@ -2910,6 +2918,240 @@ app.patch('/courier/orders/:id/location', requireAuth, async (req, res) => {
   }
 });
 
+// POST /courier/orders/:id/pickup — mark order picked up / en route (assigned → in_transit)
+app.post('/courier/orders/:id/pickup', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+
+    const me = await getFullUserMe(req.userId);
+    if (!me?.roles?.includes('courier')) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        details: 'User is not a courier',
+      });
+    }
+
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .select('id, courier_id, status, order_number')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (orderError) {
+      console.error('courier pickup order error:', orderError);
+      throw new Error(orderError.message || 'Failed to load order');
+    }
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    if (order.courier_id !== req.userId) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        details: 'You are not assigned to this order',
+      });
+    }
+
+    if (order.status === 'in_transit' || order.status === 'picked_up') {
+      const { data: current } = await supabase
+        .from('orders')
+        .select('id, status, order_number')
+        .eq('id', id)
+        .single();
+      return res.json({ order: current });
+    }
+
+    if (order.status !== 'assigned') {
+      return res.status(400).json({
+        error: 'Cannot pick up',
+        details: 'Order must be assigned before pickup',
+      });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('orders')
+      .update({ status: 'in_transit' })
+      .eq('id', id)
+      .select('id, order_number, status, courier_id')
+      .single();
+
+    if (updateError) {
+      console.error('courier pickup update error:', updateError);
+      throw new Error(updateError.message || 'Failed to update order');
+    }
+
+    const { error: historyError } = await supabase.from('order_status_history').insert({
+      order_id: id,
+      status: 'in_transit',
+      notes: 'Courier picked up order',
+      changed_by: req.userId,
+    });
+    if (historyError) {
+      console.error('order_status_history insert (in_transit) error:', historyError);
+    }
+
+    return res.json({ order: updated });
+  } catch (error) {
+    console.error('post /courier/orders/:id/pickup error:', error);
+    return res.status(500).json({
+      error: 'Failed to record pickup',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /courier/orders/:id/complete — mark delivered; credit courier delivery_fee to wallet
+app.post('/courier/orders/:id/complete', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+
+    const me = await getFullUserMe(req.userId);
+    if (!me?.roles?.includes('courier')) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        details: 'User is not a courier',
+      });
+    }
+
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .select(
+        'id, courier_id, status, order_number, delivery_fee, total_amount, payment_status, payment_method'
+      )
+      .eq('id', id)
+      .maybeSingle();
+
+    if (orderError) {
+      console.error('courier complete order error:', orderError);
+      throw new Error(orderError.message || 'Failed to load order');
+    }
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    if (order.courier_id !== req.userId) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        details: 'You are not assigned to this order',
+      });
+    }
+
+    if (order.status === 'cancelled' || order.status === 'refunded') {
+      return res.status(400).json({
+        error: 'Order not deliverable',
+        details: `Order status is ${order.status}`,
+      });
+    }
+
+    const paidOk =
+      order.payment_status === 'paid' || order.payment_method === 'cash';
+
+    if (!paidOk) {
+      return res.status(400).json({
+        error: 'Payment not settled',
+        details: 'Order must be paid before marking delivered (or cash on delivery)',
+      });
+    }
+
+    const deliveryFee = Number(order.delivery_fee) || 0;
+
+    // Idempotent recovery: already delivered but earnings insert may have failed earlier
+    if (order.status === 'delivered') {
+      const earnings = await recordCourierDeliveryEarnings({
+        courierId: req.userId,
+        orderId: id,
+        amount: deliveryFee,
+        orderNumber: order.order_number,
+      });
+      const { data: courierRow } = await supabase
+        .from('couriers')
+        .select('account_balance, total_earnings, total_deliveries')
+        .eq('id', req.userId)
+        .maybeSingle();
+      const { data: deliveredRow } = await supabase
+        .from('orders')
+        .select('id, order_number, status, delivery_fee, actual_delivery_time')
+        .eq('id', id)
+        .single();
+      return res.json({
+        order: deliveredRow,
+        earnings: earnings
+          ? {
+              amount: earnings.amount,
+              balance_after: earnings.balance_after,
+              skipped: earnings.skipped,
+            }
+          : null,
+        courier: courierRow || null,
+      });
+    }
+
+    const allowedBeforeDelivered = ['assigned', 'picked_up', 'in_transit'];
+    if (!allowedBeforeDelivered.includes(order.status)) {
+      return res.status(400).json({
+        error: 'Cannot complete delivery',
+        details: 'Order is not ready for delivery completion',
+      });
+    }
+
+    const { data: delivered, error: updateError } = await supabase
+      .from('orders')
+      .update({
+        status: 'delivered',
+        actual_delivery_time: new Date().toISOString(),
+      })
+      .eq('id', id)
+      .select('id, order_number, status, delivery_fee, actual_delivery_time')
+      .single();
+
+    if (updateError) {
+      console.error('courier complete update error:', updateError);
+      throw new Error(updateError.message || 'Failed to update order');
+    }
+
+    const { error: historyError } = await supabase.from('order_status_history').insert({
+      order_id: id,
+      status: 'delivered',
+      notes: 'Courier marked order delivered',
+      changed_by: req.userId,
+    });
+    if (historyError) {
+      console.error('order_status_history insert (delivered) error:', historyError);
+    }
+
+    const earnings = await recordCourierDeliveryEarnings({
+      courierId: req.userId,
+      orderId: id,
+      amount: deliveryFee,
+      orderNumber: order.order_number,
+    });
+
+    const { data: courierRow } = await supabase
+      .from('couriers')
+      .select('account_balance, total_earnings, total_deliveries')
+      .eq('id', req.userId)
+      .maybeSingle();
+
+    return res.json({
+      order: delivered,
+      earnings: earnings
+        ? {
+            amount: earnings.amount,
+            balance_after: earnings.balance_after,
+            skipped: earnings.skipped,
+          }
+        : null,
+      courier: courierRow || null,
+    });
+  } catch (error) {
+    console.error('post /courier/orders/:id/complete error:', error);
+    return res.status(500).json({
+      error: 'Failed to complete delivery',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // GET /users/me/wallet-transactions — wallet transaction history
 app.get('/users/me/wallet-transactions', requireAuth, async (req, res) => {
   try {
@@ -4465,6 +4707,13 @@ app.patch('/users/profile', requireAuth, async (req, res) => {
     }
 
     const profile = await updateProfile(req.userId, updates);
+    if (profilePhotoUrl) {
+      try {
+        await recordCourierProfilePhotoDocument(req.userId, profilePhotoUrl);
+      } catch (e) {
+        console.error('courier profile photo document sync:', e?.message || e);
+      }
+    }
     return res.json(profile);
   } catch (error) {
     console.error('update profile error:', error);

@@ -308,3 +308,26 @@ export async function uploadProfilePhoto(userId, imageBuffer, contentType = 'ima
   const { data: urlData } = supabase.storage.from(AVATARS_BUCKET).getPublicUrl(path);
   return urlData?.publicUrl || null;
 }
+
+/**
+ * When a courier updates their account profile photo, we also append a courier_documents row
+ * so GET /users/me (getFullUserMe) picks courier_profile_photo_url from the latest document.
+ */
+export async function recordCourierProfilePhotoDocument(userId, documentUrl) {
+  if (!userId || !documentUrl || !supabase) return;
+  const roles = await getRoles(userId);
+  if (!roles.includes('courier')) return;
+
+  const { data: courierRow } = await supabase.from('couriers').select('id').eq('id', userId).maybeSingle();
+  if (!courierRow?.id) return;
+
+  const { error } = await supabase.from('courier_documents').insert({
+    courier_id: userId,
+    document_type: 'profile_photo',
+    document_url: documentUrl,
+    status: 'approved',
+  });
+  if (error) {
+    console.error('recordCourierProfilePhotoDocument:', error.message || error);
+  }
+}
