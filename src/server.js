@@ -2611,7 +2611,17 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
         estimated_prep_time,
         estimated_delivery_time,
         created_at,
-        updated_at
+        updated_at,
+        order_items (
+          id,
+          product_id,
+          product_name,
+          product_price,
+          quantity,
+          unit,
+          weight_kg,
+          subtotal
+        )
       `,
       )
       .eq('id', id)
