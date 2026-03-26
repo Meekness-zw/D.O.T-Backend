@@ -4,6 +4,7 @@ import CryptoJS from 'crypto-js';
 import { getPesepayConfig } from './pesepayConfig.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { computeSubtotalSplit, recordMerchantEarningsForOrderPayment } from './orderPaymentSplit.js';
+import { notifyCustomerPaymentReceived } from './orderNotifications.js';
 
 const supabase = supabaseAdmin;
 
@@ -361,6 +362,19 @@ async function finalizeOrderPaymentFromPesepay({ payment, paymentStatus, transac
       console.error('[Pesepay] Failed to mark order paid:', orderUpdateError);
       throw new Error(orderUpdateError.message || 'Failed to update order');
     }
+
+    const { data: storeForNotify } = await supabase
+      .from('stores')
+      .select('store_name')
+      .eq('id', order.store_id)
+      .maybeSingle();
+
+    await notifyCustomerPaymentReceived(supabase, {
+      customerId: order.customer_id,
+      orderId: updatedOrder.id,
+      orderNumber: updatedOrder.order_number,
+      storeName: storeForNotify?.store_name,
+    });
 
     let merchantTx = null;
     if (store?.merchant_id && merchantEarnings > 0) {

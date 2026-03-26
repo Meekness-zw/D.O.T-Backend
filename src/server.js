@@ -35,6 +35,12 @@ import {
 import { supabaseAdmin as publicSupabase } from './supabaseAdminClient.js';
 import { enrichStoreForCustomerListing, assertStoreAcceptingOrders } from './storeHours.js';
 import { getMerchantHelpPayload } from './merchantHelpContent.js';
+import {
+  notifyCustomerMerchantOrderStatus,
+  notifyCustomerCourierAssigned,
+  notifyCustomerOrderPlaced,
+  notifyCustomerOrderSelfCancelled,
+} from './orderNotifications.js';
 import crypto from 'crypto';
 
 const app = express();
@@ -2353,7 +2359,7 @@ app.patch('/orders/:id', requireAuth, async (req, res) => {
     }
     const { data: order, error: orderError } = await supabase
       .from('orders')
-      .select('id, store_id, status, payment_status, payment_method')
+      .select('id, store_id, status, payment_status, payment_method, customer_id, order_number')
       .eq('id', id)
       .maybeSingle();
     if (orderError || !order) return res.status(404).json({ error: 'Order not found' });
@@ -2406,11 +2412,157 @@ app.patch('/orders/:id', requireAuth, async (req, res) => {
       console.error('order_status_history insert error:', historyError);
     }
 
+    const { data: storeRow } = await supabase
+      .from('stores')
+      .select('store_name')
+      .eq('id', order.store_id)
+      .maybeSingle();
+
+    await notifyCustomerMerchantOrderStatus(supabase, {
+      customerId: order.customer_id,
+      orderId: updated.id,
+      orderNumber: updated.order_number,
+      status,
+      storeName: storeRow?.store_name,
+    });
+
     return res.json(updated);
   } catch (error) {
     console.error('patch /orders/:id error:', error);
     return res.status(500).json({
       error: 'Failed to update order',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /orders/:id/cancel — customer cancels before the store marks the order ready (wallet refunds applied)
+app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .select(
+        'id, customer_id, store_id, status, payment_status, payment_method, total_amount, order_number',
+      )
+      .eq('id', id)
+      .maybeSingle();
+
+    if (orderError || !order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    if (order.customer_id !== req.userId) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        details: 'You can only cancel your own orders',
+      });
+    }
+
+    const st = String(order.status || '')
+      .toLowerCase()
+      .trim()
+      .replace(/\s+/g, '_');
+    const cancellable = new Set(['awaiting_payment', 'pending', 'confirmed', 'preparing']);
+    if (!cancellable.has(st)) {
+      return res.status(400).json({
+        error: 'Cannot cancel this order',
+        details:
+          'You can only cancel before the store marks it ready for pickup. Contact support if you need help.',
+      });
+    }
+
+    if (order.payment_status === 'paid' && order.payment_method === 'pesepay') {
+      return res.status(400).json({
+        error: 'Cannot cancel in the app',
+        details:
+          'This order was paid online. Please contact support if you need to cancel or refund.',
+      });
+    }
+
+    const totalAmount = Number(order.total_amount);
+    if (
+      order.payment_status === 'paid' &&
+      order.payment_method === 'wallet' &&
+      Number.isFinite(totalAmount) &&
+      totalAmount > 0
+    ) {
+      const { data: lastTx } = await supabase
+        .from('wallet_transactions')
+        .select('balance_after')
+        .eq('user_id', order.customer_id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      const prevBalance = Number(lastTx?.balance_after) || 0;
+      const newBalance = prevBalance + totalAmount;
+
+      const { error: refundError } = await supabase.from('wallet_transactions').insert({
+        user_id: order.customer_id,
+        user_type: 'customer',
+        transaction_type: 'refund',
+        amount: totalAmount,
+        balance_after: newBalance,
+        description: `Refund: cancelled order ${order.order_number}`,
+        reference_id: order.id,
+        status: 'completed',
+      });
+
+      if (refundError) {
+        console.error('customer cancel wallet refund error:', refundError);
+        throw new Error(refundError.message || 'Failed to refund wallet');
+      }
+
+      await supabase
+        .from('payments')
+        .update({ status: 'refunded' })
+        .eq('order_id', order.id)
+        .eq('customer_id', order.customer_id);
+    }
+
+    const nextPaymentStatus =
+      order.payment_status === 'paid' && order.payment_method === 'wallet'
+        ? 'refunded'
+        : order.payment_status;
+
+    const { data: updated, error: updateError } = await supabase
+      .from('orders')
+      .update({
+        status: 'cancelled',
+        payment_status: nextPaymentStatus,
+      })
+      .eq('id', id)
+      .select('id, order_number, status, payment_status')
+      .single();
+
+    if (updateError) {
+      console.error('customer cancel order update error:', updateError);
+      throw new Error(updateError.message || 'Failed to cancel order');
+    }
+
+    const { error: historyError } = await supabase.from('order_status_history').insert({
+      order_id: updated.id,
+      status: 'cancelled',
+      notes: 'Cancelled by customer',
+      changed_by: req.userId,
+    });
+    if (historyError) {
+      console.error('order_status_history insert (customer cancel) error:', historyError);
+    }
+
+    await notifyCustomerOrderSelfCancelled(supabase, {
+      customerId: order.customer_id,
+      orderId: updated.id,
+      orderNumber: updated.order_number,
+    });
+
+    return res.json({ order: updated });
+  } catch (error) {
+    console.error('post /orders/:id/cancel error:', error);
+    return res.status(500).json({
+      error: 'Failed to cancel order',
       details: error.message || 'Please try again later',
     });
   }
@@ -2445,6 +2597,9 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
         delivery_latitude,
         delivery_longitude,
         delivery_notes,
+        courier_latitude,
+        courier_longitude,
+        courier_location_updated_at,
         created_at,
         updated_at
       `,
@@ -2481,7 +2636,23 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
       });
     }
 
-    return res.json({ order: { ...order, store_name: store?.store_name || null } });
+    let courier_full_name = null;
+    if (order.courier_id) {
+      const { data: cp } = await supabase
+        .from('user_profiles')
+        .select('full_name')
+        .eq('id', order.courier_id)
+        .maybeSingle();
+      courier_full_name = cp?.full_name || null;
+    }
+
+    return res.json({
+      order: {
+        ...order,
+        store_name: store?.store_name || null,
+        courier_full_name,
+      },
+    });
   } catch (error) {
     console.error('get /orders/:id error:', error);
     return res.status(500).json({
@@ -2606,7 +2777,7 @@ app.post('/courier/jobs/:id/accept', requireAuth, async (req, res) => {
 
     const { data: order, error: orderError } = await supabase
       .from('orders')
-      .select('id, status, courier_id')
+      .select('id, status, courier_id, customer_id, order_number')
       .eq('id', id)
       .maybeSingle();
 
@@ -2646,11 +2817,94 @@ app.post('/courier/jobs/:id/accept', requireAuth, async (req, res) => {
       console.error('order_status_history insert (assigned) error:', historyError);
     }
 
+    const { data: courierProf } = await supabase
+      .from('user_profiles')
+      .select('full_name')
+      .eq('id', req.userId)
+      .maybeSingle();
+
+    await notifyCustomerCourierAssigned(supabase, {
+      customerId: order.customer_id,
+      orderId: updated.id,
+      orderNumber: updated.order_number,
+      courierName: courierProf?.full_name,
+    });
+
     return res.json({ order: updated });
   } catch (error) {
     console.error('post /courier/jobs/:id/accept error:', error);
     return res.status(500).json({
       error: 'Failed to accept job',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// PATCH /courier/orders/:id/location — assigned courier reports GPS (customer live map)
+app.patch('/courier/orders/:id/location', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { latitude, longitude } = req.body || {};
+
+    const lat = Number(latitude);
+    const lng = Number(longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({
+        error: 'Invalid coordinates',
+        details: 'latitude and longitude must be numbers',
+      });
+    }
+
+    const me = await getFullUserMe(req.userId);
+    if (!me?.roles?.includes('courier')) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        details: 'User is not a courier',
+      });
+    }
+
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .select('id, courier_id')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (orderError) {
+      console.error('courier location order error:', orderError);
+      throw new Error(orderError.message || 'Failed to load order');
+    }
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    if (order.courier_id !== req.userId) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        details: 'You are not assigned to this order',
+      });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('orders')
+      .update({
+        courier_latitude: lat,
+        courier_longitude: lng,
+        courier_location_updated_at: new Date().toISOString(),
+      })
+      .eq('id', id)
+      .select('id, courier_latitude, courier_longitude, courier_location_updated_at')
+      .single();
+
+    if (updateError) {
+      console.error('courier location update error:', updateError);
+      throw new Error(updateError.message || 'Failed to update location');
+    }
+
+    return res.json({ order: updated });
+  } catch (error) {
+    console.error('patch /courier/orders/:id/location error:', error);
+    return res.status(500).json({
+      error: 'Failed to update location',
       details: error.message || 'Please try again later',
     });
   }
@@ -2955,6 +3209,14 @@ app.post('/orders', requireAuth, async (req, res) => {
         throw new Error(walletError.message || 'Failed to record wallet transaction');
       }
     }
+
+    await notifyCustomerOrderPlaced(supabase, {
+      customerId: req.userId,
+      orderId: order.id,
+      orderNumber: order.order_number,
+      storeName: store.store_name,
+      awaitingPayment: orderStatus === 'awaiting_payment',
+    });
 
     return res.status(201).json({ order });
   } catch (error) {
