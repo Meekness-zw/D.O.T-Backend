@@ -3074,11 +3074,20 @@ app.post('/courier/orders/:id/pickup', requireAuth, async (req, res) => {
       });
     }
 
+    const updatePayload = { status: 'in_transit' };
+    const { estimated_delivery_time } = req.body || {};
+    if (estimated_delivery_time) {
+      const parsed = new Date(estimated_delivery_time);
+      if (!Number.isNaN(parsed.getTime())) {
+        updatePayload.estimated_delivery_time = parsed.toISOString();
+      }
+    }
+
     const { data: updated, error: updateError } = await supabase
       .from('orders')
-      .update({ status: 'in_transit' })
+      .update(updatePayload)
       .eq('id', id)
-      .select('id, order_number, status, courier_id')
+      .select('id, order_number, status, courier_id, estimated_delivery_time')
       .single();
 
     if (updateError) {
