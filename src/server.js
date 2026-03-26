@@ -2783,36 +2783,26 @@ app.post('/courier/jobs/:id/accept', requireAuth, async (req, res) => {
       });
     }
 
-    const { data: order, error: orderError } = await supabase
-      .from('orders')
-      .select('id, status, courier_id, customer_id, order_number')
-      .eq('id', id)
-      .maybeSingle();
-
-    if (orderError) {
-      console.error('courier accept job order error:', orderError);
-      throw new Error(orderError.message || 'Failed to load order');
-    }
-    if (!order) {
-      return res.status(404).json({ error: 'Order not found' });
-    }
-    if (order.status !== 'ready' || order.courier_id != null) {
-      return res.status(400).json({
-        error: 'Job not available',
-        details: 'Order is not in a ready state or already assigned',
-      });
-    }
-
+    // Single atomic update: only wins if still ready and unassigned (avoids races with other couriers).
     const { data: updated, error: updateError } = await supabase
       .from('orders')
       .update({ courier_id: req.userId, status: 'assigned' })
       .eq('id', id)
-      .select('id, order_number, status, courier_id')
-      .single();
+      .eq('status', 'ready')
+      .is('courier_id', null)
+      .select('id, order_number, status, courier_id, customer_id')
+      .maybeSingle();
 
     if (updateError) {
       console.error('courier accept job update error:', updateError);
       throw new Error(updateError.message || 'Failed to assign courier');
+    }
+    if (!updated) {
+      return res.status(400).json({
+        error: 'Job not available',
+        details:
+          'Order is no longer ready (another courier may have taken it, or the store changed the order status).',
+      });
     }
 
     const { error: historyError } = await supabase.from('order_status_history').insert({
@@ -2832,13 +2822,14 @@ app.post('/courier/jobs/:id/accept', requireAuth, async (req, res) => {
       .maybeSingle();
 
     await notifyCustomerCourierAssigned(supabase, {
-      customerId: order.customer_id,
+      customerId: updated.customer_id,
       orderId: updated.id,
       orderNumber: updated.order_number,
       courierName: courierProf?.full_name,
     });
 
-    return res.json({ order: updated });
+    const { customer_id: _omitCustomer, ...orderResponse } = updated;
+    return res.json({ order: orderResponse });
   } catch (error) {
     console.error('post /courier/jobs/:id/accept error:', error);
     return res.status(500).json({
