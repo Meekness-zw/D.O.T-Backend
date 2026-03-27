@@ -3975,17 +3975,34 @@ app.get('/courier/performance', requireAuth, async (req, res) => {
   }
 });
 
-// GET /users/me/notifications — notifications for current user
+// GET /users/me/notifications — notifications for current user (filter by ?role=customer|merchant|courier)
 app.get('/users/me/notifications', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
     const offset = parseInt(req.query.offset, 10) || 0;
+    const requestedRole = req.query.role ? String(req.query.role).toLowerCase() : null;
 
-    const { data, error } = await supabase
+    // Validate role if provided
+    const validRoles = ['customer', 'merchant', 'courier'];
+    if (requestedRole && !validRoles.includes(requestedRole)) {
+      return res.status(400).json({
+        error: 'Invalid role',
+        details: `Role must be one of: ${validRoles.join(', ')}`
+      });
+    }
+
+    let query = supabase
       .from('notifications')
-      .select('id, title, message, type, reference_id, is_read, created_at')
-      .eq('user_id', req.userId)
+      .select('id, title, message, type, reference_id, is_read, created_at, data')
+      .eq('user_id', req.userId);
+
+    // Filter by role if provided
+    if (requestedRole) {
+      query = query.eq('role', requestedRole);
+    }
+
+    const { data, error } = await query
       .order('created_at', { ascending: false })
       .range(offset, offset + limit - 1);
 
