@@ -3994,10 +3994,10 @@ app.get('/users/me/notifications', requireAuth, async (req, res) => {
 
     let query = supabase
       .from('notifications')
-      .select('id, title, message, type, reference_id, is_read, created_at, data')
+      .select('id, title, message, type, reference_id, is_read, created_at')
       .eq('user_id', req.userId);
 
-    // Filter by role if provided
+    // Filter by role if provided (only if role column exists in your table)
     if (requestedRole) {
       query = query.eq('role', requestedRole);
     }
