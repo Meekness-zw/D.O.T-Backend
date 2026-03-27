@@ -4109,6 +4109,31 @@ app.post('/users/me/notifications/read-all', requireAuth, async (req, res) => {
   }
 });
 
+// DELETE /users/me/notifications — clear all notifications for the current user
+app.delete('/users/me/notifications', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    const { error } = await supabase
+      .from('notifications')
+      .delete()
+      .eq('user_id', req.userId);
+
+    if (error) {
+      console.error('clear notifications error:', error);
+      throw new Error(error.message || 'Failed to clear notifications');
+    }
+
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('delete /users/me/notifications error:', error);
+    return res.status(500).json({
+      error: 'Failed to clear notifications',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // GET /users/me/addresses — saved delivery addresses for the current customer
 app.get('/users/me/addresses', requireAuth, async (req, res) => {
   try {
