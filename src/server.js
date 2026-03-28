@@ -2850,7 +2850,22 @@ app.get('/courier/jobs/open', requireAuth, async (req, res) => {
       return res.json({ jobs: [], hasActiveJob: true });
     }
 
-    const { data, error } = await supabase
+    let droppedOrderIds = [];
+    const { data: droppedRows, error: droppedRowsError } = await supabase
+      .from('order_status_history')
+      .select('order_id')
+      .eq('status', 'ready')
+      .eq('changed_by', req.userId);
+
+    if (droppedRowsError) {
+      console.error('get /courier/jobs/open dropped orders query error:', droppedRowsError);
+    } else if (Array.isArray(droppedRows)) {
+      droppedOrderIds = droppedRows
+        .map((row) => row.order_id)
+        .filter((orderId) => orderId != null);
+    }
+
+    let ordersQuery = supabase
       .from('orders')
       .select(
         `
@@ -2875,6 +2890,12 @@ app.get('/courier/jobs/open', requireAuth, async (req, res) => {
       .eq('status', 'ready')
       .is('courier_id', null)
       .order('created_at', { ascending: true });
+
+    if (droppedOrderIds.length > 0) {
+      ordersQuery = ordersQuery.not('id', 'in', `(${droppedOrderIds.join(',')})`);
+    }
+
+    const { data, error } = await ordersQuery;
 
     if (error) {
       console.error('get /courier/jobs/open error:', error);
@@ -3008,6 +3029,86 @@ app.post('/courier/jobs/:id/accept', requireAuth, async (req, res) => {
     console.error('post /courier/jobs/:id/accept error:', error);
     return res.status(500).json({
       error: 'Failed to accept job',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /courier/orders/:id/drop — assigned courier drops a job before pickup
+app.post('/courier/orders/:id/drop', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+
+    const me = await getFullUserMe(req.userId);
+    if (!me?.roles?.includes('courier')) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        details: 'User is not a courier',
+      });
+    }
+
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .select('id, courier_id, status, order_number, customer_id')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (orderError) {
+      console.error('courier drop order error:', orderError);
+      throw new Error(orderError.message || 'Failed to load order');
+    }
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    if (order.courier_id !== req.userId) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        details: 'You are not assigned to this order',
+      });
+    }
+    if (order.status !== 'assigned') {
+      return res.status(400).json({
+        error: 'Cannot drop job',
+        details: 'Job can only be dropped before pickup while assigned.',
+      });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('orders')
+      .update({ courier_id: null, status: 'ready' })
+      .eq('id', id)
+      .eq('courier_id', req.userId)
+      .eq('status', 'assigned')
+      .select('id, order_number, status, courier_id, customer_id')
+      .maybeSingle();
+
+    if (updateError) {
+      console.error('courier drop job update error:', updateError);
+      throw new Error(updateError.message || 'Failed to drop job');
+    }
+    if (!updated) {
+      return res.status(400).json({
+        error: 'Job not available',
+        details: 'Job cannot be dropped at this time.',
+      });
+    }
+
+    const { error: historyError } = await supabase.from('order_status_history').insert({
+      order_id: id,
+      status: 'ready',
+      notes: 'Courier dropped assignment',
+      changed_by: req.userId,
+    });
+    if (historyError) {
+      console.error('order_status_history insert (drop) error:', historyError);
+    }
+
+    return res.json({ order: updated });
+  } catch (error) {
+    console.error('post /courier/orders/:id/drop error:', error);
+    return res.status(500).json({
+      error: 'Failed to drop job',
       details: error.message || 'Please try again later',
     });
   }
