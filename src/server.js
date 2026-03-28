@@ -2776,6 +2776,7 @@ app.get('/courier/orders/active', requireAuth, async (req, res) => {
         delivery_address,
         delivery_latitude,
         delivery_longitude,
+        customer_id,
         stores (
           store_name,
           logo,
@@ -2794,7 +2795,26 @@ app.get('/courier/orders/active', requireAuth, async (req, res) => {
       throw new Error(error.message || 'Failed to load active order');
     }
 
-    return res.json({ order: row || null });
+    let customer = null;
+    if (row?.customer_id) {
+      const { data: profile, error: profileError } = await supabase
+        .from('user_profiles')
+        .select('full_name, profile_photo')
+        .eq('id', row.customer_id)
+        .maybeSingle();
+      if (profileError) {
+        console.error('get /courier/orders/active customer profile error:', profileError);
+        throw new Error(profileError.message || 'Failed to load customer profile');
+      }
+      if (profile) {
+        customer = {
+          name: profile.full_name || null,
+          profilePhoto: profile.profile_photo || null,
+        };
+      }
+    }
+
+    return res.json({ order: row ? { ...row, customer } : null });
   } catch (error) {
     console.error('get /courier/orders/active error:', error);
     return res.status(500).json({
@@ -2844,6 +2864,7 @@ app.get('/courier/jobs/open', requireAuth, async (req, res) => {
         delivery_address,
         delivery_latitude,
         delivery_longitude,
+        customer_id,
         stores (
           store_name,
           logo,
@@ -2860,7 +2881,43 @@ app.get('/courier/jobs/open', requireAuth, async (req, res) => {
       throw new Error(error.message || 'Failed to load jobs');
     }
 
-    return res.json({ jobs: data || [] });
+    const customerIds = Array.from(
+      new Set((data || []).map((job) => job.customer_id).filter(Boolean)),
+    );
+    let customerProfiles = [];
+    if (customerIds.length > 0) {
+      const { data: profiles, error: profilesError } = await supabase
+        .from('user_profiles')
+        .select('id, full_name, profile_photo')
+        .in('id', customerIds);
+      if (profilesError) {
+        console.error('get /courier/jobs/open customer profiles error:', profilesError);
+        throw new Error(profilesError.message || 'Failed to load customer profiles');
+      }
+      customerProfiles = profiles || [];
+    }
+
+    const customerMap = (customerProfiles || []).reduce((acc, profile) => {
+      if (profile?.id) {
+        acc[profile.id] = profile;
+      }
+      return acc;
+    }, {});
+
+    const jobs = (data || []).map((job) => {
+      const profile = customerMap[job.customer_id];
+      return {
+        ...job,
+        customer: profile
+          ? {
+              name: profile.full_name || null,
+              profilePhoto: profile.profile_photo || null,
+            }
+          : null,
+      };
+    });
+
+    return res.json({ jobs });
   } catch (error) {
     console.error('get /courier/jobs/open error:', error);
     return res.status(500).json({
