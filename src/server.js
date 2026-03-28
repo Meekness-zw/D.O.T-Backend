@@ -2778,6 +2778,7 @@ app.get('/courier/orders/active', requireAuth, async (req, res) => {
         delivery_longitude,
         stores (
           store_name,
+          logo,
           city
         )
       `,
@@ -2845,6 +2846,7 @@ app.get('/courier/jobs/open', requireAuth, async (req, res) => {
         delivery_longitude,
         stores (
           store_name,
+          logo,
           city
         )
       `,
