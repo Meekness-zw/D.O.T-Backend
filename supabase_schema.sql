@@ -333,8 +333,10 @@ CREATE TABLE IF NOT EXISTS orders (
     'preparing',
     'ready',
     'assigned',
+    'merchant_confirmed',
     'picked_up',
     'in_transit',
+    'delivery_confirmation_pending',
     'delivered',
     'cancelled',
     'refunded'

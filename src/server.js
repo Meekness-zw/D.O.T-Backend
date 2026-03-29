@@ -2698,6 +2698,161 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
   }
 });
 
+// POST /merchant/orders/:id/confirm-dispatch — merchant confirms that the courier may leave with the order
+app.post('/merchant/orders/:id/confirm-dispatch', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .select('id, store_id, courier_id, status, order_number')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (orderError) {
+      console.error('merchant confirm dispatch order error:', orderError);
+      throw new Error(orderError.message || 'Failed to load order');
+    }
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('merchant_id')
+      .eq('id', order.store_id)
+      .maybeSingle();
+
+    if (storeError || !store || store.merchant_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Cannot update this order' });
+    }
+
+    if (order.status !== 'assigned') {
+      return res.status(400).json({
+        error: 'Cannot confirm dispatch',
+        details: 'Order must be assigned to a courier before merchant confirmation.',
+      });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('orders')
+      .update({ status: 'merchant_confirmed' })
+      .eq('id', id)
+      .select('id, order_number, status')
+      .single();
+
+    if (updateError) {
+      console.error('merchant confirm dispatch update error:', updateError);
+      throw new Error(updateError.message || 'Failed to confirm dispatch');
+    }
+
+    const { error: historyError } = await supabase.from('order_status_history').insert({
+      order_id: id,
+      status: 'merchant_confirmed',
+      notes: 'Merchant confirmed dispatch',
+      changed_by: req.userId,
+    });
+    if (historyError) {
+      console.error('order_status_history insert (merchant_confirmed) error:', historyError);
+    }
+
+    return res.json({ order: updated });
+  } catch (error) {
+    console.error('post /merchant/orders/:id/confirm-dispatch error:', error);
+    return res.status(500).json({
+      error: 'Failed to confirm dispatch',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /customer/orders/:id/confirm-delivery — customer confirms the courier has delivered the order
+app.post('/customer/orders/:id/confirm-delivery', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .select('id, customer_id, courier_id, status, order_number, delivery_fee')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (orderError) {
+      console.error('customer confirm delivery order error:', orderError);
+      throw new Error(orderError.message || 'Failed to load order');
+    }
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    if (order.customer_id !== req.userId) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        details: 'You are not the customer for this order',
+      });
+    }
+
+    if (order.status === 'delivered') {
+      const { data: deliveredRow } = await supabase
+        .from('orders')
+        .select('id, order_number, status, delivery_fee, actual_delivery_time')
+        .eq('id', id)
+        .single();
+      return res.json({ order: deliveredRow });
+    }
+
+    if (order.status !== 'delivery_confirmation_pending') {
+      return res.status(400).json({
+        error: 'Cannot confirm delivery',
+        details: 'Delivery confirmation is not pending for this order.',
+      });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('orders')
+      .update({
+        status: 'delivered',
+        actual_delivery_time: new Date().toISOString(),
+      })
+      .eq('id', id)
+      .select('id, order_number, status, delivery_fee, actual_delivery_time')
+      .single();
+
+    if (updateError) {
+      console.error('customer confirm delivery update error:', updateError);
+      throw new Error(updateError.message || 'Failed to update order');
+    }
+
+    const { error: historyError } = await supabase.from('order_status_history').insert({
+      order_id: id,
+      status: 'delivered',
+      notes: 'Customer confirmed delivery',
+      changed_by: req.userId,
+    });
+    if (historyError) {
+      console.error('order_status_history insert (customer confirmed delivery) error:', historyError);
+    }
+
+    if (order.courier_id) {
+      await recordCourierDeliveryEarnings({
+        courierId: order.courier_id,
+        orderId: id,
+        amount: order.delivery_fee,
+        orderNumber: order.order_number,
+      });
+    }
+
+    return res.json({ order: updated });
+  } catch (error) {
+    console.error('post /customer/orders/:id/confirm-delivery error:', error);
+    return res.status(500).json({
+      error: 'Failed to confirm delivery',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // DELETE /orders/:id — customer removes a finished order from their history (DB delete; cascades to order_items, etc.)
 app.delete('/orders/:id', requireAuth, async (req, res) => {
   try {
@@ -2747,7 +2902,7 @@ app.delete('/orders/:id', requireAuth, async (req, res) => {
   }
 });
 
-const COURIER_ACTIVE_STATUSES = ['assigned', 'picked_up', 'in_transit'];
+const COURIER_ACTIVE_STATUSES = ['assigned', 'merchant_confirmed', 'picked_up', 'in_transit', 'delivery_confirmation_pending'];
 
 // GET /courier/orders/active — delivery in progress for this courier (resume after app restart)
 app.get('/courier/orders/active', requireAuth, async (req, res) => {
@@ -3227,10 +3382,10 @@ app.post('/courier/orders/:id/pickup', requireAuth, async (req, res) => {
       return res.json({ order: current });
     }
 
-    if (order.status !== 'assigned') {
+    if (order.status !== 'merchant_confirmed') {
       return res.status(400).json({
         error: 'Cannot pick up',
-        details: 'Order must be assigned before pickup',
+        details: 'Order must be confirmed by the merchant before pickup',
       });
     }
 
@@ -3330,53 +3485,35 @@ app.post('/courier/orders/:id/complete', requireAuth, async (req, res) => {
 
     const deliveryFee = Number(order.delivery_fee) || 0;
 
-    // Idempotent recovery: already delivered but earnings insert may have failed earlier
-    if (order.status === 'delivered') {
-      const earnings = await recordCourierDeliveryEarnings({
-        courierId: req.userId,
-        orderId: id,
-        amount: deliveryFee,
-        orderNumber: order.order_number,
-      });
-      const { data: courierRow } = await supabase
-        .from('couriers')
-        .select('account_balance, total_earnings, total_deliveries')
-        .eq('id', req.userId)
-        .maybeSingle();
-      const { data: deliveredRow } = await supabase
+    // If the courier already requested delivery confirmation, return the pending order state.
+    if (order.status === 'delivery_confirmation_pending') {
+      const { data: pendingOrder, error: pendingError } = await supabase
         .from('orders')
-        .select('id, order_number, status, delivery_fee, actual_delivery_time')
+        .select('id, order_number, status, delivery_fee')
         .eq('id', id)
         .single();
-      return res.json({
-        order: deliveredRow,
-        earnings: earnings
-          ? {
-              amount: earnings.amount,
-              balance_after: earnings.balance_after,
-              skipped: earnings.skipped,
-            }
-          : null,
-        courier: courierRow || null,
-      });
+      if (pendingError) {
+        console.error('courier complete pending order error:', pendingError);
+        throw new Error(pendingError.message || 'Failed to load pending order');
+      }
+      return res.json({ order: pendingOrder });
     }
 
-    const allowedBeforeDelivered = ['assigned', 'picked_up', 'in_transit'];
+    const allowedBeforeDelivered = ['picked_up', 'in_transit'];
     if (!allowedBeforeDelivered.includes(order.status)) {
       return res.status(400).json({
         error: 'Cannot complete delivery',
-        details: 'Order is not ready for delivery completion',
+        details: 'Order must be picked up and on the way before confirmation can be requested',
       });
     }
 
-    const { data: delivered, error: updateError } = await supabase
+    const { data: pending, error: updateError } = await supabase
       .from('orders')
       .update({
-        status: 'delivered',
-        actual_delivery_time: new Date().toISOString(),
+        status: 'delivery_confirmation_pending',
       })
       .eq('id', id)
-      .select('id, order_number, status, delivery_fee, actual_delivery_time')
+      .select('id, order_number, status, delivery_fee')
       .single();
 
     if (updateError) {
@@ -3386,38 +3523,15 @@ app.post('/courier/orders/:id/complete', requireAuth, async (req, res) => {
 
     const { error: historyError } = await supabase.from('order_status_history').insert({
       order_id: id,
-      status: 'delivered',
-      notes: 'Courier marked order delivered',
+      status: 'delivery_confirmation_pending',
+      notes: 'Courier requested delivery confirmation from customer',
       changed_by: req.userId,
     });
     if (historyError) {
-      console.error('order_status_history insert (delivered) error:', historyError);
+      console.error('order_status_history insert (delivery_confirmation_pending) error:', historyError);
     }
 
-    const earnings = await recordCourierDeliveryEarnings({
-      courierId: req.userId,
-      orderId: id,
-      amount: deliveryFee,
-      orderNumber: order.order_number,
-    });
-
-    const { data: courierRow } = await supabase
-      .from('couriers')
-      .select('account_balance, total_earnings, total_deliveries')
-      .eq('id', req.userId)
-      .maybeSingle();
-
-    return res.json({
-      order: delivered,
-      earnings: earnings
-        ? {
-            amount: earnings.amount,
-            balance_after: earnings.balance_after,
-            skipped: earnings.skipped,
-          }
-        : null,
-      courier: courierRow || null,
-    });
+    return res.json({ order: pending });
   } catch (error) {
     console.error('post /courier/orders/:id/complete error:', error);
     return res.status(500).json({
