@@ -478,14 +478,22 @@ app.get('/courier/documents', requireAuth, async (req, res) => {
       .from('courier_documents')
       .select('id, courier_id, document_type, document_url, status, created_at')
       .eq('courier_id', req.userId)
-      .order('created_at', { ascending: true });
+      .order('created_at', { ascending: false });
 
     if (error) {
       console.error('get /courier/documents error:', error);
       throw new Error(error.message || 'Failed to load documents');
     }
 
-    return res.json({ documents: data || [] });
+    // Keep only the latest document per type (no duplicates)
+    const latestByType = {};
+    for (const doc of data || []) {
+      if (!latestByType[doc.document_type]) {
+        latestByType[doc.document_type] = doc;
+      }
+    }
+
+    return res.json({ documents: Object.values(latestByType) });
   } catch (error) {
     console.error('get /courier/documents error:', error);
     return res.status(500).json({
