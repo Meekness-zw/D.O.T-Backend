@@ -2853,6 +2853,154 @@ app.post('/customer/orders/:id/confirm-delivery', requireAuth, async (req, res) 
   }
 });
 
+// POST /customer/orders/:id/review — customer submits ratings for merchant and courier after delivery
+app.post('/customer/orders/:id/review', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const {
+      merchant_rating: merchantRatingRaw,
+      courier_rating: courierRatingRaw,
+      merchant_comment: merchantComment,
+      courier_comment: courierComment,
+    } = req.body;
+
+    const merchantRating = merchantRatingRaw == null ? null : Number(merchantRatingRaw);
+    const courierRating = courierRatingRaw == null ? null : Number(courierRatingRaw);
+
+    if (
+      (merchantRating == null || Number.isNaN(merchantRating)) &&
+      (courierRating == null || Number.isNaN(courierRating))
+    ) {
+      return res.status(400).json({
+        error: 'Missing ratings',
+        details: 'Provide merchant_rating and/or courier_rating between 1 and 5.',
+      });
+    }
+
+    if (merchantRating != null && (merchantRating < 1 || merchantRating > 5)) {
+      return res.status(400).json({
+        error: 'Invalid merchant rating',
+        details: 'merchant_rating must be between 1 and 5.',
+      });
+    }
+    if (courierRating != null && (courierRating < 1 || courierRating > 5)) {
+      return res.status(400).json({
+        error: 'Invalid courier rating',
+        details: 'courier_rating must be between 1 and 5.',
+      });
+    }
+
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .select('id, customer_id, store_id, courier_id, status')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (orderError) {
+      console.error('customer review order load error:', orderError);
+      throw new Error(orderError.message || 'Failed to load order');
+    }
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    if (order.customer_id !== req.userId) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        details: 'You are not the customer for this order.',
+      });
+    }
+    if (order.status !== 'delivered') {
+      return res.status(400).json({
+        error: 'Order not delivered',
+        details: 'You can only submit a review after delivery is complete.',
+      });
+    }
+
+    const upsertReview = async ({ storeId, courierId, rating, comment }) => {
+      const baseQuery = supabase
+        .from('reviews')
+        .select('id')
+        .eq('order_id', id)
+        .eq('customer_id', req.userId);
+
+      let existingQuery = baseQuery;
+      if (storeId) {
+        existingQuery = existingQuery.eq('store_id', storeId).is('courier_id', null);
+      } else {
+        existingQuery = existingQuery.is('store_id', null).eq('courier_id', courierId);
+      }
+      const { data: existing, error: existingError } = await existingQuery.maybeSingle();
+      if (existingError) {
+        console.error('review existing lookup error:', existingError);
+        throw new Error(existingError.message || 'Failed to lookup existing review');
+      }
+
+      const payload = {
+        order_id: id,
+        customer_id: req.userId,
+        store_id: storeId || null,
+        courier_id: courierId || null,
+        rating,
+        comment: comment || null,
+      };
+
+      if (existing?.id) {
+        const { data: updated, error: updateError } = await supabase
+          .from('reviews')
+          .update(payload)
+          .eq('id', existing.id)
+          .single();
+        if (updateError) {
+          console.error('review update error:', updateError);
+          throw new Error(updateError.message || 'Failed to update review');
+        }
+        return updated;
+      }
+
+      const { data: inserted, error: insertError } = await supabase
+        .from('reviews')
+        .insert(payload)
+        .single();
+      if (insertError) {
+        console.error('review insert error:', insertError);
+        throw new Error(insertError.message || 'Failed to submit review');
+      }
+      return inserted;
+    };
+
+    const createdReviews = [];
+    if (merchantRating != null && order.store_id) {
+      createdReviews.push(
+        await upsertReview({
+          storeId: order.store_id,
+          courierId: null,
+          rating: merchantRating,
+          comment: merchantComment,
+        }),
+      );
+    }
+    if (courierRating != null && order.courier_id) {
+      createdReviews.push(
+        await upsertReview({
+          storeId: null,
+          courierId: order.courier_id,
+          rating: courierRating,
+          comment: courierComment,
+        }),
+      );
+    }
+
+    return res.json({ reviews: createdReviews });
+  } catch (error) {
+    console.error('post /customer/orders/:id/review error:', error);
+    return res.status(500).json({
+      error: 'Failed to submit review',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // DELETE /orders/:id — customer removes a finished order from their history (DB delete; cascades to order_items, etc.)
 app.delete('/orders/:id', requireAuth, async (req, res) => {
   try {
@@ -5409,6 +5557,65 @@ async function runScheduledPromotions() {
   if (error) console.error('runScheduledPromotions error:', error);
   else if (ids.length) console.log('[Cron] Activated recurring promotions:', ids.length);
 }
+
+// ─── Google Maps proxy routes ───────────────────────────────────────────────
+// Keeps the API key server-side so app-bundle restrictions never block calls.
+const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
+
+app.get('/maps/geocode', async (req, res) => {
+  if (!GOOGLE_MAPS_API_KEY) {
+    return res.status(503).json({ status: 'ERROR', error_message: 'GOOGLE_MAPS_API_KEY not set on server' });
+  }
+  try {
+    const params = new URLSearchParams({ key: GOOGLE_MAPS_API_KEY });
+    if (req.query.latlng) params.set('latlng', req.query.latlng);
+    if (req.query.address) params.set('address', req.query.address);
+    const response = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?${params}`);
+    const data = await response.json();
+    res.json(data);
+  } catch (e) {
+    console.error('Maps geocode proxy error:', e);
+    res.status(502).json({ status: 'ERROR', error_message: 'Failed to contact Google Geocoding API' });
+  }
+});
+
+app.get('/maps/places/autocomplete', async (req, res) => {
+  if (!GOOGLE_MAPS_API_KEY) {
+    return res.status(503).json({ status: 'ERROR', error_message: 'GOOGLE_MAPS_API_KEY not set on server' });
+  }
+  try {
+    const params = new URLSearchParams({ key: GOOGLE_MAPS_API_KEY });
+    if (req.query.input) params.set('input', req.query.input);
+    if (req.query.location) params.set('location', req.query.location);
+    if (req.query.radius) params.set('radius', req.query.radius);
+    if (req.query.components) params.set('components', req.query.components);
+    if (req.query.types) params.set('types', req.query.types);
+    const response = await fetch(`https://maps.googleapis.com/maps/api/place/autocomplete/json?${params}`);
+    const data = await response.json();
+    res.json(data);
+  } catch (e) {
+    console.error('Maps places autocomplete proxy error:', e);
+    res.status(502).json({ status: 'ERROR', error_message: 'Failed to contact Google Places API' });
+  }
+});
+
+app.get('/maps/places/details', async (req, res) => {
+  if (!GOOGLE_MAPS_API_KEY) {
+    return res.status(503).json({ status: 'ERROR', error_message: 'GOOGLE_MAPS_API_KEY not set on server' });
+  }
+  try {
+    const params = new URLSearchParams({ key: GOOGLE_MAPS_API_KEY });
+    if (req.query.place_id) params.set('place_id', req.query.place_id);
+    if (req.query.fields) params.set('fields', req.query.fields);
+    const response = await fetch(`https://maps.googleapis.com/maps/api/place/details/json?${params}`);
+    const data = await response.json();
+    res.json(data);
+  } catch (e) {
+    console.error('Maps place details proxy error:', e);
+    res.status(502).json({ status: 'ERROR', error_message: 'Failed to contact Google Places API' });
+  }
+});
+// ────────────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
   console.log('✅ DOT Backend API started successfully');
