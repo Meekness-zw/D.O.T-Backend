@@ -5511,53 +5511,6 @@ app.get('/admin/merchants/:id/detail', requireAdmin, async (req, res) => {
   }
 });
 
-// Global error handler
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({
-    error: 'Internal server error',
-    details: NODE_ENV === 'development' ? err.message : 'Please try again later'
-  });
-});
-
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({
-    error: 'Endpoint not found',
-    details: `${req.method} ${req.path} is not a valid endpoint`
-  });
-});
-
-// Run scheduled promotions: activate promotions whose recurrence matches current UTC time (weekly/monthly).
-async function runScheduledPromotions() {
-  if (!supabase) return;
-  const now = new Date();
-  const utcDow = now.getUTCDay(); // 0=Sun .. 6=Sat
-  const utcDom = now.getUTCDate(); // 1-31
-  const h = now.getUTCHours();
-  const m = now.getUTCMinutes();
-  const timeStr = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-
-  const { data: weekly } = await supabase
-    .from('promotions')
-    .select('id')
-    .eq('recurrence_type', 'weekly')
-    .eq('recurrence_weekday', utcDow)
-    .eq('recurrence_time', timeStr);
-  const { data: monthly } = await supabase
-    .from('promotions')
-    .select('id')
-    .eq('recurrence_type', 'monthly')
-    .eq('recurrence_month_day', utcDom)
-    .eq('recurrence_time', timeStr);
-
-  const ids = [...(weekly || []), ...(monthly || [])].map((r) => r.id);
-  if (ids.length === 0) return;
-  const { error } = await supabase.from('promotions').update({ is_active: true }).in('id', ids);
-  if (error) console.error('runScheduledPromotions error:', error);
-  else if (ids.length) console.log('[Cron] Activated recurring promotions:', ids.length);
-}
-
 // ─── Google Maps proxy routes ───────────────────────────────────────────────
 // Keeps the API key server-side so app-bundle restrictions never block calls.
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
@@ -5616,6 +5569,53 @@ app.get('/maps/places/details', async (req, res) => {
   }
 });
 // ────────────────────────────────────────────────────────────────────────────
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({
+    error: 'Internal server error',
+    details: NODE_ENV === 'development' ? err.message : 'Please try again later'
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'Endpoint not found',
+    details: `${req.method} ${req.path} is not a valid endpoint`
+  });
+});
+
+// Run scheduled promotions: activate promotions whose recurrence matches current UTC time (weekly/monthly).
+async function runScheduledPromotions() {
+  if (!supabase) return;
+  const now = new Date();
+  const utcDow = now.getUTCDay(); // 0=Sun .. 6=Sat
+  const utcDom = now.getUTCDate(); // 1-31
+  const h = now.getUTCHours();
+  const m = now.getUTCMinutes();
+  const timeStr = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+
+  const { data: weekly } = await supabase
+    .from('promotions')
+    .select('id')
+    .eq('recurrence_type', 'weekly')
+    .eq('recurrence_weekday', utcDow)
+    .eq('recurrence_time', timeStr);
+  const { data: monthly } = await supabase
+    .from('promotions')
+    .select('id')
+    .eq('recurrence_type', 'monthly')
+    .eq('recurrence_month_day', utcDom)
+    .eq('recurrence_time', timeStr);
+
+  const ids = [...(weekly || []), ...(monthly || [])].map((r) => r.id);
+  if (ids.length === 0) return;
+  const { error } = await supabase.from('promotions').update({ is_active: true }).in('id', ids);
+  if (error) console.error('runScheduledPromotions error:', error);
+  else if (ids.length) console.log('[Cron] Activated recurring promotions:', ids.length);
+}
 
 app.listen(PORT, () => {
   console.log('✅ DOT Backend API started successfully');
