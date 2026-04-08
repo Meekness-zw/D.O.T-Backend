@@ -282,16 +282,26 @@ export async function loginWithPassword({ phone, password }) {
 
   // Load profile and all roles (multi-role support)
   let profile = null;
-  const { data: profileData, error: profileError } = await supabaseAdmin
-    .from('user_profiles')
-    .select('full_name, role, is_suspended')
-    .eq('id', existingUser.id)
-    .maybeSingle();
+  try {
+    const { data: profileData, error: profileError } = await supabaseAdmin
+      .from('user_profiles')
+      .select('full_name, role, is_suspended')
+      .eq('id', existingUser.id)
+      .maybeSingle();
 
-  if (profileError) {
-    console.error('Failed to load user profile during login:', profileError);
-  } else {
-    profile = profileData;
+    if (profileError) {
+      // If is_suspended column not yet added, fall back to selecting without it
+      const { data: fallback } = await supabaseAdmin
+        .from('user_profiles')
+        .select('full_name, role')
+        .eq('id', existingUser.id)
+        .maybeSingle();
+      profile = fallback;
+    } else {
+      profile = profileData;
+    }
+  } catch (e) {
+    console.error('Failed to load user profile during login:', e);
   }
 
   // If the profile row is missing, the account was deleted — reject login

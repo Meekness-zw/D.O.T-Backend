@@ -133,24 +133,23 @@ async function requireAuth(req, res, next) {
 
   // Verify the account still exists and is not suspended
   try {
-    const { data: profile } = await supabase
+    const { data: profile, error: profileErr } = await supabase
       .from('user_profiles')
       .select('is_suspended')
       .eq('id', payload.sub)
-      .single();
+      .maybeSingle();
 
-    if (!profile) {
+    if (profileErr) {
+      // Column missing (is_suspended not yet migrated) or other non-fatal DB error — allow through
+      console.warn('[requireAuth] profile check error (non-blocking):', profileErr.message);
+    } else if (profile === null) {
       return res.status(401).json({ error: 'User not found', details: 'This account no longer exists.' });
-    }
-    if (profile.is_suspended) {
+    } else if (profile.is_suspended) {
       return res.status(403).json({ error: 'Account suspended', details: 'Your account has been suspended. Please contact support.' });
     }
   } catch (e) {
-    // PGRST116 = no rows returned by .single() — profile doesn't exist
-    if (e?.code === 'PGRST116') {
-      return res.status(401).json({ error: 'User not found', details: 'This account no longer exists.' });
-    }
-    // Any other error (e.g. is_suspended column not yet migrated) — allow through
+    // Unexpected error — allow through rather than blocking all requests
+    console.warn('[requireAuth] unexpected profile check error:', e?.message || e);
   }
 
   next();
@@ -2255,11 +2254,11 @@ app.post('/auth/send-otp', async (req, res) => {
   }
 });
 
-// POST /auth/verify-otp { phone, token }
+// POST /auth/verify-otp { phone, token, isSignUp, password, role, fullName }
 app.post('/auth/verify-otp', async (req, res) => {
   try {
-    const { phone, token, isSignUp = false, password } = req.body;
-    console.log('[Auth] /auth/verify-otp called for phone:', phone, '| isSignUp:', isSignUp);
+    const { phone, token, isSignUp = false, password, role, fullName } = req.body;
+    console.log('[Auth] /auth/verify-otp called for phone:', phone, '| isSignUp:', isSignUp, '| role:', role);
     if (!phone || !token) {
       return res.status(400).json({
         error: 'Missing required fields',
@@ -2275,6 +2274,25 @@ app.post('/auth/verify-otp', async (req, res) => {
     }
 
     const data = await verifyPhoneOtp({ phone, token, isSignUp, password });
+
+    // For sign-up: create the profile row immediately in the backend so it exists
+    // before any authenticated request is made. This prevents "User not found" errors
+    // if the client's ensureProfile call is slow or fails.
+    if (isSignUp && data?.user?.id && role) {
+      try {
+        await ensureUserProfile({
+          userId: data.user.id,
+          email: null,
+          phone: data.user.phone ?? phone,
+          fullName: fullName || '',
+          role,
+        });
+        console.log(`[Auth] Profile created for new ${role} user: ${data.user.id}`);
+      } catch (profileErr) {
+        console.error('[Auth] ensureUserProfile failed after OTP verify:', profileErr);
+        // Don't fail the whole request — the client will also call ensureProfile as a backup
+      }
+    }
 
     return res.json({
       success: true,
