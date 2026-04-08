@@ -2244,9 +2244,13 @@ app.post('/auth/send-otp', async (req, res) => {
     });
   } catch (error) {
     console.error('send-otp error:', error);
-    return res.status(500).json({
-      error: 'Failed to send verification code',
-      details: error.message || 'Please try again later'
+    // Twilio user-facing errors (invalid number, blocked, rate-limited) → 400
+    // so the frontend shows the message directly rather than a generic server error
+    const isTwilioUserError = error?.code && [60200, 60203, 60212, 60238, 21211].includes(error.code);
+    const status = isTwilioUserError ? 400 : 500;
+    return res.status(status).json({
+      error: error.message || 'Failed to send verification code',
+      details: isTwilioUserError ? undefined : 'Please try again later'
     });
   }
 });

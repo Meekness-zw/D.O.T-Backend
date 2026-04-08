@@ -45,12 +45,36 @@ export async function sendOtpToPhone(phone) {
     );
   }
 
-  const verification = await twilioClient.verify.v2
-    .services(TWILIO_VERIFY_SERVICE_SID)
-    .verifications.create({
-      to: phone,
-      channel: 'sms',
-    });
+  let verification;
+  try {
+    verification = await twilioClient.verify.v2
+      .services(TWILIO_VERIFY_SERVICE_SID)
+      .verifications.create({
+        to: phone,
+        channel: 'sms',
+      });
+  } catch (twilioErr) {
+    // Map well-known Twilio Verify error codes to user-friendly messages
+    const code = twilioErr?.code;
+    if (code === 60238) {
+      throw new Error(
+        'We could not send a verification code to this number. ' +
+        'This can happen with certain numbers or regions. ' +
+        'Please try a different number or contact support.'
+      );
+    }
+    if (code === 60200 || code === 21211) {
+      throw new Error('The phone number you entered is not valid. Please check and try again.');
+    }
+    if (code === 60203) {
+      throw new Error('Too many verification attempts. Please wait a few minutes before trying again.');
+    }
+    if (code === 60212) {
+      throw new Error('SMS could not be delivered to this number. Please try a different number.');
+    }
+    // Re-throw raw error for unexpected cases (will be caught by route handler)
+    throw twilioErr;
+  }
 
   console.log('[Auth] Twilio Verify sent OTP:', {
     phone,
@@ -260,7 +284,7 @@ export async function loginWithPassword({ phone, password }) {
   let profile = null;
   const { data: profileData, error: profileError } = await supabaseAdmin
     .from('user_profiles')
-    .select('full_name, role')
+    .select('full_name, role, is_suspended')
     .eq('id', existingUser.id)
     .maybeSingle();
 
@@ -268,6 +292,16 @@ export async function loginWithPassword({ phone, password }) {
     console.error('Failed to load user profile during login:', profileError);
   } else {
     profile = profileData;
+  }
+
+  // If the profile row is missing, the account was deleted — reject login
+  if (!profile) {
+    throw new Error('No account found for this number. Please sign up first.');
+  }
+
+  // If the account is suspended, reject login
+  if (profile.is_suspended) {
+    throw new Error('Your account has been suspended. Please contact support.');
   }
 
   // Repair user_roles from role tables (e.g. only "courier" was inserted when adding courier).
