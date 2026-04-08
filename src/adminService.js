@@ -112,7 +112,7 @@ export async function getAdminUsers(options = {}) {
 
   let query = supabase
     .from('user_profiles')
-    .select('id, email, phone, full_name, role, created_at', { count: 'exact' })
+    .select('id, email, phone, full_name, role, is_suspended, created_at', { count: 'exact' })
     .order('created_at', { ascending: false })
     .range(offset, offset + limit - 1);
 
@@ -619,4 +619,16 @@ export async function getAdminMerchantDetail(merchantId) {
     stores: signedStores,
     documents: signedDocuments,
   };
+}
+
+
+/** Suspend or unsuspend a user by setting is_suspended on their profile row. */
+export async function adminSuspendUser(userId, suspend) {
+  if (!supabase) throw new Error('Server not configured');
+  if (!userId) throw new Error('User id is required');
+  const { error } = await supabase
+    .from('user_profiles')
+    .update({ is_suspended: !!suspend })
+    .eq('id', userId);
+  if (error) throw new Error(error.message || 'Failed to update user suspension status');
 }

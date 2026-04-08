@@ -22,10 +22,12 @@ CREATE TABLE IF NOT EXISTS user_profiles (
   full_name TEXT,
   role TEXT NOT NULL CHECK (role IN ('customer', 'merchant', 'courier')),
   profile_photo TEXT,
+  is_suspended BOOLEAN DEFAULT FALSE,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 -- If table already existed with email NOT NULL, run: ALTER TABLE user_profiles ALTER COLUMN email DROP NOT NULL;
+-- Add suspension support (run if table already exists): ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN DEFAULT FALSE;
 
 -- ============================================
 -- CUSTOMERS

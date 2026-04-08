@@ -38,6 +38,7 @@ import {
   approveMerchant,
   getAdminCourierDetail,
   getAdminMerchantDetail,
+  adminSuspendUser,
 } from './adminService.js';
 import { supabaseAdmin as publicSupabase } from './supabaseAdminClient.js';
 import { enrichStoreForCustomerListing, assertStoreAcceptingOrders } from './storeHours.js';
@@ -119,8 +120,9 @@ app.use(cors({
 
 app.use(express.json({ limit: '20mb' }));
 
-/** Auth middleware: require Bearer token, set req.userId from JWT sub */
-function requireAuth(req, res, next) {
+/** Auth middleware: require Bearer token, set req.userId from JWT sub.
+ *  Also checks user_profiles to detect deleted or suspended accounts. */
+async function requireAuth(req, res, next) {
   const auth = req.headers.authorization;
   const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
   const payload = token ? verifyAccessToken(token, process.env.SUPABASE_JWT_SECRET) : null;
@@ -128,6 +130,29 @@ function requireAuth(req, res, next) {
     return res.status(401).json({ error: 'Unauthorized', details: 'Valid access token required' });
   }
   req.userId = payload.sub;
+
+  // Verify the account still exists and is not suspended
+  try {
+    const { data: profile } = await supabase
+      .from('user_profiles')
+      .select('is_suspended')
+      .eq('id', payload.sub)
+      .single();
+
+    if (!profile) {
+      return res.status(401).json({ error: 'User not found', details: 'This account no longer exists.' });
+    }
+    if (profile.is_suspended) {
+      return res.status(403).json({ error: 'Account suspended', details: 'Your account has been suspended. Please contact support.' });
+    }
+  } catch (e) {
+    // PGRST116 = no rows returned by .single() — profile doesn't exist
+    if (e?.code === 'PGRST116') {
+      return res.status(401).json({ error: 'User not found', details: 'This account no longer exists.' });
+    }
+    // Any other error (e.g. is_suspended column not yet migrated) — allow through
+  }
+
   next();
 }
 
@@ -1272,6 +1297,86 @@ app.post('/merchant/support-tickets', requireAuth, async (req, res) => {
       error: 'Failed to create support ticket',
       details: error.message || 'Please try again later',
     });
+  }
+});
+
+// POST /courier/support-tickets — create a help request from courier
+app.post('/courier/support-tickets', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { category, subject, message } = req.body || {};
+    const subj = subject != null ? String(subject).trim() : '';
+    const msg = message != null ? String(message).trim() : '';
+    if (!subj || !msg) {
+      return res.status(400).json({ error: 'Missing fields', details: 'subject and message are required' });
+    }
+    let reference_code = `C-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const { data: created, error: insertError } = await supabase
+        .from('support_tickets')
+        .insert({
+          user_id: req.userId,
+          role_context: 'courier',
+          category: category ? String(category).trim() : null,
+          subject: subj,
+          message: msg,
+          status: 'open',
+          reference_code,
+        })
+        .select('id, reference_code, subject, category, status, created_at')
+        .single();
+      if (!insertError && created) return res.status(201).json(created);
+      if (insertError?.code === '23505') {
+        reference_code = `C-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+        continue;
+      }
+      console.error('post /courier/support-tickets error:', insertError);
+      throw new Error(insertError?.message || 'Failed to create ticket');
+    }
+    throw new Error('Could not allocate a unique ticket reference');
+  } catch (error) {
+    console.error('post /courier/support-tickets error:', error);
+    return res.status(500).json({ error: 'Failed to create support ticket', details: error.message || 'Please try again later' });
+  }
+});
+
+// POST /customer/support-tickets — create a help request from customer
+app.post('/customer/support-tickets', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { category, subject, message } = req.body || {};
+    const subj = subject != null ? String(subject).trim() : '';
+    const msg = message != null ? String(message).trim() : '';
+    if (!subj || !msg) {
+      return res.status(400).json({ error: 'Missing fields', details: 'subject and message are required' });
+    }
+    let reference_code = `U-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const { data: created, error: insertError } = await supabase
+        .from('support_tickets')
+        .insert({
+          user_id: req.userId,
+          role_context: 'customer',
+          category: category ? String(category).trim() : null,
+          subject: subj,
+          message: msg,
+          status: 'open',
+          reference_code,
+        })
+        .select('id, reference_code, subject, category, status, created_at')
+        .single();
+      if (!insertError && created) return res.status(201).json(created);
+      if (insertError?.code === '23505') {
+        reference_code = `U-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+        continue;
+      }
+      console.error('post /customer/support-tickets error:', insertError);
+      throw new Error(insertError?.message || 'Failed to create ticket');
+    }
+    throw new Error('Could not allocate a unique ticket reference');
+  } catch (error) {
+    console.error('post /customer/support-tickets error:', error);
+    return res.status(500).json({ error: 'Failed to create support ticket', details: error.message || 'Please try again later' });
   }
 });
 
@@ -5507,6 +5612,31 @@ app.get('/admin/couriers/:id/detail', requireAdmin, async (req, res) => {
   }
 });
 
+// DELETE /admin/users/:id — permanently delete a user account
+app.delete('/admin/users/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await deleteUserById(id);
+    return res.json({ success: true, message: 'User deleted' });
+  } catch (error) {
+    console.error('admin/users/:id DELETE error:', error);
+    return res.status(500).json({ error: 'Failed to delete user', details: error.message || 'Try again later' });
+  }
+});
+
+// PATCH /admin/users/:id/suspend — suspend or unsuspend a user account
+app.patch('/admin/users/:id/suspend', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { suspend } = req.body;
+    await adminSuspendUser(id, !!suspend);
+    return res.json({ success: true, suspended: !!suspend });
+  } catch (error) {
+    console.error('admin/users/:id/suspend error:', error);
+    return res.status(500).json({ error: 'Failed to update user', details: error.message || 'Try again later' });
+  }
+});
+
 // Detailed view of a single merchant (profile + stores + documents)
 app.get('/admin/merchants/:id/detail', requireAdmin, async (req, res) => {
   try {
@@ -5523,7 +5653,7 @@ app.get('/admin/merchants/:id/detail', requireAdmin, async (req, res) => {
 // Keeps the API key server-side so app-bundle restrictions never block calls.
 const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
 
-app.get('/maps/geocode', async (req, res) => {
+app.get('/maps/geocode', requireAuth, async (req, res) => {
   if (!GOOGLE_MAPS_API_KEY) {
     return res.status(503).json({ status: 'ERROR', error_message: 'GOOGLE_MAPS_API_KEY not set on server' });
   }
@@ -5540,7 +5670,7 @@ app.get('/maps/geocode', async (req, res) => {
   }
 });
 
-app.get('/maps/places/autocomplete', async (req, res) => {
+app.get('/maps/places/autocomplete', requireAuth, async (req, res) => {
   if (!GOOGLE_MAPS_API_KEY) {
     return res.status(503).json({ status: 'ERROR', error_message: 'GOOGLE_MAPS_API_KEY not set on server' });
   }
@@ -5560,7 +5690,7 @@ app.get('/maps/places/autocomplete', async (req, res) => {
   }
 });
 
-app.get('/maps/places/details', async (req, res) => {
+app.get('/maps/places/details', requireAuth, async (req, res) => {
   if (!GOOGLE_MAPS_API_KEY) {
     return res.status(503).json({ status: 'ERROR', error_message: 'GOOGLE_MAPS_API_KEY not set on server' });
   }
