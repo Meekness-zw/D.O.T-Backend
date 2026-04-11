@@ -21,10 +21,12 @@ async function sendSmsDexatel(phone, message) {
   const phoneNumber = phone.startsWith('+') ? phone.substring(1) : phone;
   
   const payload = {
-    channel: 'SMS',
-    from: DEXATEL_SENDER,
-    to: phoneNumber,
-    text: message
+    messages: [{
+      channel: 'SMS',
+      from: DEXATEL_SENDER,
+      to: phoneNumber,
+      text: message
+    }]
   };
   
   console.log('Dexatel request:', JSON.stringify(payload));
