@@ -3,12 +3,16 @@ import 'dotenv/config.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 
 export async function sendOtpToPhone(phone) {
+  console.log('[sendOtpToPhone] Sending OTP to:', phone);
+  
   const { data, error } = await supabase.auth.signInWithOtp({
     phone,
     options: {
       channel: 'sms'
     }
   });
+
+  console.log('[sendOtpToPhone] Response:', { data, error });
 
   if (error) throw error;
   return { message: 'OTP sent successfully' };
