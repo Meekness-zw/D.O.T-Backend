@@ -98,8 +98,8 @@ export async function ensureUserProfile({
     profileData.password_hash = crypto.createHash('sha256').update(password).digest('hex');
   }
 
-  // 1) Upsert into user_profiles
-  const { error: profileError } = await supabase.from('user_profiles').upsert(
+  // 1) Upsert into user_profiles (using admin client for permissions)
+  const { error: profileError } = await supabaseAdmin.from('user_profiles').upsert(
     profileData,
     { onConflict: 'id' }
   );
@@ -108,12 +108,12 @@ export async function ensureUserProfile({
 
   // 2) Create row in role-specific table if not exists
   if (role === 'customer') {
-    await supabase.from('customers').upsert(
+    await supabaseAdmin.from('customers').upsert(
       { id: userId },
       { onConflict: 'id' }
     );
   } else if (role === 'merchant') {
-    await supabase.from('merchants').upsert(
+    await supabaseAdmin.from('merchants').upsert(
       {
         id: userId,
         business_name: fullName || 'New Merchant'
@@ -121,7 +121,7 @@ export async function ensureUserProfile({
       { onConflict: 'id' }
     );
   } else if (role === 'courier') {
-    await supabase.from('couriers').upsert(
+    await supabaseAdmin.from('couriers').upsert(
       { id: userId },
       { onConflict: 'id' }
     );

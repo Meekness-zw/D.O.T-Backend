@@ -2198,10 +2198,10 @@ app.post('/auth/verify-otp', async (req, res) => {
 });
 
 
-// POST /users/ensure-profile { userId, email, phone, fullName, role }
+// POST /users/ensure-profile { userId, email, phone, fullName, role, password }
 app.post('/users/ensure-profile', async (req, res) => {
   try {
-    const { userId, email, phone, fullName, role } = req.body;
+    const { userId, email, phone, fullName, role, password } = req.body;
 
     if (!userId || !role) {
       return res.status(400).json({
@@ -2219,7 +2219,7 @@ app.post('/users/ensure-profile', async (req, res) => {
       });
     }
 
-    await ensureUserProfile({ userId, email, phone, fullName, role });
+    await ensureUserProfile({ userId, email, phone, fullName, role, password });
     return res.json({
       success: true,
       message: 'User profile created successfully'
