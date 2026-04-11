@@ -1,35 +1,65 @@
 import { supabase } from './supabaseClient.js';
+import 'dotenv/config.js';
 
-/**
- * Start phone signup/login by sending an OTP SMS.
- * Twilio is configured inside Supabase Auth; from the app we just call this.
- */
-export async function sendOtpToPhone(phone) {
-  // phone must be in E.164 format, e.g. +2637xxxxxxx
-  const { data, error } = await supabase.auth.signInWithOtp({
-    phone,
-    options: {
-      channel: 'sms'
-    }
-  });
+const DEXATEL_API_KEY = process.env.DEXATEL_API_KEY;
+const DEXATEL_SENDER = process.env.DEXATEL_SENDER;
 
-  if (error) throw error;
-  return data;
+const otpStore = new Map();
+
+function generateOtp() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-/**
- * Verify the OTP sent to the user's phone and complete sign-in.
- * On success, you get a user session back.
- */
-export async function verifyPhoneOtp({ phone, token }) {
-  const { data, error } = await supabase.auth.verifyOtp({
-    phone,
-    token,
-    type: 'sms'
+async function sendSmsDexatel(phone, message) {
+  const url = 'https://api.dexatel.com/sms/send';
+  const data = new URLSearchParams({
+    token: DEXATEL_API_KEY,
+    sender: DEXATEL_SENDER,
+    to: phone,
+    message
   });
+  
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: data.toString()
+  });
+  
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Dexatel SMS failed: ${errorText}`);
+  }
+  
+  return response.json();
+}
 
-  if (error) throw error;
-  return data;
+export async function sendOtpToPhone(phone) {
+  const otp = generateOtp();
+  otpStore.set(phone, { otp, expires: Date.now() + 5 * 60 * 1000 });
+  
+  await sendSmsDexatel(phone, `Your OTP is: ${otp}`);
+  return { message: 'OTP sent successfully' };
+}
+
+export async function verifyPhoneOtp({ phone, token }) {
+  const stored = otpStore.get(phone);
+  
+  if (!stored) {
+    throw new Error('No OTP requested for this phone');
+  }
+  
+  if (Date.now() > stored.expires) {
+    otpStore.delete(phone);
+    throw new Error('OTP expired');
+  }
+  
+  if (stored.otp !== token) {
+    throw new Error('Invalid OTP');
+  }
+  
+  otpStore.delete(phone);
+  
+  return { user: { phone } };
 }
 
 /**
