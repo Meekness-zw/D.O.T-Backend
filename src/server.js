@@ -83,21 +83,20 @@ function estimateEtaMinutes(distanceKm) {
   return Math.round(clamped);
 }
 
-// Environment validation (Twilio + Supabase for phone auth)
+// Environment validation (Dexatel + Supabase for phone auth)
 const requiredEnvVars = [
   'SUPABASE_URL',
   'SUPABASE_ANON_KEY',
   'SUPABASE_SERVICE_ROLE_KEY',
   'SUPABASE_JWT_SECRET',
-  'TWILIO_ACCOUNT_SID',
-  'TWILIO_AUTH_TOKEN',
-  'TWILIO_VERIFY_SERVICE_SID',
+  'DEXATEL_API_KEY',
+  'DEXATEL_SENDER',
 ];
 const missingEnvVars = requiredEnvVars.filter((varName) => !process.env[varName]);
 
 if (missingEnvVars.length > 0) {
   console.error('❌ Missing required environment variables:', missingEnvVars.join(', '));
-  console.error('Copy backend/.env.example to backend/.env and fill in your Twilio and Supabase values.');
+  console.error('Copy backend/.env.example to backend/.env and fill in your Dexatel and Supabase values.');
   process.exit(1);
 }
 
@@ -2243,13 +2242,11 @@ app.post('/auth/send-otp', async (req, res) => {
     });
   } catch (error) {
     console.error('send-otp error:', error);
-    // Twilio user-facing errors (invalid number, blocked, rate-limited) → 400
-    // so the frontend shows the message directly rather than a generic server error
-    const isTwilioUserError = error?.code && [60200, 60203, 60212, 60238, 21211].includes(error.code);
-    const status = isTwilioUserError ? 400 : 500;
+    // User-facing errors (invalid number, rate-limited, etc.) → 400
+    const status = error?.isUserError ? 400 : 500;
     return res.status(status).json({
       error: error.message || 'Failed to send verification code',
-      details: isTwilioUserError ? undefined : 'Please try again later'
+      details: error?.isUserError ? undefined : 'Please try again later'
     });
   }
 });

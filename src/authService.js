@@ -1,22 +1,26 @@
 import crypto from 'crypto';
-import twilio from 'twilio';
+import axios from 'axios';
 import bcrypt from 'bcryptjs';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { createSupabaseAccessToken } from './sessionToken.js';
 import { getRoles, syncUserRolesFromRoleTables } from './userService.js';
 
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const TWILIO_VERIFY_SERVICE_SID = process.env.TWILIO_VERIFY_SERVICE_SID;
+const DEXATEL_API_KEY = process.env.DEXATEL_API_KEY;
+const DEXATEL_SENDER = process.env.DEXATEL_SENDER;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
 
 const PASSWORD_SALT_ROUNDS = 10;
 
-const twilioClient =
-  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
-    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    : null;
+// In-memory store mapping phone → { code, expiresAt }
+// We generate the OTP ourselves and store it here until the user submits it.
+const otpStore = new Map();
+setInterval(() => {
+  const now = Date.now();
+  for (const [phone, entry] of otpStore.entries()) {
+    if (entry.expiresAt < now) otpStore.delete(phone);
+  }
+}, 15 * 60 * 1000);
 
 async function hashPassword(plain) {
   if (!plain || typeof plain !== 'string') return null;
@@ -29,7 +33,7 @@ async function verifyPassword(plain, hash) {
 }
 
 /**
- * Start phone verification by sending a code via Twilio Verify (SMS).
+ * Start phone verification by generating a 6-digit OTP and sending it via Dexatel SMS API.
  */
 export async function sendOtpToPhone(phone) {
   if (!phone || typeof phone !== 'string') {
@@ -39,56 +43,62 @@ export async function sendOtpToPhone(phone) {
     throw new Error('Phone number must be in E.164 format (e.g. +263712345678)');
   }
 
-  if (!twilioClient || !TWILIO_VERIFY_SERVICE_SID) {
-    throw new Error(
-      'Twilio Verify is not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_VERIFY_SERVICE_SID in .env'
-    );
+  if (!DEXATEL_API_KEY || !DEXATEL_SENDER) {
+    throw new Error('Dexatel is not configured. Set DEXATEL_API_KEY and DEXATEL_SENDER in .env');
   }
 
-  let verification;
+  // Generate a cryptographically random 6-digit code
+  const code = String(crypto.randomInt(100000, 999999));
+
+  // Dexatel expects the number without the leading +
+  const dexPhone = phone.replace(/^\+/, '');
+
   try {
-    verification = await twilioClient.verify.v2
-      .services(TWILIO_VERIFY_SERVICE_SID)
-      .verifications.create({
-        to: phone,
-        channel: 'sms',
-      });
-  } catch (twilioErr) {
-    // Map well-known Twilio Verify error codes to user-friendly messages
-    const code = twilioErr?.code;
-    if (code === 60238) {
-      throw new Error(
-        'We could not send a verification code to this number. ' +
-        'This can happen with certain numbers or regions. ' +
-        'Please try a different number or contact support.'
+    await axios.post(
+      'https://api.dexatel.com/v1/messages',
+      {
+        data: {
+          from: DEXATEL_SENDER,
+          to: [dexPhone],
+          content: `Your Delivery On Time verification code is ${code}. Valid for 10 minutes. Do not share this code.`,
+        },
+      },
+      {
+        headers: {
+          'X-auth-token': DEXATEL_API_KEY,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
+  } catch (err) {
+    const status = err?.response?.status;
+    const msg = err?.response?.data?.message || err?.response?.data?.error || '';
+    if (status === 400 || status === 422) {
+      const userErr = new Error(
+        msg || 'The phone number you entered is not valid. Please check and try again.'
       );
+      userErr.isUserError = true;
+      throw userErr;
     }
-    if (code === 60200 || code === 21211) {
-      throw new Error('The phone number you entered is not valid. Please check and try again.');
+    if (status === 429) {
+      const userErr = new Error('Too many verification attempts. Please wait a few minutes before trying again.');
+      userErr.isUserError = true;
+      throw userErr;
     }
-    if (code === 60203) {
-      throw new Error('Too many verification attempts. Please wait a few minutes before trying again.');
-    }
-    if (code === 60212) {
-      throw new Error('SMS could not be delivered to this number. Please try a different number.');
-    }
-    // Re-throw raw error for unexpected cases (will be caught by route handler)
-    throw twilioErr;
+    throw err;
   }
 
-  console.log('[Auth] Twilio Verify sent OTP:', {
-    phone,
-    sid: verification.sid,
-    status: verification.status,
-    channel: verification.channel,
-  });
+  // Store the code keyed by phone for later verification (10-minute TTL)
+  otpStore.set(phone, { code, expiresAt: Date.now() + 10 * 60 * 1000 });
 
-  return { success: true, sid: verification.sid, status: verification.status };
+  console.log('[Auth] Dexatel OTP sent:', { phone });
+
+  return { success: true };
 }
 
 /**
- * Verify the code with Twilio, then get or create the user in Supabase and return a session
- * so the client can authenticate seamlessly.
+ * Verify the OTP locally (compared against what we stored when sending), then get or create
+ * the user in Supabase and return a session so the client can authenticate seamlessly.
  *
  * For sign-up, a password is required; we hash it into Supabase Auth user_metadata.passwordHash.
  */
@@ -100,23 +110,21 @@ export async function verifyPhoneOtp({ phone, token, isSignUp = false, password 
     throw new Error('Verification code must be 6 digits');
   }
 
-  if (!twilioClient || !TWILIO_VERIFY_SERVICE_SID) {
-    throw new Error('Twilio Verify is not configured');
+  const stored = otpStore.get(phone);
+  if (!stored) {
+    throw new Error('No pending verification found for this number. Please request a new code.');
+  }
+  if (stored.expiresAt < Date.now()) {
+    otpStore.delete(phone);
+    throw new Error('Verification code has expired. Please request a new one.');
   }
 
-  const check = await twilioClient.verify.v2
-    .services(TWILIO_VERIFY_SERVICE_SID)
-    .verificationChecks.create({
-      to: phone,
-      code: token,
-    });
-
-  if (check.status !== 'approved' || !check.valid) {
-    if (check.status === 'pending' || check.status === 'canceled') {
-      throw new Error('Verification code has expired. Please request a new one.');
-    }
+  if (stored.code !== token) {
     throw new Error('Invalid verification code. Please try again.');
   }
+
+  // Code is consumed — remove from store
+  otpStore.delete(phone);
 
   if (!supabaseAdmin || !SUPABASE_URL || !SUPABASE_JWT_SECRET) {
     throw new Error(
@@ -248,7 +256,7 @@ async function createSupabaseUserByPhone(phone, password) {
 
 /**
  * Password-based login for existing users.
- * No Twilio OTP is involved here: we look up the Supabase Auth user by phone,
+ * No OTP is involved here: we look up the Supabase Auth user by phone,
  * verify the stored password hash (in user_metadata.passwordHash), and then
  * return a session token identical in shape to verifyPhoneOtp.
  */
