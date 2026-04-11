@@ -12,18 +12,20 @@ function generateOtp() {
 }
 
 async function sendSmsDexatel(phone, message) {
-  const url = 'https://api.dexatel.com/sms/send';
-  const data = new URLSearchParams({
-    token: DEXATEL_API_KEY,
-    sender: DEXATEL_SENDER,
-    to: phone,
-    message
-  });
+  const url = 'https://api.dexatel.com/v1/messages';
   
   const response = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: data.toString()
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Dexatel-Key': DEXATEL_API_KEY
+    },
+    body: JSON.stringify({
+      channel: 'SMS',
+      from: DEXATEL_SENDER,
+      to: phone,
+      text: message
+    })
   });
   
   if (!response.ok) {
