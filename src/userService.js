@@ -1,5 +1,6 @@
 import { supabase } from './supabaseClient.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
+import crypto from 'crypto';
 
 export async function getProfile(userId) {
   const { data, error } = await supabaseAdmin
@@ -82,17 +83,24 @@ export async function ensureUserProfile({
   email,
   phone,
   fullName,
-  role // 'customer' | 'merchant' | 'courier'
+  role,
+  password
 }) {
+  const profileData = {
+    id: userId,
+    email,
+    phone,
+    full_name: fullName,
+    role
+  };
+
+  if (password) {
+    profileData.password_hash = crypto.createHash('sha256').update(password).digest('hex');
+  }
+
   // 1) Upsert into user_profiles
   const { error: profileError } = await supabase.from('user_profiles').upsert(
-    {
-      id: userId,
-      email,
-      phone,
-      full_name: fullName,
-      role
-    },
+    profileData,
     { onConflict: 'id' }
   );
 

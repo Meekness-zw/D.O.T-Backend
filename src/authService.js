@@ -1,6 +1,7 @@
 import { supabase } from './supabaseClient.js';
 import 'dotenv/config.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
+import crypto from 'crypto';
 
 export async function sendOtpToPhone(phone) {
   console.log('[sendOtpToPhone] Sending OTP to:', phone);
@@ -18,7 +19,30 @@ export async function sendOtpToPhone(phone) {
   return { message: 'OTP sent successfully' };
 }
 
-export async function verifyPhoneOtp({ phone, token }) {
+export async function verifyPhoneOtp({ phone, token, isSignUp = false, password, confirmPassword }) {
+  if (isSignUp) {
+    if (!password) {
+      throw new Error('Password required for sign up');
+    }
+    if (password.length < 6) {
+      throw new Error('Password must be at least 6 characters');
+    }
+    if (password !== confirmPassword) {
+      throw new Error('Passwords do not match');
+    }
+
+    const { data, error } = await supabase.auth.signUp({
+      phone,
+      password,
+      options: {
+        channel: 'sms'
+      }
+    });
+    
+    if (error) throw error;
+    return { user: data.user, session: data.session };
+  }
+  
   const { data, error } = await supabase.auth.verifyOtp({
     phone,
     token,
@@ -61,14 +85,9 @@ export async function loginWithPassword({ phone, password }) {
     throw new Error('No account found with this phone number');
   }
 
-  const { data: passwordMatch, error: passwordError } = await supabaseAdmin
-    .from('user_profiles')
-    .select('id')
-    .eq('id', profile.id)
-    .eq('password_hash', password)
-    .single();
-
-  if (passwordError || !passwordMatch) {
+  const inputHash = crypto.createHash('sha256').update(password).digest('hex');
+  
+  if (profile.password_hash !== inputHash) {
     throw new Error('Incorrect phone or password');
   }
 

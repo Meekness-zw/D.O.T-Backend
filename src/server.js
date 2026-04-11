@@ -2141,7 +2141,7 @@ app.post('/auth/send-otp', async (req, res) => {
 // POST /auth/verify-otp { phone, token }
 app.post('/auth/verify-otp', async (req, res) => {
   try {
-    const { phone, token, isSignUp = false, password } = req.body;
+    const { phone, token, isSignUp = false, password, confirmPassword } = req.body;
     console.log('[Auth] /auth/verify-otp called for phone:', phone, '| isSignUp:', isSignUp);
     if (!phone || !token) {
       return res.status(400).json({
@@ -2157,7 +2157,7 @@ app.post('/auth/verify-otp', async (req, res) => {
       });
     }
 
-    const data = await verifyPhoneOtp({ phone, token, isSignUp, password });
+    const data = await verifyPhoneOtp({ phone, token, isSignUp, password, confirmPassword });
 
     return res.json({
       success: true,
