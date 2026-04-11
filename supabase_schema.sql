@@ -1,10 +1,6 @@
 -- ============================================
 -- DOT Delivery App - Supabase Database Schema
 -- ============================================
--- User data: user_profiles (core) + customers/merchants/couriers (role-specific).
--- History: orders, order_items, order_status_history; delivery_tracking; reviews.
--- Payments: payments (per-order), wallet_transactions (balance ledger for all roles).
--- Run this schema in Supabase SQL Editor to create/migrate tables.
 
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -14,20 +10,16 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- ============================================
 
 -- User Profiles (extends Supabase Auth)
--- email nullable for phone-only auth; role must match one of customer/merchant/courier
 CREATE TABLE IF NOT EXISTS user_profiles (
-  id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-  email TEXT UNIQUE,
+id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,    -- user_profiles table extends auth.users table ```
+  email TEXT UNIQUE NOT NULL,
   phone TEXT UNIQUE,
   full_name TEXT,
   role TEXT NOT NULL CHECK (role IN ('customer', 'merchant', 'courier')),
   profile_photo TEXT,
-  is_suspended BOOLEAN DEFAULT FALSE,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
--- If table already existed with email NOT NULL, run: ALTER TABLE user_profiles ALTER COLUMN email DROP NOT NULL;
--- Add suspension support (run if table already exists): ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS is_suspended BOOLEAN DEFAULT FALSE;
 
 -- ============================================
 -- CUSTOMERS
@@ -66,8 +58,6 @@ CREATE TABLE IF NOT EXISTS customer_payment_methods (
   provider TEXT, -- e.g., "Visa", "EcoCash", "OneMoney"
   last_four_digits TEXT,
   expiry_date TEXT,
-  phone_country_code TEXT, -- e.g. "+263"
-  phone_number TEXT, -- full MSISDN or local format
   is_default BOOLEAN DEFAULT FALSE,
   is_active BOOLEAN DEFAULT TRUE,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -96,7 +86,6 @@ CREATE TABLE IF NOT EXISTS stores (
   merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
   store_name TEXT NOT NULL,
   logo TEXT,
-  banner_url TEXT,
   description TEXT,
   phone TEXT,
   email TEXT,
@@ -152,7 +141,6 @@ CREATE TABLE IF NOT EXISTS products (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   store_id UUID NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
   category_id UUID REFERENCES product_categories(id) ON DELETE SET NULL,
-  category TEXT, -- Category name stored on product (e.g. "Burgers", "Drinks")
   name TEXT NOT NULL,
   description TEXT,
   price DECIMAL(10, 2) NOT NULL,
@@ -162,27 +150,6 @@ CREATE TABLE IF NOT EXISTS products (
   is_available BOOLEAN DEFAULT TRUE,
   is_featured BOOLEAN DEFAULT FALSE,
   display_order INTEGER DEFAULT 0,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Store Promotions / Deals
-CREATE TABLE IF NOT EXISTS promotions (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  store_id UUID NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
-  title TEXT NOT NULL,
-  description TEXT,
-  tag TEXT,
-  category TEXT, -- Optional: category name this promotion applies to (e.g. \"Burgers\")
-  image_url TEXT,
-  is_active BOOLEAN DEFAULT TRUE,
-  starts_at TIMESTAMP WITH TIME ZONE,
-  ends_at TIMESTAMP WITH TIME ZONE,
-  -- Auto-post on a set day every week or month (saved in DB; cron activates at recurrence_time)
-  recurrence_type TEXT DEFAULT 'once' CHECK (recurrence_type IN ('once', 'weekly', 'monthly')),
-  recurrence_weekday SMALLINT CHECK (recurrence_weekday IS NULL OR (recurrence_weekday >= 0 AND recurrence_weekday <= 6)), -- 0=Sunday .. 6=Saturday
-  recurrence_month_day SMALLINT CHECK (recurrence_month_day IS NULL OR (recurrence_month_day >= 1 AND recurrence_month_day <= 31)),
-  recurrence_time TEXT, -- HH:MM 24h, e.g. '09:00'
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -202,25 +169,6 @@ CREATE TABLE IF NOT EXISTS merchant_settings (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Support tickets (help requests from app)
-CREATE TABLE IF NOT EXISTS support_tickets (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id UUID NOT NULL REFERENCES user_profiles(id) ON DELETE CASCADE,
-  role_context TEXT NOT NULL DEFAULT 'merchant',
-  category TEXT,
-  subject TEXT NOT NULL,
-  message TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'open' CHECK (
-    status IN ('open', 'pending', 'in_progress', 'resolved', 'closed')
-  ),
-  reference_code TEXT UNIQUE,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_support_tickets_user_id ON support_tickets(user_id);
-CREATE INDEX IF NOT EXISTS idx_support_tickets_created_at ON support_tickets(created_at DESC);
-
 -- ============================================
 -- COURIERS/RIDERS
 -- ============================================
@@ -229,9 +177,6 @@ CREATE TABLE IF NOT EXISTS couriers (
   id UUID PRIMARY KEY REFERENCES user_profiles(id) ON DELETE CASCADE,
   national_id TEXT UNIQUE,
   date_of_birth DATE,
-  city TEXT,
-  drivers_license_number TEXT,
-  drivers_license_expiry DATE,
   is_online BOOLEAN DEFAULT FALSE,
   is_verified BOOLEAN DEFAULT FALSE,
   verification_status TEXT DEFAULT 'pending' CHECK (verification_status IN ('pending', 'approved', 'rejected')),
@@ -239,19 +184,6 @@ CREATE TABLE IF NOT EXISTS couriers (
   total_deliveries INTEGER DEFAULT 0,
   total_earnings DECIMAL(10, 2) DEFAULT 0.00,
   account_balance DECIMAL(10, 2) DEFAULT 0.00,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Merchant Documents (for merchant onboarding verification)
-CREATE TABLE IF NOT EXISTS merchant_documents (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
-  document_type TEXT NOT NULL CHECK (document_type IN ('owner_id', 'business_certificate', 'proof_of_address')),
-  document_url TEXT NOT NULL,
-  status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
-  verified_at TIMESTAMP WITH TIME ZONE,
-  verified_by UUID REFERENCES user_profiles(id),
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -335,10 +267,8 @@ CREATE TABLE IF NOT EXISTS orders (
     'preparing',
     'ready',
     'assigned',
-    'merchant_confirmed',
     'picked_up',
     'in_transit',
-    'delivery_confirmation_pending',
     'delivered',
     'cancelled',
     'refunded'
@@ -490,7 +420,6 @@ CREATE INDEX IF NOT EXISTS idx_stores_is_active ON stores(is_active);
 -- Products
 CREATE INDEX IF NOT EXISTS idx_products_store_id ON products(store_id);
 CREATE INDEX IF NOT EXISTS idx_products_category_id ON products(category_id);
-CREATE INDEX IF NOT EXISTS idx_products_category ON products(store_id, category);
 CREATE INDEX IF NOT EXISTS idx_products_is_available ON products(is_available);
 
 -- Orders
@@ -522,11 +451,6 @@ CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_is_read ON notifications(is_read);
 CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON notifications(created_at DESC);
 
--- Promotions
-CREATE INDEX IF NOT EXISTS idx_promotions_store_id ON promotions(store_id);
-CREATE INDEX IF NOT EXISTS idx_promotions_is_active ON promotions(is_active);
-CREATE INDEX IF NOT EXISTS idx_promotions_time ON promotions(starts_at, ends_at);
-
 -- ============================================
 -- FUNCTIONS & TRIGGERS
 -- ============================================
@@ -540,32 +464,25 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Apply updated_at triggers to relevant tables (DROP IF EXISTS so schema is re-runnable)
-DROP TRIGGER IF EXISTS update_user_profiles_updated_at ON user_profiles;
+-- Apply updated_at triggers to relevant tables
 CREATE TRIGGER update_user_profiles_updated_at BEFORE UPDATE ON user_profiles
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_customers_updated_at ON customers;
 CREATE TRIGGER update_customers_updated_at BEFORE UPDATE ON customers
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_merchants_updated_at ON merchants;
 CREATE TRIGGER update_merchants_updated_at BEFORE UPDATE ON merchants
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_stores_updated_at ON stores;
 CREATE TRIGGER update_stores_updated_at BEFORE UPDATE ON stores
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_products_updated_at ON products;
 CREATE TRIGGER update_products_updated_at BEFORE UPDATE ON products
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_couriers_updated_at ON couriers;
 CREATE TRIGGER update_couriers_updated_at BEFORE UPDATE ON couriers
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_orders_updated_at ON orders;
 CREATE TRIGGER update_orders_updated_at BEFORE UPDATE ON orders
   FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
@@ -591,7 +508,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS set_order_number_trigger ON orders;
 CREATE TRIGGER set_order_number_trigger BEFORE INSERT ON orders
   FOR EACH ROW EXECUTE FUNCTION set_order_number();
 
@@ -616,7 +532,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS update_store_rating_trigger ON reviews;
 CREATE TRIGGER update_store_rating_trigger AFTER INSERT OR UPDATE ON reviews
   FOR EACH ROW EXECUTE FUNCTION update_store_rating();
 
@@ -636,7 +551,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS update_courier_rating_trigger ON reviews;
 CREATE TRIGGER update_courier_rating_trigger AFTER INSERT OR UPDATE ON reviews
   FOR EACH ROW EXECUTE FUNCTION update_courier_rating();
 
@@ -652,7 +566,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS log_order_status_change_trigger ON orders;
 CREATE TRIGGER log_order_status_change_trigger AFTER UPDATE ON orders
   FOR EACH ROW EXECUTE FUNCTION log_order_status_change();
 
@@ -678,124 +591,92 @@ ALTER TABLE wallet_transactions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notifications ENABLE ROW LEVEL SECURITY;
 
 -- User Profiles: Users can read/update their own profile
-DROP POLICY IF EXISTS "Users can view own profile" ON user_profiles;
 CREATE POLICY "Users can view own profile" ON user_profiles
   FOR SELECT USING (auth.uid() = id);
 
-DROP POLICY IF EXISTS "Users can update own profile" ON user_profiles;
 CREATE POLICY "Users can update own profile" ON user_profiles
   FOR UPDATE USING (auth.uid() = id);
 
 -- Customers: Customers can manage their own data
-DROP POLICY IF EXISTS "Customers can view own data" ON customers;
 CREATE POLICY "Customers can view own data" ON customers
   FOR SELECT USING (auth.uid() = id);
 
-DROP POLICY IF EXISTS "Customers can update own data" ON customers;
 CREATE POLICY "Customers can update own data" ON customers
   FOR UPDATE USING (auth.uid() = id);
 
-DROP POLICY IF EXISTS "Customers can manage own addresses" ON customer_addresses;
 CREATE POLICY "Customers can manage own addresses" ON customer_addresses
   FOR ALL USING (auth.uid() = customer_id);
 
-DROP POLICY IF EXISTS "Customers can manage own payment methods" ON customer_payment_methods;
 CREATE POLICY "Customers can manage own payment methods" ON customer_payment_methods
   FOR ALL USING (auth.uid() = customer_id);
 
 -- Stores: Public can view active stores, merchants can manage their stores
-DROP POLICY IF EXISTS "Anyone can view active stores" ON stores;
 CREATE POLICY "Anyone can view active stores" ON stores
   FOR SELECT USING (is_active = TRUE);
 
-DROP POLICY IF EXISTS "Merchants can manage own stores" ON stores;
 CREATE POLICY "Merchants can manage own stores" ON stores
   FOR ALL USING (auth.uid() = merchant_id);
 
 -- Products: Public can view available products, merchants can manage their products
-DROP POLICY IF EXISTS "Anyone can view available products" ON products;
 CREATE POLICY "Anyone can view available products" ON products
   FOR SELECT USING (is_available = TRUE AND EXISTS (
     SELECT 1 FROM stores WHERE stores.id = products.store_id AND stores.is_active = TRUE
   ));
 
-DROP POLICY IF EXISTS "Merchants can manage own products" ON products;
 CREATE POLICY "Merchants can manage own products" ON products
   FOR ALL USING (EXISTS (
     SELECT 1 FROM stores WHERE stores.id = products.store_id AND stores.merchant_id = auth.uid()
   ));
 
 -- Orders: Customers can view their orders, merchants can view store orders, couriers can view assigned orders
-DROP POLICY IF EXISTS "Customers can view own orders" ON orders;
 CREATE POLICY "Customers can view own orders" ON orders
   FOR SELECT USING (auth.uid() = customer_id);
 
-DROP POLICY IF EXISTS "Merchants can view store orders" ON orders;
 CREATE POLICY "Merchants can view store orders" ON orders
   FOR SELECT USING (EXISTS (
     SELECT 1 FROM stores WHERE stores.id = orders.store_id AND stores.merchant_id = auth.uid()
   ));
 
-DROP POLICY IF EXISTS "Couriers can view assigned orders" ON orders;
 CREATE POLICY "Couriers can view assigned orders" ON orders
   FOR SELECT USING (auth.uid() = courier_id);
 
-DROP POLICY IF EXISTS "Customers can create orders" ON orders;
 CREATE POLICY "Customers can create orders" ON orders
   FOR INSERT WITH CHECK (auth.uid() = customer_id);
 
-DROP POLICY IF EXISTS "Merchants can update store orders" ON orders;
 CREATE POLICY "Merchants can update store orders" ON orders
   FOR UPDATE USING (EXISTS (
     SELECT 1 FROM stores WHERE stores.id = orders.store_id AND stores.merchant_id = auth.uid()
   ));
 
-DROP POLICY IF EXISTS "Couriers can update assigned orders" ON orders;
 CREATE POLICY "Couriers can update assigned orders" ON orders
   FOR UPDATE USING (auth.uid() = courier_id);
 
 -- Couriers: Couriers can manage their own data
-DROP POLICY IF EXISTS "Couriers can view own data" ON couriers;
 CREATE POLICY "Couriers can view own data" ON couriers
   FOR SELECT USING (auth.uid() = id);
 
-DROP POLICY IF EXISTS "Couriers can update own data" ON couriers;
 CREATE POLICY "Couriers can update own data" ON couriers
   FOR UPDATE USING (auth.uid() = id);
 
-DROP POLICY IF EXISTS "Couriers can manage own vehicles" ON courier_vehicles;
 CREATE POLICY "Couriers can manage own vehicles" ON courier_vehicles
   FOR ALL USING (auth.uid() = courier_id);
 
-DROP POLICY IF EXISTS "Couriers can manage own documents" ON courier_documents;
 CREATE POLICY "Couriers can manage own documents" ON courier_documents
   FOR ALL USING (auth.uid() = courier_id);
 
-DROP POLICY IF EXISTS "Couriers can manage own payout methods" ON courier_payout_methods;
 CREATE POLICY "Couriers can manage own payout methods" ON courier_payout_methods
   FOR ALL USING (auth.uid() = courier_id);
 
 -- Notifications: Users can view their own notifications
-DROP POLICY IF EXISTS "Users can view own notifications" ON notifications;
 CREATE POLICY "Users can view own notifications" ON notifications
   FOR SELECT USING (auth.uid() = user_id);
 
-DROP POLICY IF EXISTS "Users can update own notifications" ON notifications;
 CREATE POLICY "Users can update own notifications" ON notifications
   FOR UPDATE USING (auth.uid() = user_id);
 
 -- Wallet Transactions: Users can view their own transactions
-DROP POLICY IF EXISTS "Users can view own wallet transactions" ON wallet_transactions;
 CREATE POLICY "Users can view own wallet transactions" ON wallet_transactions
   FOR SELECT USING (auth.uid() = user_id);
-
--- Payments: Customers can view their own payments
-DROP POLICY IF EXISTS "Customers can view own payments" ON payments;
-CREATE POLICY "Customers can view own payments" ON payments
-  FOR SELECT USING (auth.uid() = customer_id);
-
--- Order status history: readable with order (no direct policy; use service role or join via orders)
--- order_status_history is typically read via orders; service/backend can join as needed.
 
 -- ============================================
 -- COMMENTS FOR DOCUMENTATION
