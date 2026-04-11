@@ -1,7 +1,8 @@
 import 'dotenv/config.js';
 import express from 'express';
 import cors from 'cors';
-import { sendOtpToPhone, sendSignUpOtp, verifyPhoneOtp, loginWithPassword, checkPhoneRegistered, deleteUserById } from './authService.js';
+import { loginWithPassword, checkPhoneRegistered, deleteUserById } from './authService.js';
+import { verifyFirebaseToken } from './firebaseAdmin.js';
 import {
   ensureUserProfile,
   getProfile,
@@ -13,7 +14,7 @@ import {
 import { getOrdersForUser, getWalletTransactionsForUser, getPaymentsForUser, getFullUserMe, getMerchantDashboardStats } from './historyService.js';
 import { createPesepayTransaction, handlePesepayCallback } from './paymentService.js';
 import { buildPhoneForPesepayCustomer, resolvePesepayPaymentMethodCode } from './pesepayMethodMap.js';
-import { verifyAccessToken } from './sessionToken.js';
+import { createSupabaseAccessToken, verifyAccessToken } from './sessionToken.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import {
   upsertCourierProfile,
@@ -50,6 +51,7 @@ import {
 } from './orderNotifications.js';
 import { recordCourierDeliveryEarnings } from './orderPaymentSplit.js';
 import crypto from 'crypto';
+import { verifyFirebaseToken } from './firebaseAdmin.js';
 
 const app = express();
 const supabase = supabaseAdmin;
@@ -130,6 +132,62 @@ function requireAuth(req, res, next) {
   req.userId = payload.sub;
   next();
 }
+
+// POST /auth/firebase-verify { idToken, phone, name, role, password }
+app.post('/auth/firebase-verify', async (req, res) => {
+  try {
+    const { idToken, phone, name, role, password } = req.body;
+
+    if (!idToken || !role) {
+      return res.status(400).json({ error: 'idToken and role are required' });
+    }
+
+    const validRoles = ['customer', 'merchant', 'courier'];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({ error: 'Invalid role' });
+    }
+
+    // Verify the Firebase ID token — throws if invalid/expired
+    const decoded = await verifyFirebaseToken(idToken);
+    const firebaseUid = decoded.uid;
+    const verifiedPhone = decoded.phone_number || phone;
+
+    // Create profile in Supabase DB (upsert — safe to call multiple times)
+    await ensureUserProfile({
+      userId: firebaseUid,
+      email: null,
+      phone: verifiedPhone,
+      fullName: name || '',
+      role,
+      password: password || null,
+    });
+
+    // Issue a custom JWT the rest of the app uses as Bearer token
+    const accessToken = createSupabaseAccessToken({
+      userId: firebaseUid,
+      phone: verifiedPhone,
+      sessionId: crypto.randomUUID(),
+      supabaseUrl: process.env.SUPABASE_URL,
+      jwtSecret: process.env.SUPABASE_JWT_SECRET,
+    });
+
+    return res.json({
+      success: true,
+      accessToken,
+      user: {
+        id: firebaseUid,
+        phone: verifiedPhone,
+        role,
+      },
+    });
+  } catch (error) {
+    console.error('firebase-verify error:', error);
+    return res.status(401).json({
+      error: 'Verification failed',
+      details: error.message || 'Invalid or expired token',
+    });
+  }
+});
 
 /** Admin middleware: require x-admin-key or Authorization Bearer matching ADMIN_API_KEY */
 function requireAdmin(req, res, next) {
@@ -2103,118 +2161,58 @@ app.post('/auth/check-phone', async (req, res) => {
   }
 });
 
-// POST /auth/send-otp { phone, isSignUp?, password? }
-app.post('/auth/send-otp', async (req, res) => {
+// POST /auth/firebase-verify { idToken, phone, name, role, password }
+app.post('/auth/firebase-verify', async (req, res) => {
   try {
-    const { phone, isSignUp = false, password } = req.body;
+    const { idToken, phone, name, role, password } = req.body;
 
-    if (!phone) {
-      return res.status(400).json({
-        error: 'Phone number is required',
-        details: 'Please provide a phone number in E.164 format (e.g., +263712345678)'
-      });
+    if (!idToken || !role) {
+      return res.status(400).json({ error: 'idToken and role are required' });
     }
 
-    if (!phone.startsWith('+') || phone.length < 10) {
-      return res.status(400).json({
-        error: 'Invalid phone number format',
-        details: 'Phone number must be in E.164 format (e.g., +263712345678)'
-      });
+    const validRoles = ['customer', 'merchant', 'courier'];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({ error: 'Invalid role' });
     }
 
-    if (isSignUp) {
-      if (!password || password.length < 6) {
-        return res.status(400).json({
-          error: 'Password required',
-          details: 'Password must be at least 6 characters'
-        });
-      }
-      await sendSignUpOtp({ phone, password });
-    } else {
-      await sendOtpToPhone(phone);
-    }
+    // Verify the Firebase ID token — throws if invalid or expired
+    const decoded = await verifyFirebaseToken(idToken);
+    const firebaseUid = decoded.uid;
+    const verifiedPhone = decoded.phone_number || phone;
+
+    // Create profile in Supabase DB (upsert — safe to call multiple times)
+    await ensureUserProfile({
+      userId: firebaseUid,
+      email: null,
+      phone: verifiedPhone,
+      fullName: name || '',
+      role,
+      password: password || null,
+    });
+
+    // Issue a custom JWT the rest of the app uses as Bearer token
+    const accessToken = createSupabaseAccessToken({
+      userId: firebaseUid,
+      phone: verifiedPhone,
+      sessionId: crypto.randomUUID(),
+      supabaseUrl: process.env.SUPABASE_URL,
+      jwtSecret: process.env.SUPABASE_JWT_SECRET,
+    });
 
     return res.json({
       success: true,
-      message: 'Verification code sent successfully',
-      phone
-    });
-  } catch (error) {
-    console.error('send-otp error:', error);
-    return res.status(500).json({
-      error: 'Failed to send verification code',
-      details: error.message || 'Please try again later'
-    });
-  }
-});
-
-// POST /auth/verify-otp { phone, token, isSignUp?, password?, confirmPassword?, name?, role? }
-app.post('/auth/verify-otp', async (req, res) => {
-  try {
-    const { phone, token, isSignUp = false, password, confirmPassword, name, role } = req.body;
-    console.log('[Auth] /auth/verify-otp called for phone:', phone, '| isSignUp:', isSignUp);
-    if (!phone || !token) {
-      return res.status(400).json({
-        error: 'Missing required fields',
-        details: 'Both phone number and verification code are required'
-      });
-    }
-
-    if (token.length !== 6 || !/^\d+$/.test(token)) {
-      return res.status(400).json({
-        error: 'Invalid verification code',
-        details: 'Verification code must be 6 digits'
-      });
-    }
-
-    const data = await verifyPhoneOtp({ phone, token, isSignUp, password, confirmPassword });
-
-    // After OTP is verified, create the user profile and role-specific row in the DB
-    if (isSignUp && data.user?.id && role) {
-      await ensureUserProfile({
-        userId: data.user.id,
-        email: null,
-        phone: data.user.phone ?? phone,
-        fullName: name || '',
+      accessToken,
+      user: {
+        id: firebaseUid,
+        phone: verifiedPhone,
         role,
-        password: password || null,
-      });
-    }
-
-    return res.json({
-      success: true,
-      user: data.user,
-      session: data.session
+      },
     });
   } catch (error) {
-    console.error('verify-otp error:', error);
-
-    const msg = error.message || '';
-
-    // Account conflict errors (sign-up with existing phone, sign-in with unknown phone)
-    if (
-      msg.includes('already exists') ||
-      msg.includes('sign in instead') ||
-      msg.includes('sign up first') ||
-      msg.includes('No account found')
-    ) {
-      return res.status(409).json({
-        error: msg,
-        details: msg,
-      });
-    }
-
-    // Bad OTP code / expired
-    if (msg.includes('Invalid verification') || msg.includes('expired')) {
-      return res.status(400).json({
-        error: msg,
-        details: 'Please request a new verification code',
-      });
-    }
-
-    return res.status(500).json({
-      error: 'Failed to verify code',
-      details: 'Please try again',
+    console.error('firebase-verify error:', error);
+    return res.status(401).json({
+      error: 'Verification failed',
+      details: error.message || 'Invalid or expired token',
     });
   }
 });
