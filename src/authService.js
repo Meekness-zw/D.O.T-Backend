@@ -12,7 +12,22 @@ function generateOtp() {
 }
 
 async function sendSmsDexatel(phone, message) {
+  if (!DEXATEL_API_KEY || !DEXATEL_SENDER) {
+    throw new Error('Dexatel API not configured. Check DEXATEL_API_KEY and DEXATEL_SENDER in .env');
+  }
+  
   const url = 'https://api.dexatel.com/v1/messages';
+  
+  const phoneNumber = phone.startsWith('+') ? phone.substring(1) : phone;
+  
+  const payload = {
+    channel: 'SMS',
+    from: DEXATEL_SENDER,
+    to: phoneNumber,
+    text: message
+  };
+  
+  console.log('Dexatel request:', JSON.stringify(payload));
   
   const response = await fetch(url, {
     method: 'POST',
@@ -20,12 +35,7 @@ async function sendSmsDexatel(phone, message) {
       'Content-Type': 'application/json',
       'X-Dexatel-Key': DEXATEL_API_KEY
     },
-    body: JSON.stringify({
-      channel: 'SMS',
-      from: DEXATEL_SENDER,
-      to: phone,
-      text: message
-    })
+    body: JSON.stringify(payload)
   });
   
   if (!response.ok) {
