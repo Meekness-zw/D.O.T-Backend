@@ -1,7 +1,7 @@
 import 'dotenv/config.js';
 import express from 'express';
 import cors from 'cors';
-import { sendOtpToPhone, verifyPhoneOtp, loginWithPassword, checkPhoneRegistered, deleteUserById } from './authService.js';
+import { sendOtpToPhone, sendSignUpOtp, verifyPhoneOtp, loginWithPassword, checkPhoneRegistered, deleteUserById } from './authService.js';
 import {
   ensureUserProfile,
   getProfile,
@@ -2103,10 +2103,10 @@ app.post('/auth/check-phone', async (req, res) => {
   }
 });
 
-// POST /auth/send-otp { phone }
+// POST /auth/send-otp { phone, isSignUp?, password? }
 app.post('/auth/send-otp', async (req, res) => {
   try {
-    const { phone } = req.body;
+    const { phone, isSignUp = false, password } = req.body;
 
     if (!phone) {
       return res.status(400).json({
@@ -2115,7 +2115,6 @@ app.post('/auth/send-otp', async (req, res) => {
       });
     }
 
-    // Basic phone validation
     if (!phone.startsWith('+') || phone.length < 10) {
       return res.status(400).json({
         error: 'Invalid phone number format',
@@ -2123,11 +2122,22 @@ app.post('/auth/send-otp', async (req, res) => {
       });
     }
 
-    await sendOtpToPhone(phone);
+    if (isSignUp) {
+      if (!password || password.length < 6) {
+        return res.status(400).json({
+          error: 'Password required',
+          details: 'Password must be at least 6 characters'
+        });
+      }
+      await sendSignUpOtp({ phone, password });
+    } else {
+      await sendOtpToPhone(phone);
+    }
+
     return res.json({
       success: true,
       message: 'Verification code sent successfully',
-      phone: phone
+      phone
     });
   } catch (error) {
     console.error('send-otp error:', error);
@@ -2138,10 +2148,10 @@ app.post('/auth/send-otp', async (req, res) => {
   }
 });
 
-// POST /auth/verify-otp { phone, token }
+// POST /auth/verify-otp { phone, token, isSignUp?, password?, confirmPassword?, name?, role? }
 app.post('/auth/verify-otp', async (req, res) => {
   try {
-    const { phone, token, isSignUp = false, password, confirmPassword } = req.body;
+    const { phone, token, isSignUp = false, password, confirmPassword, name, role } = req.body;
     console.log('[Auth] /auth/verify-otp called for phone:', phone, '| isSignUp:', isSignUp);
     if (!phone || !token) {
       return res.status(400).json({
@@ -2158,6 +2168,18 @@ app.post('/auth/verify-otp', async (req, res) => {
     }
 
     const data = await verifyPhoneOtp({ phone, token, isSignUp, password, confirmPassword });
+
+    // After OTP is verified, create the user profile and role-specific row in the DB
+    if (isSignUp && data.user?.id && role) {
+      await ensureUserProfile({
+        userId: data.user.id,
+        email: null,
+        phone: data.user.phone ?? phone,
+        fullName: name || '',
+        role,
+        password: password || null,
+      });
+    }
 
     return res.json({
       success: true,

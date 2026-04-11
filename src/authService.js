@@ -5,12 +5,10 @@ import crypto from 'crypto';
 
 export async function sendOtpToPhone(phone) {
   console.log('[sendOtpToPhone] Sending OTP to:', phone);
-  
+
   const { data, error } = await supabase.auth.signInWithOtp({
     phone,
-    options: {
-      channel: 'sms'
-    }
+    options: { channel: 'sms' }
   });
 
   console.log('[sendOtpToPhone] Response:', { data, error });
@@ -19,30 +17,36 @@ export async function sendOtpToPhone(phone) {
   return { message: 'OTP sent successfully' };
 }
 
+/**
+ * Sign-up path: create the user with their password and send the OTP in one step.
+ * Using signUp (not signInWithOtp) means the password is set at creation time, so
+ * verifyOtp later just confirms the code and returns a session — no admin update needed.
+ */
+export async function sendSignUpOtp({ phone, password }) {
+  console.log('[sendSignUpOtp] Registering and sending OTP to:', phone);
+
+  const { data, error } = await supabase.auth.signUp({
+    phone,
+    password,
+    options: { channel: 'sms' }
+  });
+
+  console.log('[sendSignUpOtp] Response:', { data, error });
+
+  if (error) throw error;
+  return { message: 'OTP sent successfully' };
+}
+
 export async function verifyPhoneOtp({ phone, token, isSignUp = false, password, confirmPassword }) {
   if (isSignUp) {
-    if (!password) {
-      throw new Error('Password required for sign up');
-    }
-    if (password.length < 6) {
-      throw new Error('Password must be at least 6 characters');
-    }
-    if (password !== confirmPassword) {
-      throw new Error('Passwords do not match');
-    }
-
-    const { data, error } = await supabase.auth.signUp({
-      phone,
-      password,
-      options: {
-        channel: 'sms'
-      }
-    });
-    
-    if (error) throw error;
-    return { user: data.user, session: data.session };
+    if (!password) throw new Error('Password required for sign up');
+    if (password.length < 6) throw new Error('Password must be at least 6 characters');
+    if (password !== confirmPassword) throw new Error('Passwords do not match');
   }
-  
+
+  // For both sign-up and sign-in: verify the OTP and get a session.
+  // For sign-up the user was already created (with password) during send-otp via signUp(),
+  // so no admin password update is needed and the session returned here is valid.
   const { data, error } = await supabase.auth.verifyOtp({
     phone,
     token,
@@ -50,7 +54,7 @@ export async function verifyPhoneOtp({ phone, token, isSignUp = false, password,
   });
 
   if (error) throw error;
-  return { user: data.user };
+  return { user: data.user, session: data.session };
 }
 
 /**
