@@ -2,79 +2,27 @@ import { supabase } from './supabaseClient.js';
 import 'dotenv/config.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 
-const DEXATEL_API_KEY = process.env.DEXATEL_API_KEY;
-const DEXATEL_SENDER = process.env.DEXATEL_SENDER;
-
-const otpStore = new Map();
-
-function generateOtp() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
-
-async function sendSmsDexatel(phone, message) {
-  if (!DEXATEL_API_KEY || !DEXATEL_SENDER) {
-    throw new Error('Dexatel API not configured. Check DEXATEL_API_KEY and DEXATEL_SENDER in .env');
-  }
-  
-  const url = 'https://api.dexatel.com/v1/messages';
-  
-  const phoneNumber = phone.startsWith('+') ? phone.substring(1) : phone;
-  
-  const payload = {
-    messages: [{
-      channel: 'SMS',
-      from: DEXATEL_SENDER,
-      to: phoneNumber,
-      text: message
-    }]
-  };
-  
-  console.log('Dexatel request:', JSON.stringify(payload));
-  
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Dexatel-Key': DEXATEL_API_KEY
-    },
-    body: JSON.stringify(payload)
-  });
-  
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Dexatel SMS failed: ${errorText}`);
-  }
-  
-  return response.json();
-}
-
 export async function sendOtpToPhone(phone) {
-  const otp = generateOtp();
-  otpStore.set(phone, { otp, expires: Date.now() + 5 * 60 * 1000 });
-  
-  await sendSmsDexatel(phone, `Your OTP is: ${otp}`);
+  const { data, error } = await supabase.auth.signInWithOtp({
+    phone,
+    options: {
+      channel: 'sms'
+    }
+  });
+
+  if (error) throw error;
   return { message: 'OTP sent successfully' };
 }
 
 export async function verifyPhoneOtp({ phone, token }) {
-  const stored = otpStore.get(phone);
-  
-  if (!stored) {
-    throw new Error('No OTP requested for this phone');
-  }
-  
-  if (Date.now() > stored.expires) {
-    otpStore.delete(phone);
-    throw new Error('OTP expired');
-  }
-  
-  if (stored.otp !== token) {
-    throw new Error('Invalid OTP');
-  }
-  
-  otpStore.delete(phone);
-  
-  return { user: { phone } };
+  const { data, error } = await supabase.auth.verifyOtp({
+    phone,
+    token,
+    type: 'sms'
+  });
+
+  if (error) throw error;
+  return { user: data.user };
 }
 
 /**
@@ -155,4 +103,3 @@ export async function deleteUserById(userId) {
   const { error } = await supabaseAdmin.auth.admin.deleteUser(userId);
   if (error) throw error;
 }
-
