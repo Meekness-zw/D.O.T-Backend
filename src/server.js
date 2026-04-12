@@ -137,8 +137,8 @@ app.post('/auth/firebase-verify', async (req, res) => {
   try {
     const { idToken, phone, name, role, password } = req.body;
 
-    if (!idToken || !role) {
-      return res.status(400).json({ error: 'idToken and role are required' });
+    if (!idToken || !role || !password) {
+      return res.status(400).json({ error: 'idToken, role, and password are required' });
     }
 
     const validRoles = ['customer', 'merchant', 'courier'];
@@ -146,38 +146,44 @@ app.post('/auth/firebase-verify', async (req, res) => {
       return res.status(400).json({ error: 'Invalid role' });
     }
 
-    // Verify the Firebase ID token — throws if invalid/expired
+    // 1. Verify the Firebase ID token — confirms the phone number is real
     const decoded = await verifyFirebaseToken(idToken);
-    const firebaseUid = decoded.uid;
     const verifiedPhone = decoded.phone_number || phone;
 
-    // Create profile in Supabase DB (upsert — safe to call multiple times)
+    // 2. Check if this phone already has a Supabase account
+    const existing = await checkPhoneRegistered(verifiedPhone);
+
+    let userId;
+    if (existing.registered) {
+      userId = existing.userId;
+    } else {
+      // 3. Create the user in Supabase Auth so login-password works
+      const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+        phone: verifiedPhone,
+        password,
+        phone_confirm: true,
+      });
+      if (authError) throw authError;
+      userId = authData.user.id;
+    }
+
+    // 4. Create/update rows in user_profiles + role table
     await ensureUserProfile({
-      userId: firebaseUid,
+      userId,
       email: null,
       phone: verifiedPhone,
       fullName: name || '',
       role,
-      password: password || null,
+      password,
     });
 
-    // Issue a custom JWT the rest of the app uses as Bearer token
-    const accessToken = createSupabaseAccessToken({
-      userId: firebaseUid,
-      phone: verifiedPhone,
-      sessionId: crypto.randomUUID(),
-      supabaseUrl: process.env.SUPABASE_URL,
-      jwtSecret: process.env.SUPABASE_JWT_SECRET,
-    });
+    // 5. Sign in to get a live Supabase session
+    const sessionData = await loginWithPassword({ phone: verifiedPhone, password });
 
-    return res.json({
+    return res.status(201).json({
       success: true,
-      accessToken,
-      user: {
-        id: firebaseUid,
-        phone: verifiedPhone,
-        role,
-      },
+      user: { ...sessionData.user, role },
+      session: sessionData.session,
     });
   } catch (error) {
     console.error('firebase-verify error:', error);
@@ -2160,13 +2166,13 @@ app.post('/auth/check-phone', async (req, res) => {
   }
 });
 
-// POST /auth/firebase-verify { idToken, phone, name, role, password }
-app.post('/auth/firebase-verify', async (req, res) => {
+// POST /auth/register { phone, password, name, role }
+app.post('/auth/register', async (req, res) => {
   try {
-    const { idToken, phone, name, role, password } = req.body;
+    const { phone, password, name, role } = req.body;
 
-    if (!idToken || !role) {
-      return res.status(400).json({ error: 'idToken and role are required' });
+    if (!phone || !password || !role) {
+      return res.status(400).json({ error: 'Phone, password, and role are required' });
     }
 
     const validRoles = ['customer', 'merchant', 'courier'];
@@ -2174,44 +2180,53 @@ app.post('/auth/firebase-verify', async (req, res) => {
       return res.status(400).json({ error: 'Invalid role' });
     }
 
-    // Verify the Firebase ID token — throws if invalid or expired
-    const decoded = await verifyFirebaseToken(idToken);
-    const firebaseUid = decoded.uid;
-    const verifiedPhone = decoded.phone_number || phone;
+    if (!phone.startsWith('+') || phone.length < 10) {
+      return res.status(400).json({ error: 'Invalid phone number format. Use E.164 format (e.g. +263712345678)' });
+    }
 
-    // Create profile in Supabase DB (upsert — safe to call multiple times)
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    // Reject duplicate phone numbers
+    const existing = await checkPhoneRegistered(phone);
+    if (existing.registered) {
+      return res.status(409).json({ error: 'An account with this phone number already exists' });
+    }
+
+    // Create user in Supabase Auth (phone_confirm skips OTP requirement)
+    const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+      phone,
+      password,
+      phone_confirm: true,
+    });
+    if (authError) throw authError;
+
+    const userId = authData.user.id;
+
+    // Create rows in user_profiles + role-specific table
     await ensureUserProfile({
-      userId: firebaseUid,
+      userId,
       email: null,
-      phone: verifiedPhone,
+      phone,
       fullName: name || '',
       role,
-      password: password || null,
+      password,
     });
 
-    // Issue a custom JWT the rest of the app uses as Bearer token
-    const accessToken = createSupabaseAccessToken({
-      userId: firebaseUid,
-      phone: verifiedPhone,
-      sessionId: crypto.randomUUID(),
-      supabaseUrl: process.env.SUPABASE_URL,
-      jwtSecret: process.env.SUPABASE_JWT_SECRET,
-    });
+    // Sign in to return a live session
+    const sessionData = await loginWithPassword({ phone, password });
 
-    return res.json({
+    return res.status(201).json({
       success: true,
-      accessToken,
-      user: {
-        id: firebaseUid,
-        phone: verifiedPhone,
-        role,
-      },
+      user: { ...sessionData.user, role },
+      session: sessionData.session,
     });
   } catch (error) {
-    console.error('firebase-verify error:', error);
-    return res.status(401).json({
-      error: 'Verification failed',
-      details: error.message || 'Invalid or expired token',
+    console.error('register error:', error);
+    return res.status(500).json({
+      error: 'Registration failed',
+      details: error.message || 'Please try again',
     });
   }
 });
