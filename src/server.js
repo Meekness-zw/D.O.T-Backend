@@ -51,7 +51,6 @@ import {
 } from './orderNotifications.js';
 import { recordCourierDeliveryEarnings } from './orderPaymentSplit.js';
 import crypto from 'crypto';
-import { verifyFirebaseToken } from './firebaseAdmin.js';
 
 const app = express();
 const supabase = supabaseAdmin;
