@@ -36,6 +36,8 @@ import {
   getAdminPendingUsers,
   approveCourier,
   approveMerchant,
+  rejectCourier,
+  rejectMerchant,
   getAdminCourierDetail,
   getAdminMerchantDetail,
 } from './adminService.js';
@@ -5691,6 +5693,32 @@ app.post('/admin/merchants/:id/approve', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('admin/merchants/:id/approve error:', error);
     return res.status(500).json({ error: 'Failed to approve merchant', details: error.message || 'Try again later' });
+  }
+});
+
+// Reject a merchant by ID
+app.post('/admin/merchants/:id/reject', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body || {};
+    const merchant = await rejectMerchant(id, reason);
+    return res.json({ merchant });
+  } catch (error) {
+    console.error('admin/merchants/:id/reject error:', error);
+    return res.status(500).json({ error: 'Failed to reject merchant', details: error.message || 'Try again later' });
+  }
+});
+
+// Reject a courier by ID
+app.post('/admin/couriers/:id/reject', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body || {};
+    const courier = await rejectCourier(id, reason);
+    return res.json({ courier });
+  } catch (error) {
+    console.error('admin/couriers/:id/reject error:', error);
+    return res.status(500).json({ error: 'Failed to reject courier', details: error.message || 'Try again later' });
   }
 });
 

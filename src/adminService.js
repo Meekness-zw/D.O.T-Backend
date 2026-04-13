@@ -405,20 +405,22 @@ export async function getAdminPendingUsers() {
         user_profiles ( full_name, email, phone )
       `,
       )
-      .or('is_verified.eq.false,verification_status.neq.approved'),
+      .neq('verification_status', 'approved'),
     supabase
       .from('merchants')
       .select(
         `
         id,
         business_name,
+        business_type,
         is_verified,
         is_active,
+        approval_status,
         created_at,
         user_profiles ( full_name, email, phone )
       `,
       )
-      .or('is_verified.eq.false,is_active.eq.false'),
+      .or('is_verified.eq.false,is_active.eq.false,approval_status.neq.approved'),
   ]);
 
   if (couriersRes.error) {
@@ -445,6 +447,7 @@ export async function approveCourier(courierId) {
     .select(
       `
       id,
+      full_name,
       is_verified,
       verification_status,
       user_profiles ( full_name, email, phone )
@@ -465,20 +468,22 @@ export async function approveCourier(courierId) {
   return courier;
 }
 
-// Approve a merchant: mark verified & active
+// Approve a merchant: mark verified & active & approved
 export async function approveMerchant(merchantId) {
   if (!supabase) throw new Error('Server not configured');
 
   const { data: merchant, error } = await supabase
     .from('merchants')
-    .update({ is_verified: true, is_active: true })
+    .update({ is_verified: true, is_active: true, approval_status: 'approved', approved_at: new Date().toISOString() })
     .eq('id', merchantId)
     .select(
       `
       id,
       business_name,
+      business_type,
       is_verified,
       is_active,
+      approval_status,
       user_profiles ( full_name, email, phone )
     `,
     )
@@ -488,6 +493,55 @@ export async function approveMerchant(merchantId) {
   if (!merchant) throw new Error('Merchant not found');
 
   return merchant;
+}
+
+// Reject a merchant
+export async function rejectMerchant(merchantId, reason) {
+  if (!supabase) throw new Error('Server not configured');
+
+  const { data: merchant, error } = await supabase
+    .from('merchants')
+    .update({ approval_status: 'rejected', rejected_reason: reason || null })
+    .eq('id', merchantId)
+    .select(
+      `
+      id,
+      business_name,
+      business_type,
+      approval_status,
+      rejected_reason,
+      user_profiles ( full_name, email, phone )
+    `,
+    )
+    .maybeSingle();
+
+  if (error) throw new Error(error.message || 'Failed to reject merchant');
+  if (!merchant) throw new Error('Merchant not found');
+
+  return merchant;
+}
+
+// Reject a courier
+export async function rejectCourier(courierId, reason) {
+  if (!supabase) throw new Error('Server not configured');
+
+  const { data: courier, error } = await supabase
+    .from('couriers')
+    .update({ verification_status: 'rejected' })
+    .eq('id', courierId)
+    .select(
+      `
+      id,
+      verification_status,
+      user_profiles ( full_name, email, phone )
+    `,
+    )
+    .maybeSingle();
+
+  if (error) throw new Error(error.message || 'Failed to reject courier');
+  if (!courier) throw new Error('Courier not found');
+
+  return courier;
 }
 
 // Detailed view for a specific courier (for admin "Approve Users" modal)
