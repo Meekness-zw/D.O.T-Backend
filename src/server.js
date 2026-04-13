@@ -121,16 +121,23 @@ app.use(cors({
 
 app.use(express.json({ limit: '20mb' }));
 
-/** Auth middleware: require Bearer token, set req.userId from JWT sub */
-function requireAuth(req, res, next) {
+/** Auth middleware: verify Bearer token via Supabase, set req.userId */
+async function requireAuth(req, res, next) {
   const auth = req.headers.authorization;
   const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
-  const payload = token ? verifyAccessToken(token, process.env.SUPABASE_JWT_SECRET) : null;
-  if (!payload?.sub) {
+  if (!token) {
     return res.status(401).json({ error: 'Unauthorized', details: 'Valid access token required' });
   }
-  req.userId = payload.sub;
-  next();
+  try {
+    const { data, error } = await supabaseAdmin.auth.getUser(token);
+    if (error || !data?.user?.id) {
+      return res.status(401).json({ error: 'Unauthorized', details: 'Invalid or expired token' });
+    }
+    req.userId = data.user.id;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Unauthorized', details: err.message });
+  }
 }
 
 // POST /auth/firebase-verify { idToken, phone, name, role, password }
