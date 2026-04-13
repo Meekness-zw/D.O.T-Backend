@@ -51,6 +51,7 @@ import {
 } from './orderNotifications.js';
 import { recordCourierDeliveryEarnings } from './orderPaymentSplit.js';
 import crypto from 'crypto';
+import axios from 'axios';
 
 const app = express();
 const supabase = supabaseAdmin;
@@ -219,30 +220,22 @@ app.post('/auth/send-otp', async (req, res) => {
       return res.status(503).json({ error: 'OTP service not configured' });
     }
 
-    const smsRes = await fetch('https://api.dexatel.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Auth-Token': dexatelApiKey,
-      },
-      body: JSON.stringify({
-        data: {
-          from: dexatelSender,
-          to: [phone],
-          text: `Your Delivery On Time verification code is: ${code}`,
-        },
-      }),
-    });
-
-    if (!smsRes.ok) {
-      const errBody = await smsRes.text();
-      console.error('Dexatel error:', errBody);
-      return res.status(502).json({ error: 'Failed to send verification code', details: errBody });
+    try {
+      await axios.post(
+        'https://api.dexatel.com/v1/messages',
+        { data: { from: dexatelSender, to: [phone], text: `Your Delivery On Time verification code is: ${code}` } },
+        { headers: { 'Content-Type': 'application/json', 'X-Auth-Token': dexatelApiKey } }
+      );
+    } catch (smsErr) {
+      const status = smsErr.response?.status;
+      const detail = JSON.stringify(smsErr.response?.data ?? smsErr.message);
+      console.error(`Dexatel error [${status}]:`, detail);
+      return res.status(502).json({ error: 'Failed to send verification code', details: detail });
     }
 
     return res.status(200).json({ success: true });
   } catch (error) {
-    console.error('send-otp error:', error);
+    console.error('send-otp error:', error.message);
     return res.status(500).json({ error: 'Failed to send OTP', details: error.message });
   }
 });
