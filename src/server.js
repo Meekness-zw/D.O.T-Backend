@@ -273,8 +273,22 @@ app.post('/auth/verify-otp', async (req, res) => {
         password,
         phone_confirm: true,
       });
-      if (authError) throw authError;
-      userId = authData.user.id;
+      if (authError) {
+        if (authError.code === 'phone_exists') {
+          // Phone exists in auth.users but not in user_profiles (e.g. prior failed attempt)
+          const { data: listData, error: listError } = await supabaseAdmin.auth.admin.listUsers();
+          if (listError) throw listError;
+          const match = listData.users.find(u => u.phone === phone);
+          if (!match) throw new Error('Phone already registered but user not found. Please contact support.');
+          userId = match.id;
+          // Update their password to the one they just registered with
+          await supabaseAdmin.auth.admin.updateUserById(userId, { password });
+        } else {
+          throw authError;
+        }
+      } else {
+        userId = authData.user.id;
+      }
     }
 
     await ensureUserProfile({ userId, email: null, phone, fullName: name || '', role, password });
