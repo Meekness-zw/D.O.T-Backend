@@ -1,3 +1,6 @@
+-- Migration: Create business_types table for dynamic business categories
+-- Run this in Supabase SQL Editor or via Supabase CLI: supabase db push
+
 -- Create business_types table for dynamic business categories
 CREATE TABLE IF NOT EXISTS business_types (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
