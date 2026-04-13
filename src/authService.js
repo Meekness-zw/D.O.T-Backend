@@ -10,12 +10,16 @@ export async function loginWithPassword({ phone, password }) {
 
   const { data: profile, error: profileError } = await supabaseAdmin
     .from('user_profiles')
-    .select('id, password_hash')
+    .select('id, password_hash, is_suspended')
     .eq('phone', phone)
     .single();
 
   if (profileError || !profile) {
     throw new Error('No account found with this phone number');
+  }
+
+  if (profile.is_suspended) {
+    throw new Error('Your account has been suspended. Please contact support.');
   }
 
   const inputHash = crypto.createHash('sha256').update(password).digest('hex');

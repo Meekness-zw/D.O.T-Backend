@@ -274,6 +274,14 @@ app.post('/auth/verify-otp', async (req, res) => {
     let userId;
     if (existing.registered) {
       userId = existing.userId;
+      const { data: profile } = await supabaseAdmin
+        .from('user_profiles')
+        .select('is_suspended')
+        .eq('id', userId)
+        .single();
+      if (profile?.is_suspended) {
+        return res.status(403).json({ error: 'Your account has been suspended. Please contact support.' });
+      }
     } else {
       const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
         phone,
@@ -4182,7 +4190,7 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
     // Merchant core row must exist and be active
     const { data: merchant, error: merchantError } = await supabase
       .from('merchants')
-      .select('id, business_name, business_type, is_active')
+      .select('id, business_name, business_type, is_active, approval_status')
       .eq('id', req.userId)
       .maybeSingle();
 
@@ -4192,6 +4200,8 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
     }
 
     const isMerchant = !!merchant && merchant.is_active !== false;
+    const approvalStatus = merchant?.approval_status || 'pending';
+    const isApproved = approvalStatus === 'approved';
 
     // At least one active store with required address/geo fields
     let hasStore = false;
@@ -4244,6 +4254,8 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
       hasStore,
       hasRequiredDocuments,
       onboardingComplete,
+      approvalStatus,
+      isApproved,
     });
   } catch (error) {
     console.error('get /merchant/onboarding-status error:', error);
@@ -4316,6 +4328,7 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
     const verificationStatus = courier?.verification_status || 'pending';
     const onboardingComplete =
       hasProfile && hasVehicle && hasDriverLicense && hasPayoutMethod;
+    const isApproved = verificationStatus === 'approved';
 
     return res.json({
       hasProfile,
@@ -4324,6 +4337,7 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
       hasPayoutMethod,
       verificationStatus,
       onboardingComplete,
+      isApproved,
     });
   } catch (error) {
     console.error('get /courier/onboarding-status error:', error);
