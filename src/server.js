@@ -224,7 +224,7 @@ app.post('/auth/send-otp', async (req, res) => {
       await axios.post(
         'https://api.dexatel.com/v1/messages',
         { data: { from: dexatelSender, to: [phone], text: `Your Delivery On Time verification code is: ${code}` } },
-        { headers: { 'Content-Type': 'application/json', 'X-Auth-Token': dexatelApiKey } }
+        { headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${dexatelApiKey}` } }
       );
     } catch (smsErr) {
       const status = smsErr.response?.status;
