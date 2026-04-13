@@ -220,12 +220,11 @@ app.post('/auth/send-otp', async (req, res) => {
       return res.status(503).json({ error: 'OTP service not configured' });
     }
 
-    console.log('Dexatel key prefix:', dexatelApiKey?.slice(0, 8), '| sender:', dexatelSender);
     try {
       await axios.post(
         'https://api.dexatel.com/v1/messages',
-        { data: { from: dexatelSender, to: [phone], text: `Your Delivery On Time verification code is: ${code}` } },
-        { headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${dexatelApiKey}` } }
+        { from: dexatelSender, to: [phone], text: `Your Delivery On Time verification code is: ${code}`, channel: 'sms' },
+        { headers: { 'Content-Type': 'application/json', 'X-Dexatel-Key': dexatelApiKey } }
       );
     } catch (smsErr) {
       const status = smsErr.response?.status;
