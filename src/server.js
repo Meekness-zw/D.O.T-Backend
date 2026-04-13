@@ -12,8 +12,7 @@ import {
   recordCourierProfilePhotoDocument,
 } from './userService.js';
 import { getOrdersForUser, getWalletTransactionsForUser, getPaymentsForUser, getFullUserMe, getMerchantDashboardStats } from './historyService.js';
-import { createPesepayTransaction, handlePesepayCallback } from './paymentService.js';
-import { buildPhoneForPesepayCustomer, resolvePesepayPaymentMethodCode } from './pesepayMethodMap.js';
+import { initiateContipayPayment, handleContipayCallback } from './contipayService.js';
 import { createSupabaseAccessToken, verifyAccessToken } from './sessionToken.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import {
@@ -2552,7 +2551,7 @@ app.patch('/orders/:id', requireAuth, async (req, res) => {
     }
     if (
       !isCancelling &&
-      order.payment_method === 'pesepay' &&
+      order.payment_method === 'contipay' &&
       order.payment_status !== 'paid'
     ) {
       return res.status(400).json({
@@ -2642,7 +2641,7 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
       });
     }
 
-    if (order.payment_status === 'paid' && order.payment_method === 'pesepay') {
+    if (order.payment_status === 'paid' && order.payment_method === 'contipay') {
       return res.status(400).json({
         error: 'Cannot cancel in the app',
         details:
@@ -3904,10 +3903,10 @@ app.post('/orders', requireAuth, async (req, res) => {
       });
     }
 
-    if (!['cash', 'wallet', 'pesepay'].includes(payment_method)) {
+    if (!['cash', 'wallet', 'contipay'].includes(payment_method)) {
       return res.status(400).json({
         error: 'Invalid payment_method',
-        details: 'payment_method must be cash, wallet, or pesepay',
+        details: 'payment_method must be cash, wallet, or contipay',
       });
     }
 
@@ -4023,7 +4022,7 @@ app.post('/orders', requireAuth, async (req, res) => {
     let paymentStatus = 'pending';
     let orderStatus = 'pending';
 
-    if (payment_method === 'pesepay') {
+    if (payment_method === 'contipay') {
       orderStatus = 'awaiting_payment';
       paymentStatus = 'pending';
     } else if (payment_method === 'wallet') {
@@ -4343,6 +4342,103 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
     console.error('get /courier/onboarding-status error:', error);
     return res.status(500).json({
       error: 'Failed to load courier onboarding status',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// GET /business-types — get all business types (for business type selection)
+app.get('/business-types', async (req, res) => {
+  try {
+    if (!supabasePublic) throw new Error('Server not configured');
+
+    const { data, error } = await supabasePublic
+      .from('business_types')
+      .select('id, name, icon, is_custom')
+      .order('is_custom', { ascending: true })
+      .order('name', { ascending: true });
+
+    if (error) throw new Error(error.message || 'Failed to load business types');
+
+    return res.json({ business_types: data || [] });
+  } catch (error) {
+    console.error('get /business-types error:', error);
+    return res.status(500).json({
+      error: 'Failed to load business types',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /business-types — create a new business type (requires auth)
+app.post('/business-types', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    const { name, icon } = req.body || {};
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({
+        error: 'Business type name is required',
+      });
+    }
+
+    // Check if already exists
+    const { data: existing } = await supabase
+      .from('business_types')
+      .select('id, name, icon')
+      .ilike('name', name.trim())
+      .maybeSingle();
+
+    if (existing) {
+      return res.json({ 
+        id: existing.id, 
+        name: existing.name, 
+        icon: existing.icon,
+        is_custom: true 
+      });
+    }
+
+    // Map business type to an icon
+    const iconMap = {
+      'restaurant': 'coffee',
+      'grocery': 'shopping-cart',
+      'pharmacy': 'activity',
+      'hardware': 'settings',
+      'pet': 'heart',
+      'electronics': 'cpu',
+      'clothing': 'shopping-bag',
+      'beauty': 'smile',
+      'furniture': 'home',
+      'books': 'book-open',
+    };
+    
+    const nameLower = name.toLowerCase();
+    let selectedIcon = icon || 'shopping-bag';
+    for (const [key, value] of Object.entries(iconMap)) {
+      if (nameLower.includes(key)) {
+        selectedIcon = value;
+        break;
+      }
+    }
+
+    const { data, error } = await supabase
+      .from('business_types')
+      .insert({
+        name: name.trim(),
+        icon: selectedIcon,
+        is_custom: true,
+      })
+      .select('id, name, icon, is_custom')
+      .single();
+
+    if (error) throw new Error(error.message || 'Failed to create business type');
+
+    return res.json(data);
+  } catch (error) {
+    console.error('post /business-types error:', error);
+    return res.status(500).json({
+      error: 'Failed to create business type',
       details: error.message || 'Please try again later',
     });
   }
@@ -4879,182 +4975,79 @@ app.post('/users/me/addresses/:id/default', requireAuth, async (req, res) => {
   }
 });
 
-// POST /payments/pesepay/start — start a Pesepay seamless payment (auth required)
-app.post('/payments/pesepay/start', requireAuth, async (req, res) => {
+// POST /payments/contipay/start — initiate a ContiPay payment for an order (auth required)
+app.post('/payments/contipay/start', requireAuth, async (req, res) => {
   try {
-    const {
-      amount,
-      currencyCode,
-      paymentMethodCode: bodyPaymentMethodCode,
-      reasonForPayment,
-      merchantReference,
-      orderId,
-      paymentMethodId,
-      resultUrl,
-      returnUrl,
-      customer,
-    } = req.body || {};
+    const { orderId, amount } = req.body || {};
 
+    if (!orderId) {
+      return res.status(400).json({ error: 'Missing orderId' });
+    }
     if (!amount || amount <= 0) {
+      return res.status(400).json({ error: 'Invalid amount', details: 'amount must be > 0' });
+    }
+
+    // Validate order belongs to user and is awaiting payment
+    const { data: ord, error: ordErr } = await supabase
+      .from('orders')
+      .select('id, customer_id, order_number, status, payment_method, payment_status, total_amount')
+      .eq('id', orderId)
+      .maybeSingle();
+
+    if (ordErr || !ord) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    if (ord.customer_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    if (ord.payment_method !== 'contipay' || ord.status !== 'awaiting_payment') {
+      return res.status(400).json({ error: 'Order is not awaiting ContiPay payment' });
+    }
+    const expected = Number(ord.total_amount);
+    if (!Number.isFinite(expected) || Math.abs(expected - Number(amount)) > 0.02) {
+      return res.status(400).json({ error: 'Amount mismatch', details: 'amount must match the order total' });
+    }
+
+    // Get customer profile for phone/email
+    const profile = await getProfile(req.userId);
+    const phone = profile?.phone;
+    const email = profile?.email || '';
+
+    if (!phone) {
       return res.status(400).json({
-        error: 'Invalid amount',
-        details: 'amount must be greater than 0',
+        error: 'Phone number required',
+        details: 'Add a phone number to your profile so ContiPay can process payment.',
       });
     }
 
-    if (!reasonForPayment) {
-      return res.status(400).json({
-        error: 'Missing reasonForPayment',
-        details: 'reasonForPayment is required',
-      });
-    }
+    const apiBase = process.env.API_BASE_URL || `http://localhost:${process.env.PORT || 4000}`;
+    const callbackUrl = `${apiBase.replace(/\/$/, '')}/payments/contipay/callback`;
+    const returnUrl = `${apiBase.replace(/\/$/, '')}/payments/contipay/return?orderId=${encodeURIComponent(orderId)}`;
+    const reference = `DOT-${ord.order_number || orderId.slice(0, 8)}-${Date.now()}`;
 
-    if (!resultUrl) {
-      return res.status(400).json({
-        error: 'Missing resultUrl',
-        details: 'resultUrl (your public callback URL) is required for Pesepay',
-      });
-    }
-
-    let resolvedOrderId = orderId || null;
-    let paymentMethodCode = bodyPaymentMethodCode;
-    let resolvedMerchantReference = merchantReference;
-    let resolvedReason = reasonForPayment;
-    let resolvedCustomer = customer;
-    let resolvedPaymentMethodId = null;
-
-    if (paymentMethodId) {
-      const { data: pm, error: pmErr } = await supabase
-        .from('customer_payment_methods')
-        .select('id, customer_id, type, provider, phone_country_code, phone_number, is_active')
-        .eq('id', paymentMethodId)
-        .eq('customer_id', req.userId)
-        .maybeSingle();
-
-      if (pmErr || !pm) {
-        return res.status(404).json({
-          error: 'Payment method not found',
-          details: 'Invalid paymentMethodId or not your method',
-        });
-      }
-      if (pm.is_active === false) {
-        return res.status(400).json({
-          error: 'Inactive payment method',
-          details: 'Choose another payment method',
-        });
-      }
-
-      let phone = buildPhoneForPesepayCustomer(pm);
-      if (!phone && pm.type === 'card' && customer?.phoneNumber) {
-        phone = String(customer.phoneNumber).trim();
-      }
-      if (!phone) {
-        return res.status(400).json({
-          error: 'Phone required for Pesepay',
-          details:
-            'Your saved card has no mobile number — add a phone on your profile, or use a saved mobile money method.',
-        });
-      }
-
-      resolvedPaymentMethodId = pm.id;
-      resolvedCustomer = {
-        phoneNumber: phone,
-        email: customer?.email || '',
-        name: customer?.name || 'Customer',
-      };
-
-      if (!paymentMethodCode) {
-        paymentMethodCode = resolvePesepayPaymentMethodCode({
-          currencyCode: currencyCode || 'USD',
-          type: pm.type,
-          provider: pm.provider,
-        });
-      }
-    }
-
-    if (!paymentMethodCode) {
-      paymentMethodCode =
-        process.env.PESEPAY_USD_PAYMENT_METHOD_CODE ||
-        process.env.PAYMENT_USD_METHOD_CODE;
-    }
-
-    if (!resolvedCustomer?.phoneNumber) {
-      return res.status(400).json({
-        error: 'Missing customer phoneNumber',
-        details:
-          'Provide customer.phoneNumber or paymentMethodId (saved method with phone / profile phone for cards)',
-      });
-    }
-
-    if (orderId) {
-      const { data: ord, error: ordErr } = await supabase
-        .from('orders')
-        .select(
-          'id, customer_id, order_number, status, payment_method, payment_status, total_amount',
-        )
-        .eq('id', orderId)
-        .maybeSingle();
-
-      if (ordErr || !ord) {
-        return res.status(404).json({ error: 'Order not found', details: 'Invalid orderId' });
-      }
-      if (ord.customer_id !== req.userId) {
-        return res.status(403).json({ error: 'Forbidden', details: 'Not your order' });
-      }
-      if (ord.payment_method !== 'pesepay' || ord.status !== 'awaiting_payment') {
-        return res.status(400).json({
-          error: 'Invalid order state',
-          details: 'Order must be awaiting Pesepay payment',
-        });
-      }
-      const expected = Number(ord.total_amount);
-      const got = Number(amount);
-      if (!Number.isFinite(expected) || Math.abs(expected - got) > 0.02) {
-        return res.status(400).json({
-          error: 'Amount mismatch',
-          details: 'amount must match the order total',
-        });
-      }
-
-      resolvedMerchantReference = resolvedMerchantReference || ord.order_number;
-      resolvedReason = resolvedReason || `Order ${ord.order_number}`;
-      resolvedOrderId = ord.id;
-    }
-
-    if (!paymentMethodCode) {
-      return res.status(400).json({
-        error: 'Missing paymentMethodCode',
-        details:
-          'Set PESEPAY_USD_PAYMENT_METHOD_CODE on the server (or EXPO_PUBLIC_PESEPAY_USD_PAYMENT_METHOD_CODE in the app .env), or pass paymentMethodCode in the request body. Use the code from your Pesepay sandbox dashboard for the channel you want (e.g. EcoCash / card).',
-      });
-    }
-
-    const data = await createPesepayTransaction({
+    const result = await initiateContipayPayment({
       userId: req.userId,
-      amount,
-      currencyCode: currencyCode || 'USD',
-      paymentMethodCode,
-      reasonForPayment: resolvedReason,
-      merchantReference: resolvedMerchantReference,
-      orderId: resolvedOrderId,
-      resultUrl,
+      orderId: ord.id,
+      amount: Number(amount),
+      phone,
+      email,
+      reference,
+      callbackUrl,
       returnUrl,
-      customer: resolvedCustomer,
-      customerPaymentMethodId: resolvedPaymentMethodId,
     });
 
-    return res.json(data);
+    return res.json({ paymentUrl: result.paymentUrl, reference });
   } catch (error) {
-    console.error('Pesepay start error:', error);
+    console.error('ContiPay start error:', error);
     return res.status(500).json({
-      error: 'Failed to start Pesepay payment',
+      error: 'Failed to start ContiPay payment',
       details: error.message || 'Please try again later',
     });
   }
 });
 
-// GET /payments/pesepay/return — browser redirect after Pesepay hosted page; forwards to app deep link
-app.get('/payments/pesepay/return', (req, res) => {
+// GET /payments/contipay/return — browser redirect after ContiPay hosted page; forwards to app deep link
+app.get('/payments/contipay/return', (req, res) => {
   const scheme = process.env.APP_PAYMENT_DEEP_LINK_SCHEME || 'dotdeliveryontime';
   const q = new URLSearchParams(req.query || {});
   const target = `${scheme}://payment-return?${q.toString()}`;
@@ -5066,16 +5059,15 @@ app.get('/payments/pesepay/return', (req, res) => {
   return res.status(200).send(html);
 });
 
-// POST /payments/pesepay/callback — Pesepay resultUrl callback (no auth, called by Pesepay)
-app.post('/payments/pesepay/callback', async (req, res) => {
+// POST /payments/contipay/callback — ContiPay server-to-server result callback (no auth)
+app.post('/payments/contipay/callback', async (req, res) => {
   try {
-    const result = await handlePesepayCallback(req.body);
-    // Respond with a simple OK so Pesepay knows we processed it
-    return res.json({ ok: true, transactionStatus: result?.transaction?.transactionStatus });
+    await handleContipayCallback(req.body);
+    return res.json({ ok: true });
   } catch (error) {
-    console.error('Pesepay callback error:', error);
+    console.error('ContiPay callback error:', error);
     return res.status(500).json({
-      error: 'Failed to process Pesepay callback',
+      error: 'Failed to process ContiPay callback',
       details: error.message || 'Please try again later',
     });
   }
