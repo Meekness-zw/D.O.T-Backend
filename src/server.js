@@ -194,6 +194,111 @@ app.post('/auth/firebase-verify', async (req, res) => {
   }
 });
 
+// In-memory OTP store: phone -> { code, expiresAt, name, role, password }
+const otpStore = new Map();
+
+// POST /auth/send-otp { phone, name, role, password }
+app.post('/auth/send-otp', async (req, res) => {
+  try {
+    const { phone, name, role, password } = req.body;
+    if (!phone || !role || !password) {
+      return res.status(400).json({ error: 'phone, role, and password are required' });
+    }
+    const validRoles = ['customer', 'merchant', 'courier'];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({ error: 'Invalid role' });
+    }
+
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+    otpStore.set(phone, { code, expiresAt, name, role, password });
+
+    const dexatelApiKey = process.env.DEXATEL_API_KEY;
+    const dexatelSender = process.env.DEXATEL_SENDER;
+    if (!dexatelApiKey || !dexatelSender) {
+      return res.status(503).json({ error: 'OTP service not configured' });
+    }
+
+    const smsRes = await fetch('https://api.dexatel.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Auth-Token': dexatelApiKey,
+      },
+      body: JSON.stringify({
+        data: {
+          from: dexatelSender,
+          to: [phone],
+          text: `Your Delivery On Time verification code is: ${code}`,
+        },
+      }),
+    });
+
+    if (!smsRes.ok) {
+      const errBody = await smsRes.text();
+      console.error('Dexatel error:', errBody);
+      return res.status(502).json({ error: 'Failed to send verification code', details: errBody });
+    }
+
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    console.error('send-otp error:', error);
+    return res.status(500).json({ error: 'Failed to send OTP', details: error.message });
+  }
+});
+
+// POST /auth/verify-otp { phone, code }
+app.post('/auth/verify-otp', async (req, res) => {
+  try {
+    const { phone, code } = req.body;
+    if (!phone || !code) {
+      return res.status(400).json({ error: 'phone and code are required' });
+    }
+
+    const entry = otpStore.get(phone);
+    if (!entry) {
+      return res.status(400).json({ error: 'No OTP found for this number. Please request a new code.' });
+    }
+    if (Date.now() > entry.expiresAt) {
+      otpStore.delete(phone);
+      return res.status(400).json({ error: 'Verification code has expired. Please request a new one.' });
+    }
+    if (entry.code !== String(code)) {
+      return res.status(400).json({ error: 'Incorrect verification code.' });
+    }
+
+    otpStore.delete(phone);
+    const { name, role, password } = entry;
+
+    const existing = await checkPhoneRegistered(phone);
+    let userId;
+    if (existing.registered) {
+      userId = existing.userId;
+    } else {
+      const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+        phone,
+        password,
+        phone_confirm: true,
+      });
+      if (authError) throw authError;
+      userId = authData.user.id;
+    }
+
+    await ensureUserProfile({ userId, email: null, phone, fullName: name || '', role, password });
+
+    const sessionData = await loginWithPassword({ phone, password });
+
+    return res.status(201).json({
+      success: true,
+      user: { ...sessionData.user, role },
+      session: sessionData.session,
+    });
+  } catch (error) {
+    console.error('verify-otp error:', error);
+    return res.status(400).json({ error: 'Verification failed', details: error.message });
+  }
+});
+
 /** Admin middleware: require x-admin-key or Authorization Bearer matching ADMIN_API_KEY */
 function requireAdmin(req, res, next) {
   const apiKey = process.env.ADMIN_API_KEY;
