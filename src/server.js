@@ -357,6 +357,54 @@ app.get('/', (req, res) => {
   });
 });
 
+// ─── Business Types ─────────────────────────────────────────────────────────
+
+// GET /business-types — public list of all business categories
+app.get('/business-types', async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { data, error } = await supabase
+      .from('business_types')
+      .select('id, name, icon, is_default')
+      .order('is_default', { ascending: false })
+      .order('name', { ascending: true });
+    if (error) throw new Error(error.message);
+    return res.json({ business_types: data || [] });
+  } catch (err) {
+    console.error('GET /business-types error:', err);
+    return res.status(500).json({ error: 'Failed to load business types', details: err.message });
+  }
+});
+
+// POST /business-types — create a new business type (auth required; merchant submitting "Other")
+app.post('/business-types', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { name, icon } = req.body || {};
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+    const label = String(name).trim();
+    // Derive a slug from the label
+    const id = label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+
+    // Upsert so concurrent submissions of the same type are idempotent
+    const { data, error } = await supabase
+      .from('business_types')
+      .upsert({ id, name: label, icon: icon || 'shopping-bag', is_default: false }, { onConflict: 'id' })
+      .select('id, name, icon, is_default')
+      .single();
+
+    if (error) throw new Error(error.message);
+    return res.status(201).json(data);
+  } catch (err) {
+    console.error('POST /business-types error:', err);
+    return res.status(500).json({ error: 'Failed to create business type', details: err.message });
+  }
+});
+
+// ─── Public Stores ───────────────────────────────────────────────────────────
+
 // Public stores listing & search (no auth required; uses public RLS policies)
 app.get('/stores', async (req, res) => {
   try {

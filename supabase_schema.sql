@@ -520,6 +520,30 @@ CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_is_read ON notifications(is_read);
 CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON notifications(created_at DESC);
 
+-- ============================================
+-- BUSINESS TYPES (store categories)
+-- ============================================
+-- Shared lookup table: seeded with defaults, extended by merchant "Other" submissions.
+-- Used by BusinessTypeScreen (merchant onboarding) and CustomerHomeScreen (category tabs).
+
+CREATE TABLE IF NOT EXISTS business_types (
+  id TEXT PRIMARY KEY,                    -- slug: 'restaurant', 'grocery', 'pet_shop', etc.
+  name TEXT NOT NULL,                     -- display label: 'Restaurant / Food', 'Pet Shop'
+  icon TEXT NOT NULL DEFAULT 'shopping-bag', -- Feather icon name
+  is_default BOOLEAN DEFAULT FALSE,       -- true = shipped with the app
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Seed default categories (idempotent)
+INSERT INTO business_types (id, name, icon, is_default) VALUES
+  ('restaurant', 'Restaurant / Food', 'coffee', true),
+  ('grocery',    'Grocery / Retail',  'shopping-cart', true),
+  ('pharmacy',   'Pharmacy',          'activity', true),
+  ('hardware',   'Hardware Store',    'settings', true)
+ON CONFLICT (id) DO NOTHING;
+
+CREATE INDEX IF NOT EXISTS idx_business_types_is_default ON business_types(is_default);
+
 -- Promotions
 CREATE INDEX IF NOT EXISTS idx_promotions_store_id ON promotions(store_id);
 CREATE INDEX IF NOT EXISTS idx_promotions_is_active ON promotions(is_active);
