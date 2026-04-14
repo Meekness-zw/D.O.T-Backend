@@ -430,9 +430,54 @@ export async function getAdminPendingUsers() {
     throw new Error(merchantsRes.error.message || 'Failed to fetch pending merchants');
   }
 
+  const couriers = couriersRes.data || [];
+  const merchants = merchantsRes.data || [];
+
+  // Group by user ID so a user who registered for multiple roles appears as one entry
+  const userMap = new Map();
+
+  for (const c of couriers) {
+    if (!userMap.has(c.id)) {
+      userMap.set(c.id, {
+        userId: c.id,
+        profile: c.user_profiles,
+        roles: [],
+        courier: null,
+        merchant: null,
+        created_at: c.created_at,
+      });
+    }
+    const entry = userMap.get(c.id);
+    entry.roles.push('courier');
+    entry.courier = c;
+    if (c.created_at && (!entry.created_at || c.created_at < entry.created_at)) {
+      entry.created_at = c.created_at;
+    }
+  }
+
+  for (const m of merchants) {
+    if (!userMap.has(m.id)) {
+      userMap.set(m.id, {
+        userId: m.id,
+        profile: m.user_profiles,
+        roles: [],
+        courier: null,
+        merchant: null,
+        created_at: m.created_at,
+      });
+    }
+    const entry = userMap.get(m.id);
+    entry.roles.push('merchant');
+    entry.merchant = m;
+    if (m.created_at && (!entry.created_at || m.created_at < entry.created_at)) {
+      entry.created_at = m.created_at;
+    }
+  }
+
   return {
-    couriers: couriersRes.data || [],
-    merchants: merchantsRes.data || [],
+    users: Array.from(userMap.values()),
+    couriers,
+    merchants,
   };
 }
 
