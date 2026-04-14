@@ -526,47 +526,30 @@ export async function upsertMerchantOnboarding({
     }
   }
 
-  // Merchant documents (optional except owner_id + proof_of_address should be enforced by UI)
-  if (ownerIdBase64) {
-    const ext = extForMime(parseDataUrl(ownerIdBase64)?.mime);
-    const url = await uploadToBucket({
-      bucket: MERCHANT_BUCKET,
-      path: `merchants/${userId}/owner_id.${ext}`,
-      dataUrl: ownerIdBase64,
-    });
-    await supabase.from('merchant_documents').insert({
-      merchant_id: userId,
-      document_type: 'owner_id',
-      document_url: url,
-      status: 'pending',
-    });
-  }
+  // Merchant documents — delete existing then re-insert so resubmissions don't stack up
+  const docUploads = [
+    { key: 'owner_id',              dataUrl: ownerIdBase64 },
+    { key: 'business_certificate',  dataUrl: businessCertificateBase64 },
+    { key: 'proof_of_address',      dataUrl: proofOfAddressBase64 },
+  ];
 
-  if (businessCertificateBase64) {
-    const ext = extForMime(parseDataUrl(businessCertificateBase64)?.mime);
+  for (const { key, dataUrl } of docUploads) {
+    if (!dataUrl) continue;
+    const ext = extForMime(parseDataUrl(dataUrl)?.mime);
     const url = await uploadToBucket({
       bucket: MERCHANT_BUCKET,
-      path: `merchants/${userId}/business_certificate.${ext}`,
-      dataUrl: businessCertificateBase64,
+      path: `merchants/${userId}/${key}.${ext}`,
+      dataUrl,
     });
+    // Remove any previous version of this document type before inserting the new one
+    await supabase
+      .from('merchant_documents')
+      .delete()
+      .eq('merchant_id', userId)
+      .eq('document_type', key);
     await supabase.from('merchant_documents').insert({
       merchant_id: userId,
-      document_type: 'business_certificate',
-      document_url: url,
-      status: 'pending',
-    });
-  }
-
-  if (proofOfAddressBase64) {
-    const ext = extForMime(parseDataUrl(proofOfAddressBase64)?.mime);
-    const url = await uploadToBucket({
-      bucket: MERCHANT_BUCKET,
-      path: `merchants/${userId}/proof_of_address.${ext}`,
-      dataUrl: proofOfAddressBase64,
-    });
-    await supabase.from('merchant_documents').insert({
-      merchant_id: userId,
-      document_type: 'proof_of_address',
+      document_type: key,
       document_url: url,
       status: 'pending',
     });
