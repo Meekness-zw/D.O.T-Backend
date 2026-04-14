@@ -17,10 +17,10 @@ ALTER TABLE orders ADD CONSTRAINT orders_status_check CHECK (status IN (
   'refunded'
 ));
 
--- 2) Payment method: wallet + pesepay (server already used wallet; schema may differ per env)
+-- 2) Payment method: wallet + pesepay + contipay (server already used wallet; schema may differ per env)
 ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_payment_method_check;
 ALTER TABLE orders ADD CONSTRAINT orders_payment_method_check CHECK (
-  payment_method IN ('card', 'mobile_money', 'cash', 'wallet', 'pesepay')
+  payment_method IN ('card', 'mobile_money', 'cash', 'wallet', 'pesepay', 'contipay')
 );
 
 -- 3) Commission snapshot (MVP internal accounting)
