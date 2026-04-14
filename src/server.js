@@ -359,6 +359,23 @@ app.get('/', (req, res) => {
   });
 });
 
+// GET /debug/contipay — test ContiPay configuration
+app.get('/debug/contipay', (req, res) => {
+  try {
+    const { getContipayConfig } = require('./contipayService.js');
+    const config = getContipayConfig();
+    res.json({
+      hasKey: !!config.apiKey,
+      keyPrefix: config.apiKey?.slice(0, 4) || 'none',
+      keyLength: config.apiKey?.length || 0,
+      baseUrl: process.env.CONTIPAY_BASE_URL || process.env.CONTIPAY_URL || 'default',
+      envVars: Object.keys(process.env).filter(k => k.startsWith('CONTI')).join(', ')
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ─── Business Types ─────────────────────────────────────────────────────────
 
 // GET /business-types — public list of all business categories

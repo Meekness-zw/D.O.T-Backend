@@ -4,13 +4,21 @@ import { computeSubtotalSplit, recordMerchantEarningsForOrderPayment } from './o
 import { notifyCustomerPaymentReceived } from './orderNotifications.js';
 
 const supabase = supabaseAdmin;
-const CONTIPAY_BASE_URL = process.env.CONTIPAY_BASE_URL || 'https://www.contipay.co.zw/api';
+const CONTIPAY_BASE_URL = process.env.CONTIPAY_BASE_URL || process.env.CONTIPAY_URL || 'https://www.contipay.co.zw/api';
 
 export function getContipayConfig() {
-  const apiKey = process.env.CONTIPAY_API_KEY;
-  const apiSecret = process.env.CONTIPAY_API_SECRET;
-  if (!apiKey || !apiSecret) {
-    throw new Error('CONTIPAY_API_KEY and CONTIPAY_API_SECRET must be set in backend/.env');
+  const apiKey = process.env.CONTIPAY_API_KEY || process.env.CONTIPAY_TOKEN;
+  const apiSecret = process.env.CONTIPAY_API_SECRET || process.env.CONTIPAY_SECRET;
+  
+  console.log('[ContiPay] Checking config. Keys present:', {
+    hasApiKey: !!process.env.CONTIPAY_API_KEY,
+    hasToken: !!process.env.CONTIPAY_TOKEN,
+    hasApiSecret: !!process.env.CONTIPAY_API_SECRET,
+    hasSecret: !!process.env.CONTIPAY_SECRET,
+  });
+  
+  if (!apiKey) {
+    throw new Error('CONTIPAY_API_KEY (or CONTIPAY_TOKEN) must be set in backend/.env');
   }
   return { apiKey, apiSecret };
 }
@@ -36,15 +44,27 @@ export async function initiateContipayPayment({
   callbackUrl,
   returnUrl,
 }) {
+  console.log('[ContiPay] Initiate called with:', { userId, orderId, amount, phone, reference });
+
   if (!userId) throw new Error('userId is required');
   if (!amount || amount <= 0) throw new Error('amount must be > 0');
   if (!phone) throw new Error('customer phone is required');
   if (!reference) throw new Error('reference is required');
 
-  const { apiKey, apiSecret } = getContipayConfig();
+  let config;
+  try {
+    config = getContipayConfig();
+    console.log('[ContiPay] Config loaded, API key starts with:', config.apiKey?.slice(0, 4));
+  } catch (configErr) {
+    console.error('[ContiPay] Config error:', configErr.message);
+    throw configErr;
+  }
+
+  const { apiKey, apiSecret } = config;
 
   let response;
   try {
+    console.log('[ContiPay] Making request to:', `${CONTIPAY_BASE_URL}/payments/initiate`);
     response = await axios.post(
       `${CONTIPAY_BASE_URL}/payments/initiate`,
       {
@@ -59,16 +79,19 @@ export async function initiateContipayPayment({
       {
         headers: {
           'Content-Type': 'application/json',
-          'x-api-key': apiKey,
+          'Authorization': `Bearer ${apiKey}`,
           'x-api-secret': apiSecret,
         },
         timeout: 30000,
       },
     );
+    console.log('[ContiPay] Response status:', response.status, 'data:', response.data);
   } catch (axiosErr) {
-    console.error('[ContiPay] API request failed:', axiosErr.code, axiosErr.message);
+    console.error('[ContiPay] API request failed. Code:', axiosErr.code);
+    console.error('[ContiPay] Error message:', axiosErr.message);
     if (axiosErr.response) {
-      console.error('[ContiPay] API error response:', axiosErr.response.status, JSON.stringify(axiosErr.response.data));
+      console.error('[ContiPay] Response status:', axiosErr.response.status);
+      console.error('[ContiPay] Response data:', JSON.stringify(axiosErr.response.data));
     }
     throw new Error(`ContiPay API error: ${axiosErr.message}`);
   }
