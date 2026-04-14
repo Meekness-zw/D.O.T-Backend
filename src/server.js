@@ -443,7 +443,8 @@ app.get('/stores', async (req, res) => {
           total_reviews,
           is_open,
           is_active,
-          operating_hours
+          operating_hours,
+          merchants ( business_type )
         `,
       )
       .eq('is_active', true)
@@ -497,6 +498,12 @@ app.get('/stores', async (req, res) => {
         return { ...s, distance_km: null, eta_minutes: null };
       });
     }
+
+    // Flatten merchants.business_type → top-level business_type, remove nested object
+    stores = stores.map(({ merchants, ...rest }) => ({
+      ...rest,
+      business_type: merchants?.business_type || null,
+    }));
 
     stores = stores.map((s) => enrichStoreForCustomerListing(s));
 
