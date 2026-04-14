@@ -4255,7 +4255,8 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
       throw new Error(merchantError.message || 'Failed to load merchant');
     }
 
-    const isMerchant = !!merchant && merchant.is_active !== false;
+    // Allow merchant if is_active is true OR null (null means not explicitly disabled)
+    const isMerchant = !!merchant && (merchant.is_active === true || merchant.is_active === null);
     const approvalStatus = merchant?.approval_status || 'pending';
     const isApproved = approvalStatus === 'approved';
 
@@ -4272,6 +4273,20 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
       if (storesError) {
         console.error('merchant status stores error:', storesError);
         throw new Error(storesError.message || 'Failed to load stores for merchant');
+      }
+
+      // If no active store found, also check for stores with is_active null (allows stores created without explicit is_active)
+      if (!stores || stores.length === 0) {
+        const { data: nullStores, error: nullStoresError } = await supabase
+          .from('stores')
+          .select('id, address_line1, city, latitude, longitude, is_active')
+          .eq('merchant_id', req.userId)
+          .is('is_active', null)
+          .limit(1);
+
+        if (!nullStoresError) {
+          stores = nullStores;
+        }
       }
 
       hasStore =
