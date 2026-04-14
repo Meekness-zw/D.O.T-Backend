@@ -5098,9 +5098,10 @@ app.post('/payments/contipay/start', requireAuth, async (req, res) => {
     return res.json({ paymentUrl: result.paymentUrl, reference });
   } catch (error) {
     console.error('ContiPay start error:', error);
+    console.error('ContiPay start error details:', error.response?.data || error.message);
     return res.status(500).json({
       error: 'Failed to start ContiPay payment',
-      details: error.message || 'Please try again later',
+      details: error.response?.data?.message || error.response?.data?.error || error.message || 'Please try again later',
     });
   }
 });

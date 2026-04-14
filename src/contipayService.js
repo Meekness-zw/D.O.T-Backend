@@ -4,7 +4,7 @@ import { computeSubtotalSplit, recordMerchantEarningsForOrderPayment } from './o
 import { notifyCustomerPaymentReceived } from './orderNotifications.js';
 
 const supabase = supabaseAdmin;
-const CONTIPAY_BASE_URL = 'https://api.contipay.co.zw/v1';
+const CONTIPAY_BASE_URL = process.env.CONTIPAY_BASE_URL || 'https://www.contipay.co.zw/api';
 
 export function getContipayConfig() {
   const apiKey = process.env.CONTIPAY_API_KEY;
@@ -43,30 +43,42 @@ export async function initiateContipayPayment({
 
   const { apiKey, apiSecret } = getContipayConfig();
 
-  const response = await axios.post(
-    `${CONTIPAY_BASE_URL}/payments/initiate`,
-    {
-      amount,
-      currency: 'USD',
-      customer_phone: phone,
-      customer_email: email || '',
-      reference,
-      callback_url: callbackUrl,
-      return_url: returnUrl || callbackUrl,
-    },
-    {
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'x-api-secret': apiSecret,
+  let response;
+  try {
+    response = await axios.post(
+      `${CONTIPAY_BASE_URL}/payments/initiate`,
+      {
+        amount,
+        currency: 'USD',
+        customer_phone: phone,
+        customer_email: email || '',
+        reference,
+        callback_url: callbackUrl,
+        return_url: returnUrl || callbackUrl,
       },
-    },
-  );
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'x-api-secret': apiSecret,
+        },
+        timeout: 30000,
+      },
+    );
+  } catch (axiosErr) {
+    console.error('[ContiPay] API request failed:', axiosErr.code, axiosErr.message);
+    if (axiosErr.response) {
+      console.error('[ContiPay] API error response:', axiosErr.response.status, JSON.stringify(axiosErr.response.data));
+    }
+    throw new Error(`ContiPay API error: ${axiosErr.message}`);
+  }
+
+  console.log('[ContiPay] Initiate response:', response.status, response.data);
 
   const paymentUrl = response.data?.payment_url;
   if (!paymentUrl) {
     console.error('[ContiPay] Unexpected response:', response.status, JSON.stringify(response.data));
-    throw new Error(`ContiPay did not return a payment URL (status ${response.status})`);
+    throw new Error(`ContiPay did not return a payment URL (status ${response.status}): ${JSON.stringify(response.data)}`);
   }
 
   const { data: payment, error: paymentError } = await supabase
