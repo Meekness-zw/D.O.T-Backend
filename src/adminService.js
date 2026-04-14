@@ -630,8 +630,11 @@ export async function getAdminMerchantDetail(merchantId) {
         id,
         business_name,
         business_type,
+        business_registration_number,
+        tax_id,
         is_verified,
         is_active,
+        approval_status,
         created_at,
         user_profiles ( full_name, email, phone )
       `,
@@ -640,7 +643,7 @@ export async function getAdminMerchantDetail(merchantId) {
       .maybeSingle(),
     supabase
       .from('stores')
-      .select('id, store_name, logo, banner_url, city, address_line1, is_active')
+      .select('id, store_name, logo, banner_url, phone, email, address_line1, address_line2, city, state_province, postal_code, country, operating_hours, is_open, is_active, rating, created_at')
       .eq('merchant_id', merchantId)
       .order('created_at', { ascending: false }),
     supabase

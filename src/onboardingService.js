@@ -437,8 +437,12 @@ export async function upsertMerchantOnboarding({
     longitude,
     description: description ? String(description).trim() : null,
     operating_hours:
-      operating_hours && typeof operating_hours === 'object' && Object.keys(operating_hours).length > 0
-        ? operating_hours
+      operating_hours
+        ? typeof operating_hours === 'string'
+          ? { summary: operating_hours }
+          : typeof operating_hours === 'object' && Object.keys(operating_hours).length > 0
+            ? operating_hours
+            : null
         : null,
     is_open: is_open !== false,
     is_active: true,
