@@ -1530,6 +1530,68 @@ app.post('/merchant/support-tickets', requireAuth, async (req, res) => {
   }
 });
 
+// POST /courier/support-tickets — courier submits a help/issue request
+app.post('/courier/support-tickets', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { category, subject, message } = req.body || {};
+    if (!subject || !message) {
+      return res.status(400).json({ error: 'subject and message are required' });
+    }
+    const { data, error } = await supabase
+      .from('support_tickets')
+      .insert({
+        user_id: req.userId,
+        role_context: 'courier',
+        category: category || 'general',
+        subject: String(subject).trim().slice(0, 255),
+        message: String(message).trim(),
+        status: 'open',
+      })
+      .select('id, status, created_at')
+      .single();
+    if (error) throw new Error(error.message || 'Failed to create ticket');
+    return res.status(201).json({ ticket: data });
+  } catch (error) {
+    console.error('post /courier/support-tickets error:', error);
+    return res.status(500).json({
+      error: 'Failed to create support ticket',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /customer/support-tickets — customer submits a help/issue request
+app.post('/customer/support-tickets', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { category, subject, message } = req.body || {};
+    if (!subject || !message) {
+      return res.status(400).json({ error: 'subject and message are required' });
+    }
+    const { data, error } = await supabase
+      .from('support_tickets')
+      .insert({
+        user_id: req.userId,
+        role_context: 'customer',
+        category: category || 'general',
+        subject: String(subject).trim().slice(0, 255),
+        message: String(message).trim(),
+        status: 'open',
+      })
+      .select('id, status, created_at')
+      .single();
+    if (error) throw new Error(error.message || 'Failed to create ticket');
+    return res.status(201).json({ ticket: data });
+  } catch (error) {
+    console.error('post /customer/support-tickets error:', error);
+    return res.status(500).json({
+      error: 'Failed to create support ticket',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // POST /merchant/stores/:id/upload-logo — upload store logo and return URL
 app.post('/merchant/stores/:id/upload-logo', requireAuth, async (req, res) => {
   try {
@@ -4223,13 +4285,17 @@ app.post('/orders', requireAuth, async (req, res) => {
       }
     }
 
-    await notifyCustomerOrderPlaced(supabase, {
-      customerId: req.userId,
-      orderId: order.id,
-      orderNumber: order.order_number,
-      storeName: store.store_name,
-      awaitingPayment: orderStatus === 'awaiting_payment',
-    });
+    try {
+      await notifyCustomerOrderPlaced(supabase, {
+        customerId: req.userId,
+        orderId: order.id,
+        orderNumber: order.order_number,
+        storeName: store.store_name,
+        awaitingPayment: orderStatus === 'awaiting_payment',
+      });
+    } catch (notifyErr) {
+      console.error('notifyCustomerOrderPlaced failed (non-fatal):', notifyErr);
+    }
 
     return res.status(201).json({ order });
   } catch (error) {
