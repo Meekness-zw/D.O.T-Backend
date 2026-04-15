@@ -12,7 +12,7 @@ import {
   recordCourierProfilePhotoDocument,
 } from './userService.js';
 import { getOrdersForUser, getWalletTransactionsForUser, getPaymentsForUser, getFullUserMe, getMerchantDashboardStats } from './historyService.js';
-import { initiateContipayPayment, handleContipayCallback } from './contipayService.js';
+import { initiateContipayPayment, handleContipayCallback, getContipayConfig } from './contipayService.js';
 import { createSupabaseAccessToken, verifyAccessToken } from './sessionToken.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import {
@@ -362,13 +362,12 @@ app.get('/', (req, res) => {
 // GET /debug/contipay — test ContiPay configuration
 app.get('/debug/contipay', (req, res) => {
   try {
-    const { getContipayConfig } = require('./contipayService.js');
     const config = getContipayConfig();
     res.json({
       hasKey: !!config.apiKey,
       keyPrefix: config.apiKey?.slice(0, 4) || 'none',
       keyLength: config.apiKey?.length || 0,
-      baseUrl: process.env.CONTIPAY_BASE_URL || process.env.CONTIPAY_URL || 'default',
+      baseUrl: process.env.CONTIPAY_API_URL || 'https://api.contipay.co.zw',
       envVars: Object.keys(process.env).filter(k => k.startsWith('CONTI')).join(', ')
     });
   } catch (e) {

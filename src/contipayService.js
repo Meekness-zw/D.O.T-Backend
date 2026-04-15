@@ -1,13 +1,12 @@
-import { createRequire } from 'node:module';
+import axios from 'axios';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { computeSubtotalSplit, recordMerchantEarningsForOrderPayment } from './orderPaymentSplit.js';
 import { notifyCustomerPaymentReceived } from './orderNotifications.js';
 
-// The contipay npm package is CommonJS — use createRequire to load it in an ESM project
-const require = createRequire(import.meta.url);
-const contipay = require('contipay');
-
 const supabase = supabaseAdmin;
+
+// ContiPay REST API base URL — override via CONTIPAY_API_URL env var
+const CONTIPAY_API_BASE = process.env.CONTIPAY_API_URL || 'https://api.contipay.co.zw';
 
 export function getContipayConfig() {
   const apiKey = process.env.CONTIPAY_API_KEY || process.env.CONTIPAY_TOKEN;
@@ -38,8 +37,16 @@ function mapContipayStatus(status) {
 }
 
 /**
- * Initiate a ContiPay payment for an order using the official contipay SDK.
- * Returns { paymentUrl, reference }
+ * Initiate a ContiPay payment for an order via the ContiPay REST API.
+ * Returns { paymentUrl, payment }
+ *
+ * ContiPay API reference:
+ *   POST {CONTIPAY_API_BASE}/v1/payments
+ *   Authorization: Bearer <apiKey>
+ *   Body: { amount, currency, method, reference, callback, returnUrl, phone, email }
+ *
+ * Response field candidates for the checkout URL:
+ *   checkoutUrl | paymentUrl | checkout_url | url | redirect_url | payment_url
  */
 export async function initiateContipayPayment({
   userId,
@@ -57,41 +64,55 @@ export async function initiateContipayPayment({
   if (!reference) throw new Error('reference is required');
 
   const { apiKey } = getContipayConfig();
-
-  // Configure the SDK with the API key if it exposes a configure / setApiKey method
-  if (typeof contipay.configure === 'function') {
-    contipay.configure({ apiKey });
-  } else if (typeof contipay.setApiKey === 'function') {
-    contipay.setApiKey(apiKey);
-  } else if (typeof contipay.init === 'function') {
-    contipay.init({ apiKey });
-  }
-  // If none of the above — the SDK may read CONTIPAY_API_KEY from process.env automatically
-
   const paymentMethod = resolvePaymentMethod(method);
 
   console.log('[ContiPay] Creating payment:', { orderId, amount, reference, method: paymentMethod });
 
-  let payment;
+  const payload = {
+    amount: Number(amount),
+    currency: 'USD',
+    method: paymentMethod,
+    reference,
+    callback: callbackUrl,
+    ...(returnUrl ? { returnUrl } : {}),
+    ...(phone ? { phone } : {}),
+    ...(email ? { email } : {}),
+  };
+
+  let responseData;
   try {
-    payment = await contipay.createPayment({
-      amount: Number(amount),
-      currency: 'USD',
-      method: paymentMethod,
-      reference,
-      callback: callbackUrl,
-      ...(returnUrl ? { returnUrl } : {}),
-      ...(phone ? { phone } : {}),
-      ...(email ? { email } : {}),
-    });
-  } catch (sdkErr) {
-    console.error('[ContiPay] SDK error:', sdkErr?.message || sdkErr);
-    throw new Error(`ContiPay payment creation failed: ${sdkErr?.message || 'Unknown error'}`);
+    const response = await axios.post(
+      `${CONTIPAY_API_BASE}/v1/payments`,
+      payload,
+      {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        timeout: 30000,
+      }
+    );
+    responseData = response.data;
+  } catch (err) {
+    const detail = err.response?.data?.message
+      || err.response?.data?.error
+      || err.message
+      || 'Unknown error';
+    console.error('[ContiPay] API error:', detail);
+    throw new Error(`ContiPay payment creation failed: ${detail}`);
   }
 
-  const paymentUrl = payment?.checkoutUrl || payment?.paymentUrl || payment?.checkout_url || payment?.url;
+  const paymentUrl =
+    responseData?.checkoutUrl ||
+    responseData?.paymentUrl ||
+    responseData?.checkout_url ||
+    responseData?.redirect_url ||
+    responseData?.payment_url ||
+    responseData?.url;
+
   if (!paymentUrl) {
-    console.error('[ContiPay] No checkout URL in SDK response:', payment);
+    console.error('[ContiPay] No checkout URL in response:', responseData);
     throw new Error('ContiPay did not return a checkout URL');
   }
 
@@ -112,7 +133,7 @@ export async function initiateContipayPayment({
       metadata: {
         reference,
         method: paymentMethod,
-        contipay_payment_id: payment?.id || payment?.paymentId || null,
+        contipay_payment_id: responseData?.id || responseData?.paymentId || null,
       },
     })
     .select('*')
