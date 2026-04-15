@@ -1412,37 +1412,37 @@ app.get('/merchant/help', requireAuth, async (req, res) => {
 });
 
 // POST /merchant/customers/create — merchant creates a new customer account
-app.post(‘/merchant/customers/create’, requireAuth, async (req, res) => {
+app.post('/merchant/customers/create', requireAuth, async (req, res) => {
   try {
-    if (!supabase) throw new Error(‘Server not configured’);
+    if (!supabase) throw new Error('Server not configured');
 
     // Verify caller is a merchant
     const { data: merchantRow, error: merchantError } = await supabase
-      .from(‘merchants’)
-      .select(‘id’)
-      .eq(‘id’, req.userId)
+      .from('merchants')
+      .select('id')
+      .eq('id', req.userId)
       .maybeSingle();
-    if (merchantError) throw new Error(merchantError.message || ‘Failed to verify merchant’);
+    if (merchantError) throw new Error(merchantError.message || 'Failed to verify merchant');
     if (!merchantRow) {
-      return res.status(403).json({ error: ‘Forbidden’, details: ‘Merchant profile required’ });
+      return res.status(403).json({ error: 'Forbidden', details: 'Merchant profile required' });
     }
 
     const { fullName, phone, password } = req.body;
 
     if (!fullName || !phone || !password) {
-      return res.status(400).json({ error: ‘fullName, phone and password are required’ });
+      return res.status(400).json({ error: 'fullName, phone and password are required' });
     }
-    if (!phone.startsWith(‘+’) || phone.length < 10) {
-      return res.status(400).json({ error: ‘Invalid phone number format. Use E.164 format e.g. +263712345678’ });
+    if (!phone.startsWith('+') || phone.length < 10) {
+      return res.status(400).json({ error: 'Invalid phone number format. Use E.164 format e.g. +263712345678' });
     }
     if (password.length < 6) {
-      return res.status(400).json({ error: ‘Password must be at least 6 characters’ });
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
     }
 
     // Reject duplicate phone
     const existing = await checkPhoneRegistered(phone);
     if (existing.registered) {
-      return res.status(409).json({ error: ‘An account with this phone number already exists’ });
+      return res.status(409).json({ error: 'An account with this phone number already exists' });
     }
 
     // Create Supabase Auth user (phone already confirmed — no OTP needed)
@@ -1455,17 +1455,17 @@ app.post(‘/merchant/customers/create’, requireAuth, async (req, res) => {
 
     const userId = authData.user.id;
 
-    await ensureUserProfile({ userId, email: null, phone, fullName, role: ‘customer’, password });
+    await ensureUserProfile({ userId, email: null, phone, fullName, role: 'customer', password });
 
-    return res.status(201).json({ success: true, userId, message: ‘Customer account created successfully’ });
+    return res.status(201).json({ success: true, userId, message: 'Customer account created successfully' });
   } catch (error) {
-    console.error(‘POST /merchant/customers/create error:’, error);
-    return res.status(500).json({ error: ‘Failed to create customer’, details: error.message });
+    console.error('POST /merchant/customers/create error:', error);
+    return res.status(500).json({ error: 'Failed to create customer', details: error.message });
   }
 });
 
-// GET /merchant/support-tickets — current merchant’s requests
-app.get(‘/merchant/support-tickets’, requireAuth, async (req, res) => {
+// GET /merchant/support-tickets — current merchant's requests
+app.get('/merchant/support-tickets', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
     const { data: merchantRow, error: merchantError } = await supabase
