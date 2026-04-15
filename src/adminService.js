@@ -3,7 +3,29 @@
  * Uses supabaseAdmin; call only from admin-protected routes.
  */
 
+import axios from 'axios';
 import { supabaseAdmin } from './supabaseAdminClient.js';
+
+/** Send a push notification via Expo Push API. Silently ignores missing or invalid tokens. */
+async function sendExpoPush(userId, { title, body, data = {} }) {
+  if (!supabaseAdmin) return;
+  try {
+    const { data: profile } = await supabaseAdmin
+      .from('user_profiles')
+      .select('push_token')
+      .eq('id', userId)
+      .maybeSingle();
+    const token = profile?.push_token;
+    if (!token || !token.startsWith('ExponentPushToken')) return;
+    await axios.post(
+      'https://exp.host/push/send',
+      { to: token, title, body, data, sound: 'default' },
+      { headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 10000 },
+    );
+  } catch (err) {
+    console.warn('[Push] Failed to send notification to', userId, err?.message);
+  }
+}
 
 const supabase = supabaseAdmin;
 
@@ -510,6 +532,13 @@ export async function approveCourier(courierId) {
     .eq('courier_id', courierId)
     .eq('status', 'pending');
 
+  // Notify the courier
+  await sendExpoPush(courierId, {
+    title: 'Account Approved!',
+    body: 'Your courier account has been verified. You can now start accepting deliveries.',
+    data: { type: 'courier_approved' },
+  });
+
   return courier;
 }
 
@@ -537,6 +566,13 @@ export async function approveMerchant(merchantId) {
   if (error) throw new Error(error.message || 'Failed to approve merchant');
   if (!merchant) throw new Error('Merchant not found');
 
+  // Notify the merchant
+  await sendExpoPush(merchantId, {
+    title: 'Account Approved!',
+    body: `Your merchant account "${merchant.business_name}" has been approved. You can now start receiving orders.`,
+    data: { type: 'merchant_approved' },
+  });
+
   return merchant;
 }
 
@@ -563,6 +599,12 @@ export async function rejectMerchant(merchantId, reason) {
   if (error) throw new Error(error.message || 'Failed to reject merchant');
   if (!merchant) throw new Error('Merchant not found');
 
+  await sendExpoPush(merchantId, {
+    title: 'Application Update',
+    body: reason ? `Your merchant application was not approved: ${reason}` : 'Your merchant application was not approved. Please contact support.',
+    data: { type: 'merchant_rejected' },
+  });
+
   return merchant;
 }
 
@@ -586,6 +628,12 @@ export async function rejectCourier(courierId, reason) {
   if (error) throw new Error(error.message || 'Failed to reject courier');
   if (!courier) throw new Error('Courier not found');
 
+  await sendExpoPush(courierId, {
+    title: 'Application Update',
+    body: reason ? `Your courier application was not approved: ${reason}` : 'Your courier application was not approved. Please contact support.',
+    data: { type: 'courier_rejected' },
+  });
+
   return courier;
 }
 
@@ -593,42 +641,55 @@ export async function rejectCourier(courierId, reason) {
 export async function getAdminCourierDetail(courierId) {
   if (!supabase) throw new Error('Server not configured');
 
-  const [{ data: courier, error: courierError }, { data: vehicles, error: vehicleError }, { data: documents, error: docsError }] =
-    await Promise.all([
-      supabase
-        .from('couriers')
-        .select(
-          `
-          id,
-          drivers_license_number,
-          is_verified,
-          verification_status,
-          rating,
-          total_deliveries,
-          total_earnings,
-          account_balance,
-          created_at,
-          user_profiles ( full_name, email, phone, profile_photo )
-        `,
-        )
-        .eq('id', courierId)
-        .maybeSingle(),
-      supabase
-        .from('courier_vehicles')
-        .select('id, vehicle_type, brand, model, year, color, license_plate, vehicle_photo_url, registration_certificate_url, is_active')
-        .eq('courier_id', courierId)
-        .order('created_at', { ascending: false }),
-      supabase
-        .from('courier_documents')
-        .select('id, document_type, document_url, status, created_at')
-        .eq('courier_id', courierId)
-        .order('created_at', { ascending: true }),
-    ]);
+  const [
+    { data: courier, error: courierError },
+    { data: vehicles, error: vehicleError },
+    { data: documents, error: docsError },
+    { data: payoutMethods, error: payoutError },
+  ] = await Promise.all([
+    supabase
+      .from('couriers')
+      .select(
+        `
+        id,
+        national_id,
+        city,
+        date_of_birth,
+        drivers_license_number,
+        is_verified,
+        verification_status,
+        rating,
+        total_deliveries,
+        total_earnings,
+        account_balance,
+        created_at,
+        user_profiles ( full_name, email, phone, profile_photo )
+      `,
+      )
+      .eq('id', courierId)
+      .maybeSingle(),
+    supabase
+      .from('courier_vehicles')
+      .select('id, vehicle_type, brand, model, year, color, license_plate, vehicle_photo_url, registration_certificate_url, is_active')
+      .eq('courier_id', courierId)
+      .order('created_at', { ascending: false }),
+    supabase
+      .from('courier_documents')
+      .select('id, document_type, document_url, status, created_at')
+      .eq('courier_id', courierId)
+      .order('created_at', { ascending: true }),
+    supabase
+      .from('courier_payout_methods')
+      .select('id, method_type, provider, account_number, account_name, is_default, created_at')
+      .eq('courier_id', courierId)
+      .order('is_default', { ascending: false }),
+  ]);
 
   if (courierError) throw new Error(courierError.message || 'Failed to load courier');
   if (!courier) throw new Error('Courier not found');
   if (vehicleError) throw new Error(vehicleError.message || 'Failed to load courier vehicles');
   if (docsError) throw new Error(docsError.message || 'Failed to load courier documents');
+  if (payoutError) console.warn('Failed to load payout methods:', payoutError.message);
 
   const signedVehicles = await Promise.all(
     (vehicles || []).map(async (v) => {
@@ -656,6 +717,7 @@ export async function getAdminCourierDetail(courierId) {
     },
     vehicles: signedVehicles,
     documents: signedDocuments,
+    payoutMethods: payoutMethods || [],
   };
 }
 

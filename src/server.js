@@ -687,7 +687,7 @@ app.post('/couriers/onboarding/driver-license', requireAuth, async (req, res) =>
 // POST /couriers/onboarding/payout-method
 app.post('/couriers/onboarding/payout-method', requireAuth, async (req, res) => {
   try {
-    const { methodType, provider, accountNumber, accountName } = req.body || {};
+    const { methodType, provider, accountNumber, accountName, secondary } = req.body || {};
     const data = await saveCourierPayoutMethod({
       userId: req.userId,
       methodType,
@@ -695,6 +695,17 @@ app.post('/couriers/onboarding/payout-method', requireAuth, async (req, res) => 
       accountNumber,
       accountName,
     });
+    // Save optional secondary payout method
+    if (secondary?.provider && secondary?.accountNumber) {
+      await saveCourierPayoutMethod({
+        userId: req.userId,
+        methodType: secondary.methodType || 'mobile_money',
+        provider: secondary.provider,
+        accountNumber: secondary.accountNumber,
+        accountName: secondary.accountName || null,
+        isDefault: false,
+      });
+    }
     return res.json(data);
   } catch (error) {
     console.error('courier payout onboarding error:', error);
@@ -2626,6 +2637,26 @@ app.delete('/users/me/account', requireAuth, async (req, res) => {
       error: 'Failed to delete account',
       details: error.message || 'Please try again later',
     });
+  }
+});
+
+// PUT /users/me/push-token — save Expo push token for the current user
+app.put('/users/me/push-token', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { token } = req.body || {};
+    if (!token || typeof token !== 'string') {
+      return res.status(400).json({ error: 'token is required' });
+    }
+    const { error } = await supabase
+      .from('user_profiles')
+      .update({ push_token: token })
+      .eq('id', req.userId);
+    if (error) throw new Error(error.message || 'Failed to save push token');
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('PUT /users/me/push-token error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to save push token' });
   }
 });
 

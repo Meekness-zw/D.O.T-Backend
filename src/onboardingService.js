@@ -306,18 +306,20 @@ export async function saveCourierDriverLicense({
   return { success: true, uploads };
 }
 
-export async function saveCourierPayoutMethod({ userId, methodType, provider, accountNumber, accountName }) {
+export async function saveCourierPayoutMethod({ userId, methodType, provider, accountNumber, accountName, isDefault = true }) {
   requireSupabase();
   if (!userId) throw new Error('userId is required');
   if (!methodType) throw new Error('methodType is required');
   if (!provider || !String(provider).trim()) throw new Error('provider is required');
   if (!accountNumber || !String(accountNumber).trim()) throw new Error('accountNumber is required');
 
-  // Clear existing default
-  await supabase
-    .from('courier_payout_methods')
-    .update({ is_default: false })
-    .eq('courier_id', userId);
+  // Only clear existing defaults when saving a new primary method
+  if (isDefault) {
+    await supabase
+      .from('courier_payout_methods')
+      .update({ is_default: false })
+      .eq('courier_id', userId);
+  }
 
   const insert = {
     courier_id: userId,
@@ -325,7 +327,7 @@ export async function saveCourierPayoutMethod({ userId, methodType, provider, ac
     provider: String(provider).trim(),
     account_number: String(accountNumber).trim(),
     account_name: accountName ? String(accountName).trim() : null,
-    is_default: true,
+    is_default: isDefault,
   };
 
   const { data, error } = await supabase
