@@ -258,12 +258,11 @@ export async function saveCourierDriverLicense({
   expiryDate,
   frontBase64,
   backBase64,
-  selfieBase64,
 }) {
   requireSupabase();
   if (!userId) throw new Error('userId is required');
   if (!licenseNumber || !String(licenseNumber).trim()) throw new Error('licenseNumber is required');
-  if (!frontBase64 || !backBase64 || !selfieBase64) throw new Error('All license photos are required');
+  if (!frontBase64 || !backBase64) throw new Error('Front and back license photos are required');
 
   const { error: courierUpdateError } = await supabase.from('couriers').upsert(
     {
@@ -301,19 +300,6 @@ export async function saveCourierDriverLicense({
     courier_id: userId,
     document_type: 'id_drivers_license',
     document_url: backUrl,
-    status: 'pending',
-  });
-
-  const selfieUrl = await uploadToBucket({
-    bucket: COURIER_BUCKET,
-    path: `couriers/${userId}/driver_license/selfie.${extForMime(parseDataUrl(selfieBase64)?.mime)}`,
-    dataUrl: selfieBase64,
-  });
-  uploads.selfie = selfieUrl;
-  await supabase.from('courier_documents').insert({
-    courier_id: userId,
-    document_type: 'id_drivers_license',
-    document_url: selfieUrl,
     status: 'pending',
   });
 
