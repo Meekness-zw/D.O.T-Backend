@@ -514,7 +514,6 @@ export async function approveCourier(courierId) {
     .select(
       `
       id,
-      full_name,
       is_verified,
       verification_status,
       user_profiles ( full_name, email, phone )
