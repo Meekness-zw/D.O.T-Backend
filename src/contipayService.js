@@ -1,38 +1,45 @@
-import axios from 'axios';
+import { createRequire } from 'node:module';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { computeSubtotalSplit, recordMerchantEarningsForOrderPayment } from './orderPaymentSplit.js';
 import { notifyCustomerPaymentReceived } from './orderNotifications.js';
 
+// The contipay npm package is CommonJS — use createRequire to load it in an ESM project
+const require = createRequire(import.meta.url);
+const contipay = require('contipay');
+
 const supabase = supabaseAdmin;
-const CONTIPAY_BASE_URL = process.env.CONTIPAY_BASE_URL || process.env.CONTIPAY_URL || 'https://www.contipay.co.zw/api';
 
 export function getContipayConfig() {
   const apiKey = process.env.CONTIPAY_API_KEY || process.env.CONTIPAY_TOKEN;
-  const apiSecret = process.env.CONTIPAY_API_SECRET || process.env.CONTIPAY_SECRET;
-  
-  console.log('[ContiPay] Checking config. Keys present:', {
-    hasApiKey: !!process.env.CONTIPAY_API_KEY,
-    hasToken: !!process.env.CONTIPAY_TOKEN,
-    hasApiSecret: !!process.env.CONTIPAY_API_SECRET,
-    hasSecret: !!process.env.CONTIPAY_SECRET,
-  });
-  
+
   if (!apiKey) {
-    throw new Error('CONTIPAY_API_KEY (or CONTIPAY_TOKEN) must be set in backend/.env');
+    throw new Error('CONTIPAY_API_KEY must be set in backend/.env');
   }
-  return { apiKey, apiSecret };
+  return { apiKey };
+}
+
+/**
+ * Resolve which ContiPay payment method to use.
+ * Falls back to the CONTIPAY_DEFAULT_METHOD env var, then 'ecocash'.
+ */
+function resolvePaymentMethod(requested) {
+  const allowed = ['card', 'ecocash', 'onemoney', 'zipit'];
+  if (requested && allowed.includes(requested)) return requested;
+  const envDefault = process.env.CONTIPAY_DEFAULT_METHOD;
+  if (envDefault && allowed.includes(envDefault)) return envDefault;
+  return 'ecocash';
 }
 
 function mapContipayStatus(status) {
   const s = (status || '').toUpperCase();
-  if (s === 'SUCCESS' || s === 'SUCCESSFUL') return 'completed';
-  if (s === 'FAILED' || s === 'CANCELLED') return 'failed';
+  if (s === 'SUCCESS' || s === 'SUCCESSFUL' || s === 'PAID' || s === 'COMPLETE' || s === 'COMPLETED') return 'completed';
+  if (s === 'FAILED' || s === 'CANCELLED' || s === 'CANCELED' || s === 'DECLINED') return 'failed';
   return 'pending';
 }
 
 /**
- * Initiate a ContiPay payment for an order.
- * Returns { paymentUrl, payment }
+ * Initiate a ContiPay payment for an order using the official contipay SDK.
+ * Returns { paymentUrl, reference }
  */
 export async function initiateContipayPayment({
   userId,
@@ -43,101 +50,94 @@ export async function initiateContipayPayment({
   reference,
   callbackUrl,
   returnUrl,
+  method,
 }) {
-  console.log('[ContiPay] Initiate called with:', { userId, orderId, amount, phone, reference });
-
   if (!userId) throw new Error('userId is required');
   if (!amount || amount <= 0) throw new Error('amount must be > 0');
-  if (!phone) throw new Error('customer phone is required');
   if (!reference) throw new Error('reference is required');
 
-  let config;
+  const { apiKey } = getContipayConfig();
+
+  // Configure the SDK with the API key if it exposes a configure / setApiKey method
+  if (typeof contipay.configure === 'function') {
+    contipay.configure({ apiKey });
+  } else if (typeof contipay.setApiKey === 'function') {
+    contipay.setApiKey(apiKey);
+  } else if (typeof contipay.init === 'function') {
+    contipay.init({ apiKey });
+  }
+  // If none of the above — the SDK may read CONTIPAY_API_KEY from process.env automatically
+
+  const paymentMethod = resolvePaymentMethod(method);
+
+  console.log('[ContiPay] Creating payment:', { orderId, amount, reference, method: paymentMethod });
+
+  let payment;
   try {
-    config = getContipayConfig();
-    console.log('[ContiPay] Config loaded, API key starts with:', config.apiKey?.slice(0, 4));
-  } catch (configErr) {
-    console.error('[ContiPay] Config error:', configErr.message);
-    throw configErr;
+    payment = await contipay.createPayment({
+      amount: Number(amount),
+      currency: 'USD',
+      method: paymentMethod,
+      reference,
+      callback: callbackUrl,
+      ...(returnUrl ? { returnUrl } : {}),
+      ...(phone ? { phone } : {}),
+      ...(email ? { email } : {}),
+    });
+  } catch (sdkErr) {
+    console.error('[ContiPay] SDK error:', sdkErr?.message || sdkErr);
+    throw new Error(`ContiPay payment creation failed: ${sdkErr?.message || 'Unknown error'}`);
   }
 
-  const { apiKey, apiSecret } = config;
-
-  let response;
-  try {
-    console.log('[ContiPay] Making request to:', `${CONTIPAY_BASE_URL}/payments/initiate`);
-    response = await axios.post(
-      `${CONTIPAY_BASE_URL}/payments/initiate`,
-      {
-        amount,
-        currency: 'USD',
-        customer_phone: phone,
-        customer_email: email || '',
-        reference,
-        callback_url: callbackUrl,
-        return_url: returnUrl || callbackUrl,
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`,
-          'x-api-secret': apiSecret,
-        },
-        timeout: 30000,
-      },
-    );
-    console.log('[ContiPay] Response status:', response.status, 'data:', response.data);
-  } catch (axiosErr) {
-    console.error('[ContiPay] API request failed. Code:', axiosErr.code);
-    console.error('[ContiPay] Error message:', axiosErr.message);
-    if (axiosErr.response) {
-      console.error('[ContiPay] Response status:', axiosErr.response.status);
-      console.error('[ContiPay] Response data:', JSON.stringify(axiosErr.response.data));
-    }
-    throw new Error(`ContiPay API error: ${axiosErr.message}`);
-  }
-
-  console.log('[ContiPay] Initiate response:', response.status, response.data);
-
-  const paymentUrl = response.data?.payment_url;
+  const paymentUrl = payment?.checkoutUrl || payment?.paymentUrl || payment?.checkout_url || payment?.url;
   if (!paymentUrl) {
-    console.error('[ContiPay] Unexpected response:', response.status, JSON.stringify(response.data));
-    throw new Error(`ContiPay did not return a payment URL (status ${response.status}): ${JSON.stringify(response.data)}`);
+    console.error('[ContiPay] No checkout URL in SDK response:', payment);
+    throw new Error('ContiPay did not return a checkout URL');
   }
 
-  const { data: payment, error: paymentError } = await supabase
+  console.log('[ContiPay] Payment created. Checkout URL:', paymentUrl);
+
+  // Record the payment in our database
+  const { data: paymentRecord, error: paymentError } = await supabase
     .from('payments')
     .insert({
       order_id: orderId || null,
       customer_id: userId,
-      amount,
+      amount: Number(amount),
       currency: 'USD',
       payment_method: 'contipay',
       payment_provider: 'ContiPay',
       transaction_id: reference,
       status: 'pending',
-      metadata: { reference, contipay_response: response.data },
+      metadata: {
+        reference,
+        method: paymentMethod,
+        contipay_payment_id: payment?.id || payment?.paymentId || null,
+      },
     })
     .select('*')
     .single();
 
   if (paymentError) {
     console.error('[ContiPay] Failed to insert payment record:', paymentError);
-    throw new Error(paymentError.message || 'Failed to save payment');
+    throw new Error(paymentError.message || 'Failed to save payment record');
   }
 
-  return { paymentUrl, payment };
+  return { paymentUrl, payment: paymentRecord };
 }
 
 /**
- * Handle ContiPay callback (server-to-server POST from ContiPay).
- * Expected body: { status: 'SUCCESS'|'FAILED', reference, ... }
+ * Handle ContiPay server-to-server callback.
+ * ContiPay POSTs { status, reference, ... } to our callback URL.
  */
 export async function handleContipayCallback(body) {
   const { status, reference } = body || {};
   if (!reference) throw new Error('Missing reference in ContiPay callback');
 
   const paymentStatus = mapContipayStatus(status);
+  console.log('[ContiPay] Callback received:', { reference, status, paymentStatus });
 
+  // Merge existing metadata with callback payload
   const { data: prevPay } = await supabase
     .from('payments')
     .select('metadata')
@@ -189,11 +189,11 @@ async function finalizeOrderPayment(payment) {
     .maybeSingle();
 
   if (orderLoadError || !order) {
-    console.error('[ContiPay] Failed to load order for callback:', orderLoadError);
+    console.error('[ContiPay] Failed to load order for finalization:', orderLoadError);
     return;
   }
 
-  if (order.payment_status === 'paid') return; // already processed
+  if (order.payment_status === 'paid') return; // already processed — idempotent
 
   const { platformCommission, merchantEarnings } = computeSubtotalSplit(order.subtotal);
 
@@ -235,4 +235,6 @@ async function finalizeOrderPayment(payment) {
       orderNumber: order.order_number,
     });
   }
+
+  console.log('[ContiPay] Order finalized as paid:', order.id);
 }
