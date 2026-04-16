@@ -2473,6 +2473,30 @@ app.post('/auth/login-password', async (req, res) => {
   }
 });
 
+// POST /auth/refresh { refreshToken } — exchange a Supabase refresh token for a new access token
+app.post('/auth/refresh', async (req, res) => {
+  try {
+    const { refreshToken } = req.body || {};
+    if (!refreshToken || typeof refreshToken !== 'string') {
+      return res.status(400).json({ error: 'refreshToken is required' });
+    }
+    if (!supabaseAdmin) {
+      return res.status(503).json({ error: 'Server not configured' });
+    }
+    const { data, error } = await supabaseAdmin.auth.refreshSession({ refresh_token: refreshToken });
+    if (error || !data?.session) {
+      return res.status(401).json({ error: 'Invalid or expired refresh token' });
+    }
+    return res.json({
+      accessToken: data.session.access_token,
+      refreshToken: data.session.refresh_token,
+    });
+  } catch (err) {
+    console.error('POST /auth/refresh error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // POST /auth/check-phone { phone } — check if phone is already registered (any role)
 app.post('/auth/check-phone', async (req, res) => {
   try {
