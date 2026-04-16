@@ -78,6 +78,7 @@ export async function getOrdersForUser(userId, options = {}) {
         total_amount,
         payment_method,
         delivery_address,
+        estimated_delivery_time,
         created_at,
         updated_at,
         store_id,
