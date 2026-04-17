@@ -31,7 +31,18 @@ export function getContipayConfig() {
 
   const merchantId = process.env.CONTIPAY_MERCHANT_ID;
 
-  if (!token || !secret) throw new Error('CONTIPAY_AUTH_KEY / CONTIPAY_AUTH_SECRET must be set in backend/.env');
+  if (!token || !secret) {
+    // Log which names were checked so the Render env var name can be confirmed
+    console.error('[ContiPay] Missing credentials. Checked env vars:', {
+      CONTIPAY_TEST_AUTH_KEY:    !!process.env.CONTIPAY_TEST_AUTH_KEY,
+      CONTIPAY_AUTH_KEY:         !!process.env.CONTIPAY_AUTH_KEY,
+      CONTIPAY_TOKEN:            !!process.env.CONTIPAY_TOKEN,
+      CONTIPAY_TEST_AUTH_SECRET: !!process.env.CONTIPAY_TEST_AUTH_SECRET,
+      CONTIPAY_AUTH_SECRET:      !!process.env.CONTIPAY_AUTH_SECRET,
+      CONTIPAY_SECRET:           !!process.env.CONTIPAY_SECRET,
+    });
+    throw new Error('CONTIPAY_AUTH_KEY / CONTIPAY_AUTH_SECRET must be set in backend/.env');
+  }
   if (!merchantId)        throw new Error('CONTIPAY_MERCHANT_ID must be set in backend/.env');
 
   // CONTIPAY_ENV explicitly overrides NODE_ENV.
