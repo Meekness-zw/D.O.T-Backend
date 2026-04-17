@@ -89,15 +89,15 @@ export async function notifyCustomerOrderPlaced(supabase, {
   totalAmount = null,
 }) {
   if (!customerId) return;
-  const store = storeName || ‘The store’;
-  const numLabel = orderNumber ? `#${orderNumber}` : ‘your order’;
+  const store = storeName || 'The store';
+  const numLabel = orderNumber ? `#${orderNumber}` : 'your order';
 
   if (awaitingPayment) {
     await insertUserNotification(supabase, {
       userId: customerId,
-      title: ‘Complete payment’,
+      title: 'Complete payment',
       message: `Finish paying for ${numLabel} at ${store} to send it to the kitchen.`,
-      type: ‘payment’,
+      type: 'payment',
       referenceId: orderId,
       data: {
         orderId,
@@ -113,9 +113,9 @@ export async function notifyCustomerOrderPlaced(supabase, {
 
   await insertUserNotification(supabase, {
     userId: customerId,
-    title: ‘Order placed’,
-    message: `${numLabel} was sent to ${store}. You’ll get updates as it progresses.`,
-    type: ‘order’,
+    title: 'Order placed',
+    message: `${numLabel} was sent to ${store}. You'll get updates as it progresses.`,
+    type: 'order',
     referenceId: orderId,
     data: { orderId, orderNumber, storeName: store },
   });
