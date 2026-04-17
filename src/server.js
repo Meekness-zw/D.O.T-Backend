@@ -5751,6 +5751,38 @@ app.get('/admin/users', requireAdmin, async (req, res) => {
   }
 });
 
+// DELETE /admin/users/:id — permanently delete a user (auth + profile)
+app.delete('/admin/users/:id', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id) return res.status(400).json({ error: 'User ID required' });
+    await deleteUserById(id);
+    return res.json({ success: true, message: 'User deleted' });
+  } catch (error) {
+    console.error('admin delete user error:', error);
+    return res.status(500).json({ error: 'Failed to delete user', details: error.message || 'Try again later' });
+  }
+});
+
+// PATCH /admin/users/:id/suspend — suspend or unsuspend a user
+app.patch('/admin/users/:id/suspend', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { suspend } = req.body;
+    if (!id) return res.status(400).json({ error: 'User ID required' });
+    const { error } = await supabase
+      .from('user_profiles')
+      .update({ is_suspended: !!suspend })
+      .eq('id', id);
+    if (error) throw error;
+    return res.json({ success: true, is_suspended: !!suspend });
+  } catch (error) {
+    console.error('admin suspend user error:', error);
+    return res.status(500).json({ error: 'Failed to update user', details: error.message || 'Try again later' });
+  }
+});
+
 app.get('/admin/orders', requireAdmin, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
