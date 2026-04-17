@@ -118,6 +118,7 @@ export async function getOrdersForUser(userId, options = {}) {
         created_at,
         updated_at,
         store_id,
+        customer_id,
         stores ( store_name ),
         order_items (
           product_id,

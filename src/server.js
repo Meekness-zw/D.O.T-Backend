@@ -13,6 +13,7 @@ import {
 } from './userService.js';
 import { getOrdersForUser, getWalletTransactionsForUser, getPaymentsForUser, getFullUserMe, getMerchantDashboardStats } from './historyService.js';
 import { initiateContipayPayment, handleContipayCallback, getContipayConfig } from './contipayService.js';
+import { createPesepayTransaction, handlePesepayCallback } from './paymentService.js';
 import { createSupabaseAccessToken, verifyAccessToken } from './sessionToken.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import {
@@ -45,6 +46,7 @@ import { supabaseAdmin as publicSupabase } from './supabaseAdminClient.js';
 import { enrichStoreForCustomerListing, assertStoreAcceptingOrders } from './storeHours.js';
 import { getMerchantHelpPayload } from './merchantHelpContent.js';
 import {
+  insertUserNotification,
   notifyCustomerMerchantOrderStatus,
   notifyCustomerCourierAssigned,
   notifyCustomerOrderPlaced,
@@ -1068,7 +1070,28 @@ app.patch('/merchant/products/:id', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden', details: 'Cannot modify this product' });
     }
 
-    const { name, description, price, is_available, is_featured, image_url, category_id, unit } = req.body || {};
+    const { name, description, price, is_available, is_featured, image_url, category_id, category_name, unit } = req.body || {};
+
+    let resolvedCategoryId = category_id !== undefined ? (category_id || null) : undefined;
+    if (resolvedCategoryId === undefined && category_name !== undefined && String(category_name || '').trim()) {
+      const catName = String(category_name).trim();
+      const { data: existing } = await supabase
+        .from('product_categories')
+        .select('id')
+        .eq('store_id', product.store_id)
+        .ilike('name', catName)
+        .maybeSingle();
+      if (existing) {
+        resolvedCategoryId = existing.id;
+      } else {
+        const { data: created } = await supabase
+          .from('product_categories')
+          .insert({ store_id: product.store_id, name: catName })
+          .select('id')
+          .single();
+        if (created) resolvedCategoryId = created.id;
+      }
+    }
 
     const update = {};
     if (name !== undefined) update.name = String(name).trim();
@@ -1079,7 +1102,7 @@ app.patch('/merchant/products/:id', requireAuth, async (req, res) => {
     if (is_available !== undefined) update.is_available = !!is_available;
     if (is_featured !== undefined) update.is_featured = !!is_featured;
     if (image_url !== undefined) update.image_url = image_url ? String(image_url).trim() : null;
-    if (category_id !== undefined) update.category_id = category_id || null;
+    if (resolvedCategoryId !== undefined) update.category_id = resolvedCategoryId;
     if (unit !== undefined) update.unit = unit === 'kg' ? 'kg' : 'item';
 
     if (Object.keys(update).length === 0) {
@@ -1917,7 +1940,7 @@ app.get('/merchant/stores/:storeId/categories', requireAuth, async (req, res) =>
 app.post('/merchant/products', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
-    const { store_id, name, description, price, category_id, unit, image_url, is_available, is_featured } = req.body || {};
+    const { store_id, name, description, price, category_id, category_name, unit, image_url, is_available, is_featured } = req.body || {};
     if (!store_id || !name || price === undefined || price === null) {
       return res.status(400).json({
         error: 'Missing required fields',
@@ -1933,6 +1956,28 @@ app.post('/merchant/products', requireAuth, async (req, res) => {
     if (storeError || !store) {
       return res.status(403).json({ error: 'Forbidden', details: 'Store not found or access denied' });
     }
+
+    let resolvedCategoryId = category_id || null;
+    if (!resolvedCategoryId && category_name && String(category_name).trim()) {
+      const catName = String(category_name).trim();
+      const { data: existing } = await supabase
+        .from('product_categories')
+        .select('id')
+        .eq('store_id', store_id)
+        .ilike('name', catName)
+        .maybeSingle();
+      if (existing) {
+        resolvedCategoryId = existing.id;
+      } else {
+        const { data: created } = await supabase
+          .from('product_categories')
+          .insert({ store_id, name: catName })
+          .select('id')
+          .single();
+        if (created) resolvedCategoryId = created.id;
+      }
+    }
+
     const insert = {
       store_id,
       name: String(name).trim(),
@@ -1943,7 +1988,7 @@ app.post('/merchant/products', requireAuth, async (req, res) => {
       is_available: is_available !== false,
       is_featured: !!is_featured,
     };
-    if (category_id) insert.category_id = category_id;
+    if (resolvedCategoryId) insert.category_id = resolvedCategoryId;
     const { data: created, error: insertError } = await supabase
       .from('products')
       .insert(insert)
@@ -2793,7 +2838,7 @@ app.patch('/orders/:id', requireAuth, async (req, res) => {
     }
     if (
       !isCancelling &&
-      order.payment_method === 'contipay' &&
+      ['contipay', 'pesepay'].includes(order.payment_method) &&
       order.payment_status !== 'paid'
     ) {
       return res.status(400).json({
@@ -4145,10 +4190,10 @@ app.post('/orders', requireAuth, async (req, res) => {
       });
     }
 
-    if (!['cash', 'wallet', 'contipay'].includes(payment_method)) {
+    if (!['cash', 'wallet', 'contipay', 'pesepay'].includes(payment_method)) {
       return res.status(400).json({
         error: 'Invalid payment_method',
-        details: 'payment_method must be cash, wallet, or contipay',
+        details: 'payment_method must be cash, wallet, contipay, or pesepay',
       });
     }
 
@@ -4180,7 +4225,7 @@ app.post('/orders', requireAuth, async (req, res) => {
     const { data: store, error: storeError } = await supabase
       .from('stores')
       .select(
-        'id, store_name, address_line1, city, latitude, longitude, is_active, is_open, operating_hours',
+        'id, store_name, address_line1, city, latitude, longitude, is_active, is_open, operating_hours, merchant_id',
       )
       .eq('id', store_id)
       .maybeSingle();
@@ -4264,7 +4309,7 @@ app.post('/orders', requireAuth, async (req, res) => {
     let paymentStatus = 'pending';
     let orderStatus = 'pending';
 
-    if (payment_method === 'contipay') {
+    if (payment_method === 'contipay' || payment_method === 'pesepay') {
       orderStatus = 'awaiting_payment';
       paymentStatus = 'pending';
     } else if (payment_method === 'wallet') {
@@ -4403,6 +4448,23 @@ app.post('/orders', requireAuth, async (req, res) => {
       });
     } catch (notifyErr) {
       console.error('notifyCustomerOrderPlaced failed (non-fatal):', notifyErr);
+    }
+
+    // Notify the merchant that a new order has arrived
+    if (store.merchant_id) {
+      try {
+        const itemCount = items.length;
+        await insertUserNotification(supabase, {
+          userId: store.merchant_id,
+          title: 'New order received',
+          message: `Order ${orderNumber} — ${itemCount} item${itemCount !== 1 ? 's' : ''} — $${totalAmount.toFixed(2)}`,
+          type: 'order',
+          referenceId: order.id,
+          data: { orderId: order.id, orderNumber },
+        });
+      } catch (merchantNotifyErr) {
+        console.error('merchant order notification failed (non-fatal):', merchantNotifyErr);
+      }
     }
 
     return res.status(201).json({ order });
@@ -5327,6 +5389,112 @@ app.post('/payments/contipay/callback', async (req, res) => {
   }
 });
 
+// POST /payments/pesepay/start — initiate a Pesepay payment for an order (auth required)
+app.post('/payments/pesepay/start', requireAuth, async (req, res) => {
+  try {
+    const { orderId, amount, currencyCode = 'USD', reasonForPayment, merchantReference, customer, paymentMethodId, paymentMethodCode } = req.body || {};
+
+    if (!orderId) {
+      return res.status(400).json({ error: 'Missing orderId' });
+    }
+
+    const { data: ord, error: ordErr } = await supabase
+      .from('orders')
+      .select('id, customer_id, order_number, status, payment_method, payment_status, total_amount')
+      .eq('id', orderId)
+      .maybeSingle();
+
+    if (ordErr || !ord) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    if (ord.customer_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    if (ord.status !== 'awaiting_payment') {
+      return res.status(400).json({ error: 'Order is not awaiting payment' });
+    }
+
+    const requestedAmount = Number(amount) || Number(ord.total_amount);
+    if (!requestedAmount || requestedAmount <= 0) {
+      return res.status(400).json({ error: 'Invalid amount' });
+    }
+
+    const profile = await getProfile(req.userId);
+    const phone = customer?.phoneNumber || profile?.phone;
+    if (!phone) {
+      return res.status(400).json({
+        error: 'Phone number required',
+        details: 'Add a phone number to your profile so Pesepay can process payment.',
+      });
+    }
+
+    const finalPaymentMethodCode = paymentMethodCode || process.env.PESEPAY_USD_PAYMENT_METHOD_CODE;
+    if (!finalPaymentMethodCode) {
+      return res.status(400).json({
+        error: 'Missing paymentMethodCode',
+        details: 'PESEPAY_USD_PAYMENT_METHOD_CODE is not set in backend/.env',
+      });
+    }
+
+    const apiBase = process.env.API_BASE_URL || `http://localhost:${process.env.PORT || 4000}`;
+    const resultUrl = `${apiBase.replace(/\/$/, '')}/payments/pesepay/callback`;
+    const returnUrl = `${apiBase.replace(/\/$/, '')}/payments/pesepay/return?orderId=${encodeURIComponent(orderId)}`;
+
+    const result = await createPesepayTransaction({
+      userId: req.userId,
+      amount: requestedAmount,
+      currencyCode,
+      paymentMethodCode: finalPaymentMethodCode,
+      reasonForPayment: reasonForPayment || `Order ${ord.order_number}`,
+      merchantReference: merchantReference || ord.order_number,
+      resultUrl,
+      returnUrl,
+      customer: {
+        phoneNumber: phone,
+        email: customer?.email || profile?.email || '',
+        name: customer?.name || profile?.full_name || 'Customer',
+      },
+      orderId: ord.id,
+      customerPaymentMethodId: paymentMethodId || null,
+    });
+
+    return res.json({ transaction: result.transaction, payment: result.payment });
+  } catch (error) {
+    console.error('Pesepay start error:', error);
+    return res.status(500).json({
+      error: 'Failed to start Pesepay payment',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// GET /payments/pesepay/return — browser redirect after Pesepay hosted page; forwards to app deep link
+app.get('/payments/pesepay/return', (req, res) => {
+  const scheme = process.env.APP_PAYMENT_DEEP_LINK_SCHEME || 'dotdeliveryontime';
+  const q = new URLSearchParams(req.query || {});
+  const target = `${scheme}://payment-return?${q.toString()}`;
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Returning to app</title>
+<meta http-equiv="refresh" content="0;url=${target.replace(/"/g, '&quot;')}">
+<script>window.location.replace(${JSON.stringify(target)});</script></head>
+<body><p>Returning to the app…</p></body></html>`;
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  return res.status(200).send(html);
+});
+
+// POST /payments/pesepay/callback — Pesepay server-to-server result callback (no auth)
+app.post('/payments/pesepay/callback', async (req, res) => {
+  try {
+    await handlePesepayCallback(req.body);
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error('Pesepay callback error:', error);
+    return res.status(500).json({
+      error: 'Failed to process Pesepay callback',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // GET /users/me/payment-methods — payment methods saved for the current customer
 app.get('/users/me/payment-methods', requireAuth, async (req, res) => {
   try {
@@ -6028,6 +6196,70 @@ async function runScheduledPromotions() {
   if (error) console.error('runScheduledPromotions error:', error);
   else if (ids.length) console.log('[Cron] Activated recurring promotions:', ids.length);
 }
+
+// ─── Google Maps proxy endpoints ─────────────────────────────────────────────
+// These proxy requests to the Google Maps APIs so the API key stays on the server.
+
+// GET /maps/places/autocomplete?input=...&components=...&types=...
+app.get('/maps/places/autocomplete', async (req, res) => {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) return res.status(503).json({ status: 'REQUEST_DENIED', error_message: 'Google Maps API key not configured on server.' });
+  try {
+    const params = new URLSearchParams({
+      key: apiKey,
+      input: req.query.input || '',
+      ...(req.query.components ? { components: req.query.components } : {}),
+      ...(req.query.types ? { types: req.query.types } : {}),
+      ...(req.query.location ? { location: req.query.location } : {}),
+      ...(req.query.radius ? { radius: req.query.radius } : {}),
+    });
+    const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?${params}`;
+    const r = await axios.get(url, { timeout: 8000 });
+    return res.json(r.data);
+  } catch (err) {
+    console.error('GET /maps/places/autocomplete error:', err.message);
+    return res.status(502).json({ status: 'UNKNOWN_ERROR', error_message: err.message });
+  }
+});
+
+// GET /maps/places/details?place_id=...&fields=...
+app.get('/maps/places/details', async (req, res) => {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) return res.status(503).json({ status: 'REQUEST_DENIED', error_message: 'Google Maps API key not configured on server.' });
+  if (!req.query.place_id) return res.status(400).json({ status: 'INVALID_REQUEST', error_message: 'place_id is required.' });
+  try {
+    const params = new URLSearchParams({
+      key: apiKey,
+      place_id: req.query.place_id,
+      ...(req.query.fields ? { fields: req.query.fields } : {}),
+    });
+    const url = `https://maps.googleapis.com/maps/api/place/details/json?${params}`;
+    const r = await axios.get(url, { timeout: 8000 });
+    return res.json(r.data);
+  } catch (err) {
+    console.error('GET /maps/places/details error:', err.message);
+    return res.status(502).json({ status: 'UNKNOWN_ERROR', error_message: err.message });
+  }
+});
+
+// GET /maps/geocode?latlng=lat,lng  (reverse geocoding — Android only; iOS uses native)
+app.get('/maps/geocode', async (req, res) => {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) return res.status(503).json({ status: 'REQUEST_DENIED', error_message: 'Google Maps API key not configured on server.' });
+  if (!req.query.latlng) return res.status(400).json({ status: 'INVALID_REQUEST', error_message: 'latlng is required.' });
+  try {
+    const params = new URLSearchParams({
+      key: apiKey,
+      latlng: req.query.latlng,
+    });
+    const url = `https://maps.googleapis.com/maps/api/geocode/json?${params}`;
+    const r = await axios.get(url, { timeout: 8000 });
+    return res.json(r.data);
+  } catch (err) {
+    console.error('GET /maps/geocode error:', err.message);
+    return res.status(502).json({ status: 'UNKNOWN_ERROR', error_message: err.message });
+  }
+});
 
 app.listen(PORT, () => {
   console.log('✅ DOT Backend API started successfully');
