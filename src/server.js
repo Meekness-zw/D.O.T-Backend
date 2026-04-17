@@ -5271,7 +5271,8 @@ app.post('/payments/contipay/start', requireAuth, async (req, res) => {
 
     const apiBase = process.env.API_BASE_URL || `http://localhost:${process.env.PORT || 4000}`;
     const callbackUrl = `${apiBase.replace(/\/$/, '')}/payments/contipay/callback`;
-    const returnUrl = `${apiBase.replace(/\/$/, '')}/payments/contipay/return?orderId=${encodeURIComponent(orderId)}`;
+    const returnUrl = `${apiBase.replace(/\/$/, '')}/payments/contipay/return?orderId=${encodeURIComponent(orderId)}&status=success`;
+    const cancelUrl = `${apiBase.replace(/\/$/, '')}/payments/contipay/return?orderId=${encodeURIComponent(orderId)}&status=cancelled`;
     const reference = `DOT-${ord.order_number || orderId.slice(0, 8)}-${Date.now()}`;
 
     const result = await initiateContipayPayment({
@@ -5280,9 +5281,11 @@ app.post('/payments/contipay/start', requireAuth, async (req, res) => {
       amount: Number(amount),
       phone,
       email,
+      fullName: profile?.full_name || '',
       reference,
       callbackUrl,
       returnUrl,
+      cancelUrl,
     });
 
     return res.json({ paymentUrl: result.paymentUrl, reference });

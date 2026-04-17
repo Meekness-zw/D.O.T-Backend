@@ -1,52 +1,78 @@
-import axios from 'axios';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const Contipay = require('contipay-js/src/contipay.js');
+const RedirectMethod = require('contipay-js/src/helpers/redirect_method.js');
+
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { computeSubtotalSplit, recordMerchantEarningsForOrderPayment } from './orderPaymentSplit.js';
 import { notifyCustomerPaymentReceived } from './orderNotifications.js';
 
 const supabase = supabaseAdmin;
 
-// ContiPay REST API base URL — override via CONTIPAY_API_URL env var
-const CONTIPAY_API_BASE = process.env.CONTIPAY_API_URL || 'https://api.contipay.co.zw';
+// ContiPay API URLs (from official Postman collection)
+const CONTIPAY_UAT_URL  = 'https://api-uat.contipay.net';    // sandbox/test
+const CONTIPAY_LIVE_URL = 'https://api-v2.contipay.co.zw';   // production
 
 export function getContipayConfig() {
-  const apiKey = process.env.CONTIPAY_API_KEY || process.env.CONTIPAY_TOKEN;
+  const isProduction = process.env.NODE_ENV === 'production';
 
-  if (!apiKey) {
-    throw new Error('CONTIPAY_API_KEY must be set in backend/.env');
-  }
-  return { apiKey };
+  // Support separate test/live key pairs (official ContiPay pattern).
+  // Falls back to the shared CONTIPAY_AUTH_KEY / CONTIPAY_AUTH_SECRET if the
+  // environment-specific ones are not set.
+  const token = isProduction
+    ? (process.env.CONTIPAY_LIVE_AUTH_KEY    || process.env.CONTIPAY_AUTH_KEY)
+    : (process.env.CONTIPAY_TEST_AUTH_KEY    || process.env.CONTIPAY_AUTH_KEY);
+
+  const secret = isProduction
+    ? (process.env.CONTIPAY_LIVE_AUTH_SECRET || process.env.CONTIPAY_AUTH_SECRET)
+    : (process.env.CONTIPAY_TEST_AUTH_SECRET || process.env.CONTIPAY_AUTH_SECRET);
+
+  const merchantId = process.env.CONTIPAY_MERCHANT_ID;
+
+  if (!token || !secret) throw new Error('CONTIPAY_AUTH_KEY / CONTIPAY_AUTH_SECRET must be set in backend/.env');
+  if (!merchantId)        throw new Error('CONTIPAY_MERCHANT_ID must be set in backend/.env');
+
+  // CONTIPAY_ENV explicitly overrides NODE_ENV.
+  // Set CONTIPAY_ENV=DEV in your .env to always use the sandbox, even on production infra.
+  const contipayEnv = (process.env.CONTIPAY_ENV || '').toUpperCase();
+  const env = contipayEnv === 'LIVE' ? 'LIVE'
+            : contipayEnv === 'DEV'  ? 'DEV'
+            : isProduction           ? 'LIVE'
+            :                          'DEV';
+
+  return { token, secret, merchantId: Number(merchantId), env };
 }
 
 /**
- * Resolve which ContiPay payment method to use.
- * Falls back to the CONTIPAY_DEFAULT_METHOD env var, then 'ecocash'.
+ * Map ContiPay webhook status to our internal status.
+ * statusCode is most reliable: 1 = paid, 4 = declined.
  */
-function resolvePaymentMethod(requested) {
-  const allowed = ['card', 'ecocash', 'onemoney', 'zipit'];
-  if (requested && allowed.includes(requested)) return requested;
-  const envDefault = process.env.CONTIPAY_DEFAULT_METHOD;
-  if (envDefault && allowed.includes(envDefault)) return envDefault;
-  return 'ecocash';
-}
+function mapContipayStatus(status, statusCode) {
+  if (statusCode === 1) return 'completed';
+  if (statusCode === 4) return 'failed';
 
-function mapContipayStatus(status) {
-  const s = (status || '').toUpperCase();
-  if (s === 'SUCCESS' || s === 'SUCCESSFUL' || s === 'PAID' || s === 'COMPLETE' || s === 'COMPLETED') return 'completed';
-  if (s === 'FAILED' || s === 'CANCELLED' || s === 'CANCELED' || s === 'DECLINED') return 'failed';
+  const s = (status || '').toLowerCase();
+  if (['paid', 'success', 'successful', 'complete', 'completed'].includes(s)) return 'completed';
+  if (['declined', 'failed', 'cancelled', 'canceled'].includes(s)) return 'failed';
   return 'pending';
 }
 
+function parseCustomerName(fullName) {
+  const parts = (fullName || '').trim().split(/\s+/);
+  const firstName  = parts[0] || '-';
+  const surname    = parts.length > 1 ? parts[parts.length - 1] : '-';
+  const middleName = parts.length > 2 ? parts.slice(1, -1).join(' ') : '-';
+  return { firstName, surname, middleName };
+}
+
 /**
- * Initiate a ContiPay payment for an order via the ContiPay REST API.
- * Returns { paymentUrl, payment }
+ * Initiate a ContiPay redirect payment for an order.
  *
- * ContiPay API reference:
- *   POST {CONTIPAY_API_BASE}/v1/payments
- *   Authorization: Bearer <apiKey>
- *   Body: { amount, currency, method, reference, callback, returnUrl, phone, email }
+ * Uses contipay-js (npm) with the redirect method:
+ *   PUT {baseUrl}/acquire/payment  (Basic auth: token:secret)
  *
- * Response field candidates for the checkout URL:
- *   checkoutUrl | paymentUrl | checkout_url | url | redirect_url | payment_url
+ * ContiPay returns a hosted checkout URL that the customer opens to
+ * pick their payment method (EcoCash, card, etc.).
  */
 export async function initiateContipayPayment({
   userId,
@@ -54,87 +80,92 @@ export async function initiateContipayPayment({
   amount,
   phone,
   email,
+  fullName,
   reference,
   callbackUrl,
   returnUrl,
-  method,
+  cancelUrl,
 }) {
-  if (!userId) throw new Error('userId is required');
+  if (!userId)              throw new Error('userId is required');
   if (!amount || amount <= 0) throw new Error('amount must be > 0');
-  if (!reference) throw new Error('reference is required');
+  if (!reference)           throw new Error('reference is required');
 
-  const { apiKey } = getContipayConfig();
-  const paymentMethod = resolvePaymentMethod(method);
+  const { token, secret, merchantId, env } = getContipayConfig();
+  const { firstName, surname, middleName }  = parseCustomerName(fullName);
 
-  console.log('[ContiPay] Creating payment:', { orderId, amount, reference, method: paymentMethod });
+  // ContiPay expects local format, e.g. 0771234567
+  const cell = (phone || '').replace(/^\+263/, '0').replace(/\s+/g, '');
 
-  const payload = {
-    amount: Number(amount),
-    currency: 'USD',
-    method: paymentMethod,
-    reference,
-    callback: callbackUrl,
-    ...(returnUrl ? { returnUrl } : {}),
-    ...(phone ? { phone } : {}),
-    ...(email ? { email } : {}),
-  };
+  console.log('[ContiPay] Creating redirect payment:', { orderId, amount, reference, env });
 
-  let responseData;
-  try {
-    const response = await axios.post(
-      `${CONTIPAY_API_BASE}/v1/payments`,
-      payload,
-      {
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
-        timeout: 30000,
-      }
+  // Initialize client — call updateURL BEFORE setAppMode so it picks up the
+  // correct UAT host (the npm package default is stale).
+  const client = new Contipay(token, secret);
+  client.updateURL(CONTIPAY_UAT_URL, CONTIPAY_LIVE_URL);
+  client.setAppMode(env);           // DEV → UAT, LIVE → production
+  client.setPaymentMethod('redirect'); // PUT
+
+  // Build the redirect payload via the RedirectMethod helper
+  const helper = new RedirectMethod(
+    merchantId,
+    callbackUrl,
+    returnUrl  || callbackUrl,
+    cancelUrl  || returnUrl || callbackUrl,
+  );
+  helper
+    .setUpCustomer(firstName, surname, cell, 'ZW', email || '', middleName)
+    .setUpTransaction(
+      Number(amount),
+      'USD',
+      reference,
+      `DOT order payment (ref: ${reference})`,
     );
-    responseData = response.data;
-  } catch (err) {
-    const detail = err.response?.data?.message
-      || err.response?.data?.error
-      || err.message
-      || 'Unknown error';
+
+  const payload = helper.preparePayload();
+  console.log('[ContiPay] Payload:', JSON.stringify(payload));
+
+  const responseData = await client.process(payload);
+
+  // contipay-js swallows HTTP errors and returns { status: 'Error', message }
+  if (!responseData || responseData.status === 'Error') {
+    const detail = responseData?.message || 'Unknown error';
     console.error('[ContiPay] API error:', detail);
     throw new Error(`ContiPay payment creation failed: ${detail}`);
   }
 
+  console.log('[ContiPay] API response:', JSON.stringify(responseData));
+
   const paymentUrl =
-    responseData?.checkoutUrl ||
-    responseData?.paymentUrl ||
+    responseData?.paymentUrl   ||
+    responseData?.payment_url  ||
+    responseData?.checkoutUrl  ||
     responseData?.checkout_url ||
+    responseData?.redirectUrl  ||
     responseData?.redirect_url ||
-    responseData?.payment_url ||
-    responseData?.url;
+    responseData?.url          ||
+    responseData?.data?.paymentUrl ||
+    responseData?.data?.url;
 
   if (!paymentUrl) {
-    console.error('[ContiPay] No checkout URL in response:', responseData);
+    console.error('[ContiPay] No checkout URL in response:', JSON.stringify(responseData));
     throw new Error('ContiPay did not return a checkout URL');
   }
 
-  console.log('[ContiPay] Payment created. Checkout URL:', paymentUrl);
+  console.log('[ContiPay] Checkout URL:', paymentUrl);
 
-  // Record the payment in our database
+  // Record the pending payment
   const { data: paymentRecord, error: paymentError } = await supabase
     .from('payments')
     .insert({
-      order_id: orderId || null,
-      customer_id: userId,
-      amount: Number(amount),
-      currency: 'USD',
-      payment_method: 'contipay',
+      order_id:         orderId || null,
+      customer_id:      userId,
+      amount:           Number(amount),
+      currency:         'USD',
+      payment_method:   'contipay',
       payment_provider: 'ContiPay',
-      transaction_id: reference,
-      status: 'pending',
-      metadata: {
-        reference,
-        method: paymentMethod,
-        contipay_payment_id: responseData?.id || responseData?.paymentId || null,
-      },
+      transaction_id:   reference,
+      status:           'pending',
+      metadata: { reference, contipay_response: responseData },
     })
     .select('*')
     .single();
@@ -148,17 +179,16 @@ export async function initiateContipayPayment({
 }
 
 /**
- * Handle ContiPay server-to-server callback.
- * ContiPay POSTs { status, reference, ... } to our callback URL.
+ * Handle ContiPay server-to-server webhook callback.
+ * Webhook payload includes: { status, statusCode, reference, contiPayRef, amount, charge, message }
  */
 export async function handleContipayCallback(body) {
-  const { status, reference } = body || {};
+  const { status, statusCode, reference } = body || {};
   if (!reference) throw new Error('Missing reference in ContiPay callback');
 
-  const paymentStatus = mapContipayStatus(status);
-  console.log('[ContiPay] Callback received:', { reference, status, paymentStatus });
+  const paymentStatus = mapContipayStatus(status, statusCode);
+  console.log('[ContiPay] Callback received:', { reference, status, statusCode, paymentStatus });
 
-  // Merge existing metadata with callback payload
   const { data: prevPay } = await supabase
     .from('payments')
     .select('metadata')
@@ -214,7 +244,7 @@ async function finalizeOrderPayment(payment) {
     return;
   }
 
-  if (order.payment_status === 'paid') return; // already processed — idempotent
+  if (order.payment_status === 'paid') return; // idempotent
 
   const { platformCommission, merchantEarnings } = computeSubtotalSplit(order.subtotal);
 
@@ -227,10 +257,10 @@ async function finalizeOrderPayment(payment) {
   const { data: updatedOrder, error: orderUpdateError } = await supabase
     .from('orders')
     .update({
-      payment_status: 'paid',
-      status: 'pending',
+      payment_status:             'paid',
+      status:                     'pending',
       platform_commission_amount: platformCommission,
-      merchant_earnings_amount: merchantEarnings,
+      merchant_earnings_amount:   merchantEarnings,
     })
     .eq('id', order.id)
     .select('*')
@@ -242,18 +272,18 @@ async function finalizeOrderPayment(payment) {
   }
 
   await notifyCustomerPaymentReceived(supabase, {
-    customerId: order.customer_id,
-    orderId: updatedOrder.id,
+    customerId:  order.customer_id,
+    orderId:     updatedOrder.id,
     orderNumber: updatedOrder.order_number,
-    storeName: store?.store_name,
+    storeName:   store?.store_name,
   });
 
   if (store?.merchant_id && merchantEarnings > 0) {
     await recordMerchantEarningsForOrderPayment({
       merchantUserId: store.merchant_id,
-      paymentId: payment.id,
-      amount: merchantEarnings,
-      orderNumber: order.order_number,
+      paymentId:      payment.id,
+      amount:         merchantEarnings,
+      orderNumber:    order.order_number,
     });
   }
 
