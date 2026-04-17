@@ -5999,6 +5999,15 @@ app.listen(PORT, () => {
   console.log('✅ DOT Backend API started successfully');
   console.log(`📍 Server: http://localhost:${PORT}`);
   console.log(`🌍 Environment: ${NODE_ENV}`);
+  console.log('[ENV CHECK] ContiPay vars present at startup:', {
+    CONTIPAY_AUTH_KEY:         !!process.env.CONTIPAY_AUTH_KEY,
+    CONTIPAY_AUTH_SECRET:      !!process.env.CONTIPAY_AUTH_SECRET,
+    CONTIPAY_TOKEN:            !!process.env.CONTIPAY_TOKEN,
+    CONTIPAY_SECRET:           !!process.env.CONTIPAY_SECRET,
+    CONTIPAY_MERCHANT_ID:      !!process.env.CONTIPAY_MERCHANT_ID,
+    CONTIPAY_ENV:              process.env.CONTIPAY_ENV || '(not set, defaults to DEV)',
+    SUPABASE_SERVICE_ROLE_KEY: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+  });
   console.log(`🔒 CORS allowed origins:`, allowedOrigins);
   if (!process.env.PESEPAY_USD_PAYMENT_METHOD_CODE && !process.env.PAYMENT_USD_METHOD_CODE) {
     console.warn(
