@@ -4398,6 +4398,8 @@ app.post('/orders', requireAuth, async (req, res) => {
         orderNumber: order.order_number,
         storeName: store.store_name,
         awaitingPayment: orderStatus === 'awaiting_payment',
+        paymentMethod: payment_method || null,
+        totalAmount: totalAmount || null,
       });
     } catch (notifyErr) {
       console.error('notifyCustomerOrderPlaced failed (non-fatal):', notifyErr);
@@ -6000,10 +6002,10 @@ app.listen(PORT, () => {
   console.log(`📍 Server: http://localhost:${PORT}`);
   console.log(`🌍 Environment: ${NODE_ENV}`);
   console.log('[ENV CHECK] ContiPay vars present at startup:', {
+    CONTIPAY_API_KEY:          !!process.env.CONTIPAY_API_KEY,
+    CONTIPAY_API_SECRET:       !!process.env.CONTIPAY_API_SECRET,
     CONTIPAY_AUTH_KEY:         !!process.env.CONTIPAY_AUTH_KEY,
     CONTIPAY_AUTH_SECRET:      !!process.env.CONTIPAY_AUTH_SECRET,
-    CONTIPAY_TOKEN:            !!process.env.CONTIPAY_TOKEN,
-    CONTIPAY_SECRET:           !!process.env.CONTIPAY_SECRET,
     CONTIPAY_MERCHANT_ID:      !!process.env.CONTIPAY_MERCHANT_ID,
     CONTIPAY_ENV:              process.env.CONTIPAY_ENV || '(not set, defaults to DEV)',
     SUPABASE_SERVICE_ROLE_KEY: !!process.env.SUPABASE_SERVICE_ROLE_KEY,

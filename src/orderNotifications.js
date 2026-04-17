@@ -5,7 +5,7 @@
 
 export async function insertUserNotification(
   supabase,
-  { userId, title, message, type = 'order', referenceId = null },
+  { userId, title, message, type = 'order', referenceId = null, data = null },
 ) {
   if (!supabase || !userId || !title || !message) return;
   const { error } = await supabase.from('notifications').insert({
@@ -14,6 +14,7 @@ export async function insertUserNotification(
     message: String(message).slice(0, 2000),
     type,
     reference_id: referenceId,
+    ...(data ? { data } : {}),
   });
   if (error) console.error('[notifications] insert failed:', error.message || error);
 }
@@ -84,28 +85,39 @@ export async function notifyCustomerOrderPlaced(supabase, {
   orderNumber,
   storeName,
   awaitingPayment,
+  paymentMethod = null,
+  totalAmount = null,
 }) {
   if (!customerId) return;
-  const store = storeName || 'The store';
-  const numLabel = orderNumber ? `#${orderNumber}` : 'your order';
+  const store = storeName || ‘The store’;
+  const numLabel = orderNumber ? `#${orderNumber}` : ‘your order’;
 
   if (awaitingPayment) {
     await insertUserNotification(supabase, {
       userId: customerId,
-      title: 'Complete payment',
+      title: ‘Complete payment’,
       message: `Finish paying for ${numLabel} at ${store} to send it to the kitchen.`,
-      type: 'payment',
+      type: ‘payment’,
       referenceId: orderId,
+      data: {
+        orderId,
+        orderNumber,
+        storeName: store,
+        paymentMethod,
+        totalAmount,
+        awaitingPayment: true,
+      },
     });
     return;
   }
 
   await insertUserNotification(supabase, {
     userId: customerId,
-    title: 'Order placed',
+    title: ‘Order placed’,
     message: `${numLabel} was sent to ${store}. You’ll get updates as it progresses.`,
-    type: 'order',
+    type: ‘order’,
     referenceId: orderId,
+    data: { orderId, orderNumber, storeName: store },
   });
 }
 
