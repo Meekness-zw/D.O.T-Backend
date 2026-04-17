@@ -383,8 +383,7 @@ app.get('/business-types', async (req, res) => {
     if (!supabase) throw new Error('Server not configured');
     const { data, error } = await supabase
       .from('business_types')
-      .select('id, name, icon, is_default')
-      .order('is_default', { ascending: false })
+      .select('id, name, icon')
       .order('name', { ascending: true });
     if (error) throw new Error(error.message);
     return res.json({ business_types: data || [] });

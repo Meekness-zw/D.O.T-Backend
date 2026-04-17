@@ -19,13 +19,15 @@ export function getContipayConfig() {
   // Support separate test/live key pairs (official ContiPay pattern).
   // Falls back to the shared CONTIPAY_AUTH_KEY / CONTIPAY_AUTH_SECRET if the
   // environment-specific ones are not set.
+  // Accept all naming conventions in order of preference so existing Render
+  // vars (CONTIPAY_TOKEN / CONTIPAY_SECRET) keep working without changes.
   const token = isProduction
-    ? (process.env.CONTIPAY_LIVE_AUTH_KEY    || process.env.CONTIPAY_AUTH_KEY)
-    : (process.env.CONTIPAY_TEST_AUTH_KEY    || process.env.CONTIPAY_AUTH_KEY);
+    ? (process.env.CONTIPAY_LIVE_AUTH_KEY    || process.env.CONTIPAY_AUTH_KEY    || process.env.CONTIPAY_TOKEN)
+    : (process.env.CONTIPAY_TEST_AUTH_KEY    || process.env.CONTIPAY_AUTH_KEY    || process.env.CONTIPAY_TOKEN);
 
   const secret = isProduction
-    ? (process.env.CONTIPAY_LIVE_AUTH_SECRET || process.env.CONTIPAY_AUTH_SECRET)
-    : (process.env.CONTIPAY_TEST_AUTH_SECRET || process.env.CONTIPAY_AUTH_SECRET);
+    ? (process.env.CONTIPAY_LIVE_AUTH_SECRET || process.env.CONTIPAY_AUTH_SECRET || process.env.CONTIPAY_SECRET)
+    : (process.env.CONTIPAY_TEST_AUTH_SECRET || process.env.CONTIPAY_AUTH_SECRET || process.env.CONTIPAY_SECRET);
 
   const merchantId = process.env.CONTIPAY_MERCHANT_ID;
 
