@@ -4499,7 +4499,7 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
     // Merchant core row must exist
     const { data: merchant, error: merchantError } = await supabase
       .from('merchants')
-      .select('id, business_name, business_type, is_active, approval_status')
+      .select('id, business_name, business_type, is_active, approval_status, rejected_reason')
       .eq('id', req.userId)
       .maybeSingle();
 
@@ -4514,6 +4514,8 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
     const isMerchant = !!merchant;
     const approvalStatus = merchant?.approval_status || 'pending';
     const isApproved = approvalStatus === 'approved';
+    const isRejected = approvalStatus === 'rejected';
+    const rejectedReason = merchant?.rejected_reason || null;
 
     // At least one store with required address/geo fields
     // Be lenient - check for any store, not just is_active = true
@@ -4567,6 +4569,8 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
       onboardingComplete,
       approvalStatus,
       isApproved,
+      isRejected,
+      rejectedReason,
     });
   } catch (error) {
     console.error('get /merchant/onboarding-status error:', error);

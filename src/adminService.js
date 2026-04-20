@@ -607,33 +607,43 @@ export async function rejectMerchant(merchantId, reason) {
   return merchant;
 }
 
-// Reject a courier
+// Reject a courier — notify then delete all courier data so they can re-apply
 export async function rejectCourier(courierId, reason) {
   if (!supabase) throw new Error('Server not configured');
 
-  const { data: courier, error } = await supabase
+  // Fetch courier info for notification before deleting
+  const { data: courier, error: fetchError } = await supabase
     .from('couriers')
-    .update({ verification_status: 'rejected' })
+    .select('id, user_profiles ( full_name, email, phone )')
     .eq('id', courierId)
-    .select(
-      `
-      id,
-      verification_status,
-      user_profiles ( full_name, email, phone )
-    `,
-    )
     .maybeSingle();
 
-  if (error) throw new Error(error.message || 'Failed to reject courier');
+  if (fetchError) throw new Error(fetchError.message || 'Failed to find courier');
   if (!courier) throw new Error('Courier not found');
 
+  // Notify the user before wiping data
   await sendExpoPush(courierId, {
-    title: 'Application Update',
-    body: reason ? `Your courier application was not approved: ${reason}` : 'Your courier application was not approved. Please contact support.',
-    data: { type: 'courier_rejected' },
+    title: 'Application Declined',
+    body: reason
+      ? `Your courier application was declined: ${reason}. Please review the requirements and try again.`
+      : 'Your courier application was declined. Please review the requirements and try again.',
+    data: { type: 'courier_rejected', reason: reason || null },
   });
 
-  return courier;
+  // Delete related data (cascade may not cover all tables)
+  await supabase.from('courier_documents').delete().eq('courier_id', courierId);
+  await supabase.from('courier_vehicles').delete().eq('courier_id', courierId);
+  await supabase.from('courier_payout_methods').delete().eq('courier_id', courierId);
+
+  // Delete the courier record — user_profiles row stays so they can log in and re-apply
+  const { error: deleteError } = await supabase
+    .from('couriers')
+    .delete()
+    .eq('id', courierId);
+
+  if (deleteError) throw new Error(deleteError.message || 'Failed to remove courier record');
+
+  return { id: courierId, deleted: true };
 }
 
 // Detailed view for a specific courier (for admin "Approve Users" modal)
