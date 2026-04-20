@@ -97,13 +97,10 @@ export async function upsertCourierProfile({
     throw new Error('You must be at least 18 years old to create a courier account');
   }
 
-  // Update profile name and ensure role stays courier without touching email
+  // Update display name only; role is determined by table membership, email is never overwritten
   const { error: profileError } = await supabase
     .from('user_profiles')
-    .update({
-      full_name: String(fullName).trim(),
-      role: 'courier',
-    })
+    .update({ full_name: String(fullName).trim() })
     .eq('id', userId);
   if (profileError) throw new Error(profileError.message || 'Failed to update user profile');
 
@@ -153,18 +150,6 @@ export async function upsertCourierProfile({
       document_url: url,
       status: 'pending',
     });
-  }
-
-  // If we uploaded a profile photo, also persist it into user_profiles.profile_photo
-  if (uploads.profile_photo_url) {
-    try {
-      await supabase
-        .from('user_profiles')
-        .update({ profile_photo: uploads.profile_photo_url })
-        .eq('id', userId);
-    } catch (e) {
-      console.error('Failed to save courier profile photo to user_profiles:', e);
-    }
   }
 
   return { success: true, uploads };
@@ -375,18 +360,14 @@ export async function upsertMerchantOnboarding({
   if (!address || !String(address).trim()) throw new Error('address is required');
   if (latitude == null || longitude == null) throw new Error('latitude and longitude are required');
 
-  const fallbackEmail = email ? String(email).trim() : `${userId}@merchant.local`;
-
-  const { error: profileError } = await supabase.from('user_profiles').upsert(
-    {
-      id: userId,
-      full_name: ownerName ? String(ownerName).trim() : null,
-      role: 'merchant',
-      email: fallbackEmail,
-    },
-    { onConflict: 'id' },
-  );
-  if (profileError) throw new Error(profileError.message || 'Failed to update user profile');
+  // Only update full_name if provided; never overwrite email (login email) or role (determined by table membership)
+  if (ownerName && String(ownerName).trim()) {
+    const { error: profileError } = await supabase
+      .from('user_profiles')
+      .update({ full_name: String(ownerName).trim() })
+      .eq('id', userId);
+    if (profileError) throw new Error(profileError.message || 'Failed to update user profile');
+  }
 
   const merchantPayload = {
     id: userId,

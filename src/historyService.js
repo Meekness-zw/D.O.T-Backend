@@ -274,7 +274,30 @@ export async function getFullUserMe(userId) {
     const courierProfileDoc =
       Array.isArray(courierDocs) && courierDocs.length > 0 ? courierDocs[0] : null;
     if (courierProfileDoc?.document_url) {
-      result.courier_profile_photo_url = courierProfileDoc.document_url;
+      // Attempt to create a signed URL (1 hour) so the image is accessible from private buckets
+      try {
+        const rawUrl = courierProfileDoc.document_url;
+        const u = new URL(rawUrl);
+        const parts = u.pathname.split('/').filter(Boolean);
+        const objectIdx = parts.findIndex((p) => p === 'object');
+        if (objectIdx !== -1) {
+          const afterObject = parts.slice(objectIdx + 1);
+          const isPublicPath = afterObject[0] === 'public';
+          const bucket = isPublicPath ? afterObject[1] : afterObject[0];
+          const pathParts = isPublicPath ? afterObject.slice(2) : afterObject.slice(1);
+          const path = decodeURIComponent(pathParts.join('/'));
+          if (bucket && path) {
+            const { data: signed } = await supabase.storage.from(bucket).createSignedUrl(path, 3600);
+            result.courier_profile_photo_url = signed?.signedUrl || rawUrl;
+          } else {
+            result.courier_profile_photo_url = rawUrl;
+          }
+        } else {
+          result.courier_profile_photo_url = rawUrl;
+        }
+      } catch {
+        result.courier_profile_photo_url = courierProfileDoc.document_url;
+      }
     }
   }
 
