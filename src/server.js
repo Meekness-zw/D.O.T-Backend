@@ -13,7 +13,6 @@ import {
 } from './userService.js';
 import { getOrdersForUser, getWalletTransactionsForUser, getPaymentsForUser, getFullUserMe, getMerchantDashboardStats } from './historyService.js';
 import { initiateContipayPayment, handleContipayCallback, getContipayConfig } from './contipayService.js';
-import { createPesepayTransaction, handlePesepayCallback } from './paymentService.js';
 import { createSupabaseAccessToken, verifyAccessToken } from './sessionToken.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import {
@@ -2838,7 +2837,7 @@ app.patch('/orders/:id', requireAuth, async (req, res) => {
     }
     if (
       !isCancelling &&
-      ['contipay', 'pesepay'].includes(order.payment_method) &&
+      order.payment_method === 'contipay' &&
       order.payment_status !== 'paid'
     ) {
       return res.status(400).json({
@@ -4190,10 +4189,10 @@ app.post('/orders', requireAuth, async (req, res) => {
       });
     }
 
-    if (!['cash', 'wallet', 'contipay', 'pesepay'].includes(payment_method)) {
+    if (!['cash', 'wallet', 'contipay'].includes(payment_method)) {
       return res.status(400).json({
         error: 'Invalid payment_method',
-        details: 'payment_method must be cash, wallet, contipay, or pesepay',
+        details: 'payment_method must be cash, wallet, or contipay',
       });
     }
 
@@ -4309,7 +4308,7 @@ app.post('/orders', requireAuth, async (req, res) => {
     let paymentStatus = 'pending';
     let orderStatus = 'pending';
 
-    if (payment_method === 'contipay' || payment_method === 'pesepay') {
+    if (payment_method === 'contipay') {
       orderStatus = 'awaiting_payment';
       paymentStatus = 'pending';
     } else if (payment_method === 'wallet') {
@@ -5393,112 +5392,6 @@ app.post('/payments/contipay/callback', async (req, res) => {
   }
 });
 
-// POST /payments/pesepay/start — initiate a Pesepay payment for an order (auth required)
-app.post('/payments/pesepay/start', requireAuth, async (req, res) => {
-  try {
-    const { orderId, amount, currencyCode = 'USD', reasonForPayment, merchantReference, customer, paymentMethodId, paymentMethodCode } = req.body || {};
-
-    if (!orderId) {
-      return res.status(400).json({ error: 'Missing orderId' });
-    }
-
-    const { data: ord, error: ordErr } = await supabase
-      .from('orders')
-      .select('id, customer_id, order_number, status, payment_method, payment_status, total_amount')
-      .eq('id', orderId)
-      .maybeSingle();
-
-    if (ordErr || !ord) {
-      return res.status(404).json({ error: 'Order not found' });
-    }
-    if (ord.customer_id !== req.userId) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-    if (ord.status !== 'awaiting_payment') {
-      return res.status(400).json({ error: 'Order is not awaiting payment' });
-    }
-
-    const requestedAmount = Number(amount) || Number(ord.total_amount);
-    if (!requestedAmount || requestedAmount <= 0) {
-      return res.status(400).json({ error: 'Invalid amount' });
-    }
-
-    const profile = await getProfile(req.userId);
-    const phone = customer?.phoneNumber || profile?.phone;
-    if (!phone) {
-      return res.status(400).json({
-        error: 'Phone number required',
-        details: 'Add a phone number to your profile so Pesepay can process payment.',
-      });
-    }
-
-    const finalPaymentMethodCode = paymentMethodCode || process.env.PESEPAY_USD_PAYMENT_METHOD_CODE;
-    if (!finalPaymentMethodCode) {
-      return res.status(400).json({
-        error: 'Missing paymentMethodCode',
-        details: 'PESEPAY_USD_PAYMENT_METHOD_CODE is not set in backend/.env',
-      });
-    }
-
-    const apiBase = process.env.API_BASE_URL || `http://localhost:${process.env.PORT || 4000}`;
-    const resultUrl = `${apiBase.replace(/\/$/, '')}/payments/pesepay/callback`;
-    const returnUrl = `${apiBase.replace(/\/$/, '')}/payments/pesepay/return?orderId=${encodeURIComponent(orderId)}`;
-
-    const result = await createPesepayTransaction({
-      userId: req.userId,
-      amount: requestedAmount,
-      currencyCode,
-      paymentMethodCode: finalPaymentMethodCode,
-      reasonForPayment: reasonForPayment || `Order ${ord.order_number}`,
-      merchantReference: merchantReference || ord.order_number,
-      resultUrl,
-      returnUrl,
-      customer: {
-        phoneNumber: phone,
-        email: customer?.email || profile?.email || '',
-        name: customer?.name || profile?.full_name || 'Customer',
-      },
-      orderId: ord.id,
-      customerPaymentMethodId: paymentMethodId || null,
-    });
-
-    return res.json({ transaction: result.transaction, payment: result.payment });
-  } catch (error) {
-    console.error('Pesepay start error:', error);
-    return res.status(500).json({
-      error: 'Failed to start Pesepay payment',
-      details: error.message || 'Please try again later',
-    });
-  }
-});
-
-// GET /payments/pesepay/return — browser redirect after Pesepay hosted page; forwards to app deep link
-app.get('/payments/pesepay/return', (req, res) => {
-  const scheme = process.env.APP_PAYMENT_DEEP_LINK_SCHEME || 'dotdeliveryontime';
-  const q = new URLSearchParams(req.query || {});
-  const target = `${scheme}://payment-return?${q.toString()}`;
-  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Returning to app</title>
-<meta http-equiv="refresh" content="0;url=${target.replace(/"/g, '&quot;')}">
-<script>window.location.replace(${JSON.stringify(target)});</script></head>
-<body><p>Returning to the app…</p></body></html>`;
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  return res.status(200).send(html);
-});
-
-// POST /payments/pesepay/callback — Pesepay server-to-server result callback (no auth)
-app.post('/payments/pesepay/callback', async (req, res) => {
-  try {
-    await handlePesepayCallback(req.body);
-    return res.json({ ok: true });
-  } catch (error) {
-    console.error('Pesepay callback error:', error);
-    return res.status(500).json({
-      error: 'Failed to process Pesepay callback',
-      details: error.message || 'Please try again later',
-    });
-  }
-});
-
 // GET /users/me/payment-methods — payment methods saved for the current customer
 app.get('/users/me/payment-methods', requireAuth, async (req, res) => {
   try {
@@ -6279,11 +6172,6 @@ app.listen(PORT, () => {
     SUPABASE_SERVICE_ROLE_KEY: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
   });
   console.log(`🔒 CORS allowed origins:`, allowedOrigins);
-  if (!process.env.PESEPAY_USD_PAYMENT_METHOD_CODE && !process.env.PAYMENT_USD_METHOD_CODE) {
-    console.warn(
-      '[Pesepay] PESEPAY_USD_PAYMENT_METHOD_CODE is not set. USD order payments will fail until you add it to backend/.env (copy the payment method code from your Pesepay sandbox or live dashboard).',
-    );
-  }
   runScheduledPromotions();
   setInterval(runScheduledPromotions, 15 * 60 * 1000);
 });
