@@ -286,9 +286,11 @@ export async function getFullUserMe(userId) {
         const objectIdx = parts.findIndex((p) => p === 'object');
         if (objectIdx !== -1) {
           const afterObject = parts.slice(objectIdx + 1);
-          const isPublicPath = afterObject[0] === 'public';
-          const bucket = isPublicPath ? afterObject[1] : afterObject[0];
-          const pathParts = isPublicPath ? afterObject.slice(2) : afterObject.slice(1);
+          // Supabase storage paths: /object/public/{bucket}/… or /object/sign/{bucket}/… or /object/authenticated/{bucket}/…
+          const knownAccessTypes = ['public', 'sign', 'authenticated'];
+          const hasAccessType = knownAccessTypes.includes(afterObject[0]);
+          const bucket = hasAccessType ? afterObject[1] : afterObject[0];
+          const pathParts = hasAccessType ? afterObject.slice(2) : afterObject.slice(1);
           const path = decodeURIComponent(pathParts.join('/'));
           if (bucket && path) {
             const { data: signed } = await supabase.storage.from(bucket).createSignedUrl(path, 3600);

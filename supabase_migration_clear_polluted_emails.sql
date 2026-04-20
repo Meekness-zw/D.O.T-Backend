@@ -1,13 +1,10 @@
--- Clear user_profiles.email for phone-only accounts where it was polluted by merchant onboarding.
--- A phone-only account is one where auth.users has no email but user_profiles.email is non-null.
--- Onboarding no longer writes to user_profiles.email, so this is a one-time cleanup.
+-- Sync user_profiles.email to the canonical email from auth.users.
+-- This clears merchant business emails that were incorrectly written to user_profiles.email
+-- during merchant onboarding. Phone-only users will have email set to NULL (correct).
+-- Email-registered users will have their real auth email preserved.
 
 UPDATE user_profiles up
-SET email = NULL
-WHERE up.email IS NOT NULL
-  AND NOT EXISTS (
-    SELECT 1 FROM auth.users au
-    WHERE au.id = up.id
-      AND au.email IS NOT NULL
-      AND au.email <> ''
-  );
+SET email = au.email
+FROM auth.users au
+WHERE au.id = up.id
+  AND up.email IS DISTINCT FROM au.email;
