@@ -237,22 +237,9 @@ export async function getFullUserMe(userId) {
   const roles = await getRoles(userId);
   const result = { profile, roles: roles.length > 0 ? roles : (profile.role ? [profile.role] : []) };
 
-  // Fetch the canonical email from Supabase Auth — this is never touched by role onboarding,
-  // so it's always the user's real email (or null for phone-only accounts).
-  try {
-    const authResult = await supabase.auth.admin.getUserById(userId);
-    const authEmail = authResult?.data?.user?.email || null;
-    result.auth_email = authEmail;
-
-    // If the auth account has no email (phone-only registration) but user_profiles.email was
-    // polluted by merchant onboarding, clear it silently so courier/customer views see null.
-    if (!authEmail && profile.email) {
-      await supabase.from('user_profiles').update({ email: null }).eq('id', userId).catch(() => {});
-      result.profile = { ...result.profile, email: null };
-    }
-  } catch {
-    result.auth_email = null;
-  }
+  // Use user_profiles.email as canonical email. Merchant onboarding no longer writes to this
+  // column, so it reflects the user's own email (or null for phone-only accounts).
+  result.auth_email = profile.email ?? null;
 
   if (result.roles.includes('customer')) {
     const { data } = await supabase.from('customers').select('*').eq('id', userId).single();
