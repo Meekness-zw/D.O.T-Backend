@@ -427,7 +427,8 @@ export async function getAdminPendingUsers() {
         user_profiles ( full_name, email, phone )
       `,
       )
-      .neq('verification_status', 'approved'),
+      // neq does not match NULL — also include rows where verification_status is null
+      .or('verification_status.is.null,verification_status.neq.approved'),
     supabase
       .from('merchants')
       .select(
@@ -442,7 +443,8 @@ export async function getAdminPendingUsers() {
         user_profiles ( full_name, email, phone )
       `,
       )
-      .or('is_verified.eq.false,is_active.eq.false,approval_status.neq.approved'),
+      // neq does not match NULL — explicitly include null approval_status rows too
+      .or('approval_status.is.null,approval_status.neq.approved'),
   ]);
 
   if (couriersRes.error) {

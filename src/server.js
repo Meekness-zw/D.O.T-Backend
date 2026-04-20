@@ -58,6 +58,44 @@ import axios from 'axios';
 const app = express();
 const supabase = supabaseAdmin;
 const PORT = process.env.PORT || 4000;
+
+// Send push notification to all verified, non-busy couriers about a new ready order
+async function notifyAvailableCouriers(orderId, orderNumber, storeName) {
+  if (!supabase) return;
+  try {
+    // Get all verified couriers
+    const { data: couriers } = await supabase
+      .from('couriers')
+      .select('id, user_profiles ( push_token )')
+      .eq('is_verified', true);
+    if (!couriers?.length) return;
+
+    // Exclude couriers currently on an active delivery
+    const { data: busyRows } = await supabase
+      .from('orders')
+      .select('courier_id')
+      .in('status', ['assigned', 'merchant_confirmed', 'picked_up', 'in_transit', 'delivery_confirmation_pending'])
+      .not('courier_id', 'is', null);
+    const busyIds = new Set((busyRows || []).map((r) => r.courier_id));
+
+    const numLabel = orderNumber ? `#${orderNumber}` : 'An order';
+    const store = storeName || 'a store';
+    const pushMessages = [];
+    for (const courier of couriers) {
+      if (busyIds.has(courier.id)) continue;
+      const token = courier.user_profiles?.push_token;
+      if (!token || !token.startsWith('ExponentPushToken')) continue;
+      pushMessages.push({ to: token, title: 'New delivery available', body: `${numLabel} from ${store} is ready for pickup.`, data: { type: 'new_job', orderId }, sound: 'default' });
+    }
+    if (!pushMessages.length) return;
+    await axios.post('https://exp.host/push/send', pushMessages, {
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      timeout: 10000,
+    });
+  } catch (err) {
+    console.warn('[Push] Failed to notify couriers for order', orderId, err?.message);
+  }
+}
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
 // Simple distance + ETA helpers
@@ -84,6 +122,23 @@ function estimateEtaMinutes(distanceKm) {
   const minutes = (distanceKm / speedKmh) * 60;
   const clamped = Math.min(Math.max(minutes, 10), 60); // 10–60 mins
   return Math.round(clamped);
+}
+
+// Delivery fee: $5 base for ≤10 km; beyond that $0.50/km ($0.55 during rush hour).
+// Rush hour = weekdays 7–9 am and 5–7 pm Zimbabwe time (CAT = UTC+2).
+function isRushHour(date = new Date()) {
+  const localHour = (date.getUTCHours() + 2) % 24;
+  const day = date.getUTCDay(); // 0=Sun, 6=Sat
+  const weekday = day >= 1 && day <= 5;
+  return weekday && ((localHour >= 7 && localHour < 9) || (localHour >= 17 && localHour < 19));
+}
+
+function calculateDeliveryFee(distanceKm) {
+  const BASE = 5.00;
+  const BASE_KM = 10;
+  if (distanceKm <= BASE_KM) return BASE;
+  const rate = isRushHour() ? 0.55 : 0.50;
+  return Math.round((BASE + (distanceKm - BASE_KM) * rate) * 100) / 100;
 }
 
 // Environment validation (Twilio + Supabase for phone auth)
@@ -1030,6 +1085,30 @@ app.get('/stores/:storeId/menu', async (req, res) => {
       error: 'Failed to load menu',
       details: error.message || 'Please try again later',
     });
+  }
+});
+
+// GET /stores/:storeId/delivery-fee?delivery_lat=&delivery_lng= — estimate delivery fee for a store
+app.get('/stores/:storeId/delivery-fee', async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { storeId } = req.params;
+    const deliveryLat = parseFloat(req.query.delivery_lat);
+    const deliveryLng = parseFloat(req.query.delivery_lng);
+    if (!Number.isFinite(deliveryLat) || !Number.isFinite(deliveryLng)) {
+      return res.status(400).json({ error: 'delivery_lat and delivery_lng are required' });
+    }
+    const { data: store, error } = await supabase
+      .from('stores')
+      .select('latitude, longitude')
+      .eq('id', storeId)
+      .maybeSingle();
+    if (error || !store) return res.status(404).json({ error: 'Store not found' });
+    const distanceKm = haversineKm(store.latitude, store.longitude, deliveryLat, deliveryLng);
+    const fee = calculateDeliveryFee(distanceKm);
+    return res.json({ delivery_fee: fee, distance_km: Math.round(distanceKm * 10) / 10, is_rush_hour: isRushHour() });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to calculate delivery fee' });
   }
 });
 
@@ -2880,6 +2959,10 @@ app.patch('/orders/:id', requireAuth, async (req, res) => {
       storeName: storeRow?.store_name,
     });
 
+    if (status === 'ready') {
+      notifyAvailableCouriers(updated.id, updated.order_number, storeRow?.store_name).catch(() => {});
+    }
+
     return res.json(updated);
   } catch (error) {
     console.error('patch /orders/:id error:', error);
@@ -2918,12 +3001,12 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
       .toLowerCase()
       .trim()
       .replace(/\s+/g, '_');
-    const cancellable = new Set(['awaiting_payment', 'pending', 'confirmed', 'preparing']);
+    const cancellable = new Set(['awaiting_payment', 'pending']);
     if (!cancellable.has(st)) {
       return res.status(400).json({
         error: 'Cannot cancel this order',
         details:
-          'You can only cancel before the store marks it ready for pickup. Contact support if you need help.',
+          'You can only cancel before the merchant accepts your order. Contact support if you need help.',
       });
     }
 
@@ -3621,6 +3704,7 @@ app.get('/courier/jobs/open', requireAuth, async (req, res) => {
         id,
         order_number,
         total_amount,
+        delivery_fee,
         status,
         pickup_address,
         pickup_latitude,
@@ -4293,7 +4377,11 @@ app.post('/orders', requireAuth, async (req, res) => {
       (sum, item) => sum + Number(item.subtotal || 0),
       0,
     );
-    const deliveryFee = 0; // TODO: dynamic delivery pricing
+    const distanceKm = haversineKm(
+      store.latitude, store.longitude,
+      defAddr.latitude, defAddr.longitude,
+    );
+    const deliveryFee = calculateDeliveryFee(distanceKm);
     const tax = 0;
     const totalAmount = subtotal + deliveryFee + tax;
 
