@@ -3468,6 +3468,28 @@ app.post('/customer/orders/:id/confirm-delivery', requireAuth, async (req, res) 
         amount: order.delivery_fee,
         orderNumber: order.order_number,
       });
+
+      // Notify courier that customer confirmed delivery
+      try {
+        const { data: courierProfile } = await supabase
+          .from('user_profiles')
+          .select('push_token')
+          .eq('id', order.courier_id)
+          .maybeSingle();
+        const courierToken = courierProfile?.push_token;
+        if (courierToken && courierToken.startsWith('ExponentPushToken')) {
+          const orderLabel = order.order_number ? `#${order.order_number}` : 'Your delivery';
+          await axios.post('https://exp.host/push/send', [{
+            to: courierToken,
+            title: 'Delivery confirmed!',
+            body: `${orderLabel} has been confirmed by the customer. Great work!`,
+            data: { type: 'delivery_completed', orderId: id },
+            sound: 'default',
+          }], { headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 10000 });
+        }
+      } catch (pushErr) {
+        console.warn('[Push] Failed to notify courier of delivery confirmation:', pushErr?.message);
+      }
     }
 
     return res.json({ order: updated });
@@ -4329,6 +4351,28 @@ app.post('/courier/orders/:id/complete', requireAuth, async (req, res) => {
     });
     if (historyError) {
       console.error('order_status_history insert (delivery_confirmation_pending) error:', historyError);
+    }
+
+    // Notify customer to confirm delivery
+    try {
+      const { data: customerProfile } = await supabase
+        .from('user_profiles')
+        .select('push_token')
+        .eq('id', order.customer_id)
+        .maybeSingle();
+      const customerToken = customerProfile?.push_token;
+      if (customerToken && customerToken.startsWith('ExponentPushToken')) {
+        const orderLabel = order.order_number ? `#${order.order_number}` : 'Your order';
+        await axios.post('https://exp.host/push/send', [{
+          to: customerToken,
+          title: 'Your order has arrived!',
+          body: `${orderLabel} has been delivered. Please confirm you received it.`,
+          data: { type: 'delivery_confirmation', orderId: id },
+          sound: 'default',
+        }], { headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 10000 });
+      }
+    } catch (pushErr) {
+      console.warn('[Push] Failed to notify customer of delivery confirmation request:', pushErr?.message);
     }
 
     return res.json({ order: pending });
