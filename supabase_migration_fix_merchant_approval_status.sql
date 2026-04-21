@@ -8,7 +8,7 @@
 
 UPDATE merchants
 SET approval_status = 'approved',
-    is_active       = true
+    is_active       = truea
 WHERE approval_status IS NULL
   AND is_verified   = true;
 
