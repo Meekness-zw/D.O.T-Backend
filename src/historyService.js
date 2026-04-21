@@ -285,29 +285,33 @@ export async function getFullUserMe(userId) {
         const objectIdx = parts.findIndex((p) => p === 'object');
         if (objectIdx !== -1) {
           const afterObject = parts.slice(objectIdx + 1);
-          const accessType = afterObject[0]; // 'public' | 'sign' | 'authenticated'
-
-          // Public bucket files have permanent URLs — no signed URL needed.
-          if (accessType === 'public') {
-            result.courier_profile_photo_url = rawUrl;
-          } else {
-            // Private / authenticated bucket — create a long-lived signed URL (7 days).
-            const knownAccessTypes = ['sign', 'authenticated'];
-            const hasAccessType = knownAccessTypes.includes(accessType);
-            const bucket = hasAccessType ? afterObject[1] : afterObject[0];
-            const pathParts = hasAccessType ? afterObject.slice(2) : afterObject.slice(1);
-            const path = decodeURIComponent(pathParts.join('/'));
-            if (bucket && path) {
-              const { data: signed } = await supabase.storage.from(bucket).createSignedUrl(path, 604800);
-              result.courier_profile_photo_url = signed?.signedUrl || rawUrl;
+          // getPublicUrl() always produces /object/public/{bucket}/… even for private buckets.
+          // We must always attempt a signed URL — a private bucket URL is inaccessible without one.
+          const knownAccessTypes = ['public', 'sign', 'authenticated'];
+          const hasAccessType = knownAccessTypes.includes(afterObject[0]);
+          const bucket = hasAccessType ? afterObject[1] : afterObject[0];
+          const pathParts = hasAccessType ? afterObject.slice(2) : afterObject.slice(1);
+          const path = decodeURIComponent(pathParts.join('/'));
+          if (bucket && path) {
+            // 7-day expiry — long enough to survive app restarts; refreshed on every focus
+            const { data: signed, error: signErr } = await supabase.storage
+              .from(bucket)
+              .createSignedUrl(path, 604800);
+            if (signed?.signedUrl) {
+              result.courier_profile_photo_url = signed.signedUrl;
             } else {
+              // Fallback: if bucket is genuinely public the raw URL works; private buckets will be blank
+              console.warn('[historyService] createSignedUrl failed:', signErr?.message, '— bucket:', bucket, 'path:', path);
               result.courier_profile_photo_url = rawUrl;
             }
+          } else {
+            result.courier_profile_photo_url = rawUrl;
           }
         } else {
           result.courier_profile_photo_url = rawUrl;
         }
-      } catch {
+      } catch (e) {
+        console.warn('[historyService] courier photo URL parse error:', e?.message);
         result.courier_profile_photo_url = courierProfileDoc.document_url;
       }
     }
