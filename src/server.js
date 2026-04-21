@@ -6035,6 +6035,57 @@ app.patch('/users/profile', requireAuth, async (req, res) => {
 });
 
 // ========== Admin Dashboard API (require ADMIN_API_KEY) ==========
+
+// POST /admin/create-user { phone, name, role, password }
+// Creates a new user directly (bypasses OTP) — admin use only.
+app.post('/admin/create-user', requireAdmin, async (req, res) => {
+  try {
+    const { phone, name, role, password } = req.body;
+    const missing = ['phone', 'role', 'password'].filter(f => !req.body[f]);
+    if (missing.length) {
+      return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
+    }
+    const validRoles = ['customer', 'merchant', 'courier'];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({ error: `Invalid role. Must be one of: ${validRoles.join(', ')}` });
+    }
+
+    // Check if phone is already registered
+    const existing = await checkPhoneRegistered(phone);
+    let userId;
+    if (existing.registered) {
+      return res.status(409).json({ error: 'A user with this phone number already exists.' });
+    }
+
+    const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+      phone,
+      password,
+      phone_confirm: true,
+    });
+    if (authError) {
+      if (authError.code === 'phone_exists') {
+        const { data: listData, error: listError } = await supabaseAdmin.auth.admin.listUsers();
+        if (listError) throw listError;
+        const match = listData.users.find(u => u.phone === phone);
+        if (!match) throw new Error('Phone already registered but user not found.');
+        userId = match.id;
+        await supabaseAdmin.auth.admin.updateUserById(userId, { password });
+      } else {
+        throw authError;
+      }
+    } else {
+      userId = authData.user.id;
+    }
+
+    await ensureUserProfile({ userId, email: null, phone, fullName: name || '', role, password });
+
+    return res.status(201).json({ success: true, userId, phone, name: name || '', role });
+  } catch (error) {
+    console.error('admin/create-user error:', error);
+    return res.status(500).json({ error: 'Failed to create user', details: error.message });
+  }
+});
+
 app.get('/admin/stats', requireAdmin, async (req, res) => {
   try {
     const stats = await getAdminStats();
