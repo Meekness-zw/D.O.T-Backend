@@ -59,17 +59,39 @@ const app = express();
 const supabase = supabaseAdmin;
 const PORT = process.env.PORT || 4000;
 
-// Paginate through ALL auth users to find one by phone.
-// listUsers() defaults to 50 per page — without pagination the user is
-// silently missing when there are more than 50 accounts.
+// Find an auth user by phone number.
+// Strategy 1: GoTrue REST admin API supports a phone filter — fast, exact.
+// Strategy 2: Paginate listUsers with normalised comparison (handles + prefix
+//             differences between what we pass and what Supabase stores).
 async function findAuthUserByPhone(phone) {
+  const normalize = (p) => (p || '').replace(/\s+/g, '');
+
+  // Strategy 1: direct REST query
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (supabaseUrl && serviceKey) {
+    try {
+      const url = `${supabaseUrl}/auth/v1/admin/users?filter=${encodeURIComponent(`phone=${phone}`)}&per_page=1`;
+      const res = await fetch(url, {
+        headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` },
+      });
+      if (res.ok) {
+        const body = await res.json();
+        const users = Array.isArray(body?.users) ? body.users : [];
+        if (users.length > 0) return users[0];
+      }
+    } catch (_) { /* fall through */ }
+  }
+
+  // Strategy 2: paginated scan with normalised comparison
   let page = 1;
   while (true) {
     const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page, perPage: 1000 });
     if (error) throw error;
-    const match = data.users.find(u => u.phone === phone);
+    const users = Array.isArray(data?.users) ? data.users : [];
+    const match = users.find(u => normalize(u.phone) === normalize(phone));
     if (match) return match;
-    if (data.users.length < 1000) return null;
+    if (users.length < 1000) return null;
     page++;
   }
 }

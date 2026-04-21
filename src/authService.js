@@ -48,11 +48,33 @@ export async function checkPhoneRegistered(phone) {
     throw error;
   }
 
-  return {
-    registered: !!profile,
-    userId: profile?.id || null,
-    role: profile?.role || null
-  };
+  if (profile) {
+    return { registered: true, userId: profile.id, role: profile.role || null };
+  }
+
+  // Profile not found — check auth.users directly so callers can reuse the
+  // existing auth record instead of hitting a phone_exists conflict.
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (supabaseUrl && serviceKey) {
+    try {
+      const url = `${supabaseUrl}/auth/v1/admin/users?filter=${encodeURIComponent(`phone=${phone}`)}&per_page=1`;
+      const res = await fetch(url, {
+        headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` },
+      });
+      if (res.ok) {
+        const body = await res.json();
+        const users = Array.isArray(body?.users) ? body.users : [];
+        if (users.length > 0) {
+          // Auth user exists but profile was deleted — treat as registered so
+          // verify-otp reuses the existing auth ID and recreates the profile.
+          return { registered: true, userId: users[0].id, role: null };
+        }
+      }
+    } catch (_) { /* ignore — fall through to not-registered */ }
+  }
+
+  return { registered: false, userId: null, role: null };
 }
 
 export async function deleteUserById(userId) {
