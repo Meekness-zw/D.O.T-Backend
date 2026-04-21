@@ -162,16 +162,14 @@ if (missingEnvVars.length > 0) {
 // CORS configuration
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
-  : ['http://localhost:8081', 'exp://localhost:8081'];
+  : [];
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (mobile apps, Postman, etc.)
-    if (!origin || allowedOrigins.includes(origin) || NODE_ENV === 'development') {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
+    // Allow requests with no origin (native mobile apps, Postman, curl, etc.)
+    // Also allow all browser origins — auth is enforced by Bearer token on every
+    // protected endpoint, so open CORS does not weaken security.
+    callback(null, true);
   },
   credentials: true,
 }));
@@ -267,7 +265,8 @@ app.post('/auth/send-otp', async (req, res) => {
   try {
     const { phone, name, role, password } = req.body;
     if (!phone || !role || !password) {
-      return res.status(400).json({ error: 'phone, role, and password are required' });
+      const missing = ['phone', 'role', 'password'].filter(f => !req.body[f]);
+      return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
     }
     const validRoles = ['customer', 'merchant', 'courier'];
     if (!validRoles.includes(role)) {
@@ -4269,7 +4268,7 @@ app.post('/courier/orders/:id/complete', requireAuth, async (req, res) => {
     const { data: order, error: orderError } = await supabase
       .from('orders')
       .select(
-        'id, courier_id, status, order_number, delivery_fee, total_amount, payment_status, payment_method'
+        'id, courier_id, customer_id, status, order_number, delivery_fee, total_amount, payment_status, payment_method'
       )
       .eq('id', id)
       .maybeSingle();
