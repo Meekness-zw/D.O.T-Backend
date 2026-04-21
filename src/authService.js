@@ -48,33 +48,11 @@ export async function checkPhoneRegistered(phone) {
     throw error;
   }
 
-  if (profile) {
-    return { registered: true, userId: profile.id, role: profile.role || null };
-  }
-
-  // Profile not found — check auth.users directly so callers can reuse the
-  // existing auth record instead of hitting a phone_exists conflict.
-  // Supabase stores phones without '+', so compare digits only.
-  try {
-    const digitsOnly = (p) => (p || '').replace(/\D/g, '');
-    const target = digitsOnly(phone);
-    let page = 1;
-    while (target) {
-      const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page, perPage: 1000 });
-      if (error) break;
-      const users = Array.isArray(data?.users) ? data.users : [];
-      const match = users.find(u => digitsOnly(u.phone) === target);
-      if (match) {
-        // Auth user exists but profile was deleted — reuse the auth ID so
-        // verify-otp can recreate the profile without hitting phone_exists.
-        return { registered: true, userId: match.id, role: null };
-      }
-      if (users.length < 1000) break;
-      page++;
-    }
-  } catch (_) { /* ignore — fall through */ }
-
-  return { registered: false, userId: null, role: null };
+  return {
+    registered: !!profile,
+    userId: profile?.id || null,
+    role: profile?.role || null,
+  };
 }
 
 export async function deleteUserById(userId) {

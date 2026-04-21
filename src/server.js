@@ -367,12 +367,18 @@ app.post('/auth/verify-otp', async (req, res) => {
       });
       if (authError) {
         if (authError.code === 'phone_exists') {
-          // Phone exists in auth.users but not in user_profiles (e.g. prior failed attempt)
+          // Orphaned auth record (no user_profiles row) — delete it and start fresh.
           const match = await findAuthUserByPhone(phone);
-          if (!match) throw new Error('Phone already registered but user not found. Please contact support.');
-          userId = match.id;
-          // Update their password to the one they just registered with
-          await supabaseAdmin.auth.admin.updateUserById(userId, { password });
+          if (match) {
+            await supabaseAdmin.auth.admin.deleteUser(match.id);
+          }
+          const { data: retryData, error: retryError } = await supabaseAdmin.auth.admin.createUser({
+            phone,
+            password,
+            phone_confirm: true,
+          });
+          if (retryError) throw retryError;
+          userId = retryData.user.id;
         } else {
           throw authError;
         }
@@ -6084,9 +6090,16 @@ app.post('/admin/create-user', requireAdmin, async (req, res) => {
     if (authError) {
       if (authError.code === 'phone_exists') {
         const match = await findAuthUserByPhone(phone);
-        if (!match) throw new Error('Phone already registered but user not found.');
-        userId = match.id;
-        await supabaseAdmin.auth.admin.updateUserById(userId, { password });
+        if (match) {
+          await supabaseAdmin.auth.admin.deleteUser(match.id);
+        }
+        const { data: retryData, error: retryError } = await supabaseAdmin.auth.admin.createUser({
+          phone,
+          password,
+          phone_confirm: true,
+        });
+        if (retryError) throw retryError;
+        userId = retryData.user.id;
       } else {
         throw authError;
       }
