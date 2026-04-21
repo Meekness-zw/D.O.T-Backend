@@ -3956,7 +3956,7 @@ app.post('/courier/jobs/:id/accept', requireAuth, async (req, res) => {
     });
 
     const { customer_id: _omitCustomer, ...orderResponse } = updated;
-    return res.json({ order: orderResponse });
+    return res.json({ order: { ...orderResponse, accepted_at: new Date().toISOString() } });
   } catch (error) {
     console.error('post /courier/jobs/:id/accept error:', error);
     return res.status(500).json({
@@ -4000,10 +4000,33 @@ app.post('/courier/orders/:id/drop', requireAuth, async (req, res) => {
       });
     }
     if (order.status !== 'assigned') {
+      const postArrival = ['courier_arrived', 'merchant_confirmed', 'picked_up', 'in_transit', 'delivery_confirmation_pending'].includes(order.status);
       return res.status(400).json({
         error: 'Cannot drop job',
-        details: 'Job can only be dropped before pickup while assigned.',
+        details: postArrival
+          ? 'You have already arrived at the pickup location and must complete this delivery.'
+          : 'Job can only be dropped before pickup.',
       });
+    }
+
+    // Enforce 3-minute drop window from acceptance
+    const { data: assignedRow } = await supabase
+      .from('order_status_history')
+      .select('created_at')
+      .eq('order_id', id)
+      .eq('status', 'assigned')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (assignedRow?.created_at) {
+      const msElapsed = Date.now() - new Date(assignedRow.created_at).getTime();
+      if (msElapsed > 3 * 60 * 1000) {
+        return res.status(400).json({
+          error: 'Cannot drop job',
+          details: 'The 3-minute cancellation window has passed. You must complete this delivery.',
+        });
+      }
     }
 
     const { data: updated, error: updateError } = await supabase
