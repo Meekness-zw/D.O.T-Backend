@@ -59,6 +59,21 @@ const app = express();
 const supabase = supabaseAdmin;
 const PORT = process.env.PORT || 4000;
 
+// Paginate through ALL auth users to find one by phone.
+// listUsers() defaults to 50 per page — without pagination the user is
+// silently missing when there are more than 50 accounts.
+async function findAuthUserByPhone(phone) {
+  let page = 1;
+  while (true) {
+    const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page, perPage: 1000 });
+    if (error) throw error;
+    const match = data.users.find(u => u.phone === phone);
+    if (match) return match;
+    if (data.users.length < 1000) return null;
+    page++;
+  }
+}
+
 // Send push notification to all verified, non-busy couriers about a new ready order
 async function notifyAvailableCouriers(orderId, orderNumber, storeName) {
   if (!supabase) return;
@@ -347,9 +362,7 @@ app.post('/auth/verify-otp', async (req, res) => {
       if (authError) {
         if (authError.code === 'phone_exists') {
           // Phone exists in auth.users but not in user_profiles (e.g. prior failed attempt)
-          const { data: listData, error: listError } = await supabaseAdmin.auth.admin.listUsers();
-          if (listError) throw listError;
-          const match = listData.users.find(u => u.phone === phone);
+          const match = await findAuthUserByPhone(phone);
           if (!match) throw new Error('Phone already registered but user not found. Please contact support.');
           userId = match.id;
           // Update their password to the one they just registered with
@@ -6064,9 +6077,7 @@ app.post('/admin/create-user', requireAdmin, async (req, res) => {
     });
     if (authError) {
       if (authError.code === 'phone_exists') {
-        const { data: listData, error: listError } = await supabaseAdmin.auth.admin.listUsers();
-        if (listError) throw listError;
-        const match = listData.users.find(u => u.phone === phone);
+        const match = await findAuthUserByPhone(phone);
         if (!match) throw new Error('Phone already registered but user not found.');
         userId = match.id;
         await supabaseAdmin.auth.admin.updateUserById(userId, { password });
