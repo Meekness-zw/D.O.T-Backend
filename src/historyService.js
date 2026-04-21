@@ -278,7 +278,6 @@ export async function getFullUserMe(userId) {
     const courierProfileDoc =
       Array.isArray(courierDocs) && courierDocs.length > 0 ? courierDocs[0] : null;
     if (courierProfileDoc?.document_url) {
-      // Attempt to create a signed URL (1 hour) so the image is accessible from private buckets
       try {
         const rawUrl = courierProfileDoc.document_url;
         const u = new URL(rawUrl);
@@ -286,17 +285,24 @@ export async function getFullUserMe(userId) {
         const objectIdx = parts.findIndex((p) => p === 'object');
         if (objectIdx !== -1) {
           const afterObject = parts.slice(objectIdx + 1);
-          // Supabase storage paths: /object/public/{bucket}/… or /object/sign/{bucket}/… or /object/authenticated/{bucket}/…
-          const knownAccessTypes = ['public', 'sign', 'authenticated'];
-          const hasAccessType = knownAccessTypes.includes(afterObject[0]);
-          const bucket = hasAccessType ? afterObject[1] : afterObject[0];
-          const pathParts = hasAccessType ? afterObject.slice(2) : afterObject.slice(1);
-          const path = decodeURIComponent(pathParts.join('/'));
-          if (bucket && path) {
-            const { data: signed } = await supabase.storage.from(bucket).createSignedUrl(path, 3600);
-            result.courier_profile_photo_url = signed?.signedUrl || rawUrl;
-          } else {
+          const accessType = afterObject[0]; // 'public' | 'sign' | 'authenticated'
+
+          // Public bucket files have permanent URLs — no signed URL needed.
+          if (accessType === 'public') {
             result.courier_profile_photo_url = rawUrl;
+          } else {
+            // Private / authenticated bucket — create a long-lived signed URL (7 days).
+            const knownAccessTypes = ['sign', 'authenticated'];
+            const hasAccessType = knownAccessTypes.includes(accessType);
+            const bucket = hasAccessType ? afterObject[1] : afterObject[0];
+            const pathParts = hasAccessType ? afterObject.slice(2) : afterObject.slice(1);
+            const path = decodeURIComponent(pathParts.join('/'));
+            if (bucket && path) {
+              const { data: signed } = await supabase.storage.from(bucket).createSignedUrl(path, 604800);
+              result.courier_profile_photo_url = signed?.signedUrl || rawUrl;
+            } else {
+              result.courier_profile_photo_url = rawUrl;
+            }
           }
         } else {
           result.courier_profile_photo_url = rawUrl;
