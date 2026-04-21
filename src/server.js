@@ -3687,7 +3687,8 @@ app.get('/courier/jobs/open', requireAuth, async (req, res) => {
       .from('order_status_history')
       .select('order_id')
       .eq('status', 'ready')
-      .eq('changed_by', req.userId);
+      .eq('changed_by', req.userId)
+      .eq('notes', 'Courier dropped assignment');
 
     if (droppedRowsError) {
       console.error('get /courier/jobs/open dropped orders query error:', droppedRowsError);
