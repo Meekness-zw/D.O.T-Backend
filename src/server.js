@@ -3227,6 +3227,81 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
   }
 });
 
+// POST /courier/orders/:id/arrived — courier signals they are physically at the pickup location
+app.post('/courier/orders/:id/arrived', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .select('id, store_id, status, order_number, courier_id')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (orderError) throw new Error(orderError.message || 'Failed to load order');
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.courier_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden', details: 'This order is not assigned to you' });
+    }
+    if (order.status !== 'assigned') {
+      return res.status(400).json({
+        error: 'Cannot mark arrived',
+        details: `Order is already in status: ${order.status}`,
+      });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('orders')
+      .update({ status: 'courier_arrived' })
+      .eq('id', id)
+      .select('id, order_number, status')
+      .single();
+
+    if (updateError) throw new Error(updateError.message || 'Failed to update order');
+
+    await supabase.from('order_status_history').insert({
+      order_id: id,
+      status: 'courier_arrived',
+      notes: 'Courier arrived at pickup location',
+      changed_by: req.userId,
+    });
+
+    // Notify merchant that the courier is at the door
+    try {
+      const { data: store } = await supabase
+        .from('stores')
+        .select('merchant_id')
+        .eq('id', order.store_id)
+        .maybeSingle();
+      if (store?.merchant_id) {
+        const { data: merchantProfile } = await supabase
+          .from('user_profiles')
+          .select('push_token')
+          .eq('id', store.merchant_id)
+          .maybeSingle();
+        const token = merchantProfile?.push_token;
+        if (token?.startsWith('ExponentPushToken')) {
+          await axios.post('https://exp.host/push/send', {
+            to: token,
+            title: 'Courier has arrived',
+            body: `The courier for order #${order.order_number} is at your location. Please confirm pickup.`,
+            data: { type: 'courier_arrived', orderId: id },
+            sound: 'default',
+          }, { headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 10000 });
+        }
+      }
+    } catch (notifyErr) {
+      console.warn('[Push] Failed to notify merchant of courier arrival:', notifyErr?.message);
+    }
+
+    return res.json({ order: updated });
+  } catch (error) {
+    console.error('post /courier/orders/:id/arrived error:', error);
+    return res.status(500).json({ error: 'Failed to mark arrived', details: error.message || 'Please try again later' });
+  }
+});
+
 // POST /merchant/orders/:id/confirm-dispatch — merchant confirms that the courier may leave with the order
 app.post('/merchant/orders/:id/confirm-dispatch', requireAuth, async (req, res) => {
   try {
@@ -3257,10 +3332,10 @@ app.post('/merchant/orders/:id/confirm-dispatch', requireAuth, async (req, res) 
       return res.status(403).json({ error: 'Forbidden', details: 'Cannot update this order' });
     }
 
-    if (order.status !== 'assigned') {
+    if (!['assigned', 'courier_arrived'].includes(order.status)) {
       return res.status(400).json({
         error: 'Cannot confirm dispatch',
-        details: 'Order must be assigned to a courier before merchant confirmation.',
+        details: 'Order must have an assigned courier before merchant confirmation.',
       });
     }
 
@@ -3268,7 +3343,7 @@ app.post('/merchant/orders/:id/confirm-dispatch', requireAuth, async (req, res) 
       .from('orders')
       .update({ status: 'merchant_confirmed' })
       .eq('id', id)
-      .select('id, order_number, status')
+      .select('id, order_number, status, courier_id')
       .single();
 
     if (updateError) {
@@ -3284,6 +3359,29 @@ app.post('/merchant/orders/:id/confirm-dispatch', requireAuth, async (req, res) 
     });
     if (historyError) {
       console.error('order_status_history insert (merchant_confirmed) error:', historyError);
+    }
+
+    // Notify courier that merchant has confirmed — they can now start delivery
+    if (updated?.courier_id) {
+      try {
+        const { data: courierProfile } = await supabase
+          .from('user_profiles')
+          .select('push_token')
+          .eq('id', updated.courier_id)
+          .maybeSingle();
+        const token = courierProfile?.push_token;
+        if (token?.startsWith('ExponentPushToken')) {
+          await axios.post('https://exp.host/push/send', {
+            to: token,
+            title: 'Pickup confirmed',
+            body: `The merchant has confirmed order #${updated.order_number}. You can now start delivery.`,
+            data: { type: 'merchant_confirmed', orderId: id },
+            sound: 'default',
+          }, { headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 10000 });
+        }
+      } catch (notifyErr) {
+        console.warn('[Push] Failed to notify courier of merchant confirmation:', notifyErr?.message);
+      }
     }
 
     return res.json({ order: updated });
@@ -3579,7 +3677,7 @@ app.delete('/orders/:id', requireAuth, async (req, res) => {
   }
 });
 
-const COURIER_ACTIVE_STATUSES = ['assigned', 'merchant_confirmed', 'picked_up', 'in_transit', 'delivery_confirmation_pending'];
+const COURIER_ACTIVE_STATUSES = ['assigned', 'courier_arrived', 'merchant_confirmed', 'picked_up', 'in_transit', 'delivery_confirmation_pending'];
 
 // GET /courier/orders/active — delivery in progress for this courier (resume after app restart)
 app.get('/courier/orders/active', requireAuth, async (req, res) => {
