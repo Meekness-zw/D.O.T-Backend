@@ -54,25 +54,25 @@ export async function checkPhoneRegistered(phone) {
 
   // Profile not found — check auth.users directly so callers can reuse the
   // existing auth record instead of hitting a phone_exists conflict.
-  const supabaseUrl = process.env.SUPABASE_URL;
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (supabaseUrl && serviceKey) {
-    try {
-      const url = `${supabaseUrl}/auth/v1/admin/users?filter=${encodeURIComponent(`phone=${phone}`)}&per_page=1`;
-      const res = await fetch(url, {
-        headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` },
-      });
-      if (res.ok) {
-        const body = await res.json();
-        const users = Array.isArray(body?.users) ? body.users : [];
-        if (users.length > 0) {
-          // Auth user exists but profile was deleted — treat as registered so
-          // verify-otp reuses the existing auth ID and recreates the profile.
-          return { registered: true, userId: users[0].id, role: null };
-        }
+  // Supabase stores phones without '+', so compare digits only.
+  try {
+    const digitsOnly = (p) => (p || '').replace(/\D/g, '');
+    const target = digitsOnly(phone);
+    let page = 1;
+    while (target) {
+      const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page, perPage: 1000 });
+      if (error) break;
+      const users = Array.isArray(data?.users) ? data.users : [];
+      const match = users.find(u => digitsOnly(u.phone) === target);
+      if (match) {
+        // Auth user exists but profile was deleted — reuse the auth ID so
+        // verify-otp can recreate the profile without hitting phone_exists.
+        return { registered: true, userId: match.id, role: null };
       }
-    } catch (_) { /* ignore — fall through to not-registered */ }
-  }
+      if (users.length < 1000) break;
+      page++;
+    }
+  } catch (_) { /* ignore — fall through */ }
 
   return { registered: false, userId: null, role: null };
 }

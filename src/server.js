@@ -59,37 +59,21 @@ const app = express();
 const supabase = supabaseAdmin;
 const PORT = process.env.PORT || 4000;
 
-// Find an auth user by phone number.
-// Strategy 1: GoTrue REST admin API supports a phone filter — fast, exact.
-// Strategy 2: Paginate listUsers with normalised comparison (handles + prefix
-//             differences between what we pass and what Supabase stores).
+// Find an auth user by phone number using digit-only comparison.
+// Supabase stores phones without the leading '+' (e.g. "263712345678"),
+// while our code passes "+263712345678". Stripping all non-digits makes
+// the comparison format-agnostic.
 async function findAuthUserByPhone(phone) {
-  const normalize = (p) => (p || '').replace(/\s+/g, '');
+  const digitsOnly = (p) => (p || '').replace(/\D/g, '');
+  const target = digitsOnly(phone);
+  if (!target) return null;
 
-  // Strategy 1: direct REST query
-  const supabaseUrl = process.env.SUPABASE_URL;
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (supabaseUrl && serviceKey) {
-    try {
-      const url = `${supabaseUrl}/auth/v1/admin/users?filter=${encodeURIComponent(`phone=${phone}`)}&per_page=1`;
-      const res = await fetch(url, {
-        headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` },
-      });
-      if (res.ok) {
-        const body = await res.json();
-        const users = Array.isArray(body?.users) ? body.users : [];
-        if (users.length > 0) return users[0];
-      }
-    } catch (_) { /* fall through */ }
-  }
-
-  // Strategy 2: paginated scan with normalised comparison
   let page = 1;
   while (true) {
     const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page, perPage: 1000 });
     if (error) throw error;
     const users = Array.isArray(data?.users) ? data.users : [];
-    const match = users.find(u => normalize(u.phone) === normalize(phone));
+    const match = users.find(u => digitsOnly(u.phone) === target);
     if (match) return match;
     if (users.length < 1000) return null;
     page++;
