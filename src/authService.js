@@ -41,10 +41,14 @@ export async function loginWithPassword({ phone, password }) {
 }
 
 export async function checkPhoneRegistered(phone) {
+  const normalised = phone
+    ? phone.replace(/[\s\-().]/g, '').replace(/^\+?/, '+')
+    : phone;
+
   const { data: profile, error } = await supabaseAdmin
     .from('user_profiles')
     .select('id, role')
-    .eq('phone', phone)
+    .eq('phone', normalised)
     .single();
 
   if (error && error.code !== 'PGRST116') {
@@ -55,6 +59,7 @@ export async function checkPhoneRegistered(phone) {
     registered: !!profile,
     userId: profile?.id || null,
     role: profile?.role || null,
+    phone: normalised,
   };
 }
 

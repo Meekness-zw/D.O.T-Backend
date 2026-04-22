@@ -412,6 +412,107 @@ app.post('/auth/verify-otp', async (req, res) => {
   }
 });
 
+// Separate OTP store for password resets (keeps signup and reset flows independent)
+const resetOtpStore = new Map();
+
+// POST /auth/forgot-password { phone }
+app.post('/auth/forgot-password', async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ error: 'Phone number is required' });
+
+    const normalised = phone.replace(/[\s\-().]/g, '');
+
+    // Only send a code if the account actually exists
+    const existing = await checkPhoneRegistered(normalised);
+    if (!existing.registered) {
+      return res.status(404).json({ error: 'No account found with this phone number.' });
+    }
+
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const expiresAt = Date.now() + 10 * 60 * 1000;
+    resetOtpStore.set(normalised, { code, expiresAt });
+
+    const dexatelApiKey = process.env.DEXATEL_API_KEY;
+    const dexatelSender = process.env.DEXATEL_SENDER;
+    if (!dexatelApiKey || !dexatelSender) {
+      return res.status(503).json({ error: 'SMS service not configured' });
+    }
+
+    try {
+      await axios.post(
+        'https://api.dexatel.com/v1/messages',
+        { data: { from: dexatelSender, to: [normalised], text: `Your Delivery On Time password reset code is: ${code}`, channel: 'sms' } },
+        { headers: { 'Content-Type': 'application/json', 'X-Dexatel-Key': dexatelApiKey } }
+      );
+    } catch (smsErr) {
+      const detail = JSON.stringify(smsErr.response?.data ?? smsErr.message);
+      console.error('forgot-password SMS error:', detail);
+      return res.status(502).json({ error: 'Failed to send reset code', details: detail });
+    }
+
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    console.error('forgot-password error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to send reset code' });
+  }
+});
+
+// POST /auth/reset-password { phone, code, newPassword }
+app.post('/auth/reset-password', async (req, res) => {
+  try {
+    const { phone, code, newPassword } = req.body;
+    if (!phone || !code || !newPassword) {
+      return res.status(400).json({ error: 'phone, code, and newPassword are required' });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    const normalised = phone.replace(/[\s\-().]/g, '');
+
+    const entry = resetOtpStore.get(normalised);
+    if (!entry) {
+      return res.status(400).json({ error: 'No reset code found. Please request a new one.' });
+    }
+    if (Date.now() > entry.expiresAt) {
+      resetOtpStore.delete(normalised);
+      return res.status(400).json({ error: 'Reset code has expired. Please request a new one.' });
+    }
+    if (entry.code !== String(code)) {
+      return res.status(400).json({ error: 'Incorrect reset code.' });
+    }
+
+    resetOtpStore.delete(normalised);
+
+    // Fetch the user's ID from user_profiles
+    const { data: profile, error: profileError } = await supabaseAdmin
+      .from('user_profiles')
+      .select('id')
+      .eq('phone', normalised)
+      .single();
+
+    if (profileError || !profile) {
+      return res.status(404).json({ error: 'Account not found.' });
+    }
+
+    // Update the password hash in user_profiles
+    const newHash = crypto.createHash('sha256').update(newPassword).digest('hex');
+    await supabaseAdmin
+      .from('user_profiles')
+      .update({ password_hash: newHash })
+      .eq('id', profile.id);
+
+    // Update the Supabase Auth password so login still works
+    await supabaseAdmin.auth.admin.updateUserById(profile.id, { password: newPassword });
+
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    console.error('reset-password error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to reset password' });
+  }
+});
+
 /** Admin middleware: require x-admin-key or Authorization Bearer matching ADMIN_API_KEY */
 function requireAdmin(req, res, next) {
   const apiKey = process.env.ADMIN_API_KEY;

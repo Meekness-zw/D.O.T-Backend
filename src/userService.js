@@ -86,10 +86,15 @@ export async function ensureUserProfile({
   role,
   password
 }) {
+  // Always store phone in E.164 format with leading +
+  const normalisedPhone = phone
+    ? phone.replace(/[\s\-().]/g, '').replace(/^\+?/, '+')
+    : phone;
+
   const profileData = {
     id: userId,
     email,
-    phone,
+    phone: normalisedPhone,
     full_name: fullName,
     role
   };
