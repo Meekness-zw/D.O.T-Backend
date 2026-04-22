@@ -4882,23 +4882,18 @@ app.get('/merchant/dashboard-stats', requireAuth, async (req, res) => {
 // GET /merchant/onboarding-status — check if merchant has fully completed setup
 app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
   try {
-    if (!supabase) throw new Error('Server not configured');
-
-    // Merchant core row must exist
-    const { data: merchant, error: merchantError } = await supabase
+    // Use admin client throughout so RLS never blocks these lookups
+    const { data: merchant, error: merchantError } = await supabaseAdmin
       .from('merchants')
       .select('id, business_name, business_type, is_active, approval_status, rejected_reason')
       .eq('id', req.userId)
       .maybeSingle();
-
-    console.log('[merchant/onboarding-status] Merchant row:', merchant);
 
     if (merchantError) {
       console.error('merchant status merchant error:', merchantError);
       throw new Error(merchantError.message || 'Failed to load merchant');
     }
 
-    // Allow merchant if is_active is true OR null/undefined (null means not explicitly disabled)
     const isMerchant = !!merchant;
     const approvalStatus = merchant?.approval_status || 'pending';
     const isApproved = approvalStatus === 'approved';
@@ -4908,33 +4903,22 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
     // At least one store row exists for this merchant
     let hasStore = false;
     if (isMerchant) {
-      const { data: stores, error: storesError } = await supabase
+      const { data: stores, error: storesError } = await supabaseAdmin
         .from('stores')
         .select('id, address_line1, city, latitude, longitude, is_active')
         .eq('merchant_id', req.userId)
         .limit(5);
 
-      console.log('[merchant/onboarding-status] Stores found:', stores);
-
       if (!storesError && Array.isArray(stores) && stores.length > 0) {
-        // Any store row counts — merchant clearly completed setup if a store exists
         hasStore = true;
-        // Prefer a store that also has location data, but don't require it
-        for (const store of stores) {
-          if (store.address_line1 && store.city && store.latitude != null && store.longitude != null) {
-            hasStore = true;
-            break;
-          }
-        }
       }
     }
 
-    // Required merchant documents: owner_id and proof_of_address must exist
-    // For existing merchants, make documents optional to allow them in
+    // Documents optional — if merchant + store exist, they're considered onboarded
     let hasRequiredDocuments = false;
     if (isMerchant) {
       try {
-        const { data: docs, error: docsError } = await supabase
+        const { data: docs, error: docsError } = await supabaseAdmin
           .from('merchant_documents')
           .select('document_type')
           .eq('merchant_id', req.userId);
@@ -4944,11 +4928,10 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
           hasRequiredDocuments = types.includes('owner_id') && types.includes('proof_of_address');
         }
       } catch (docsErr) {
-        console.log('[merchant/onboarding-status] Documents check error, allowing:', docsErr.message);
+        console.log('[merchant/onboarding-status] Documents check skipped:', docsErr.message);
       }
     }
 
-    // For now, make documents optional - if user has merchant + store, they're considered onboarded
     const onboardingComplete = isMerchant && hasStore;
 
     return res.json({
