@@ -8,8 +8,8 @@ export async function loginWithPassword({ phone, password }) {
     throw new Error('Phone and password are required');
   }
 
-  // Normalise: strip spaces/dashes so "+263 71 234 5678" matches "+263712345678"
-  const normalised = phone.replace(/[\s\-().]/g, '');
+  // Normalise: strip spaces/dashes and ensure leading + so "+263 71 234 5678" matches "+263712345678"
+  const normalised = phone.replace(/[\s\-().]/g, '').replace(/^\+?/, '+');
 
   const { data: profile, error: profileError } = await supabaseAdmin
     .from('user_profiles')
