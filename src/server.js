@@ -294,6 +294,12 @@ app.post('/auth/send-otp', async (req, res) => {
       return res.status(400).json({ error: 'Invalid role' });
     }
 
+    // Only allow signup for phones not already in user_profiles
+    const existing = await checkPhoneRegistered(phone);
+    if (existing.registered) {
+      return res.status(409).json({ error: 'Phone number already registered. Please log in instead.' });
+    }
+
     const code = String(Math.floor(100000 + Math.random() * 900000));
     const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
     otpStore.set(phone, { code, expiresAt, name, role, password });
@@ -324,10 +330,10 @@ app.post('/auth/send-otp', async (req, res) => {
   }
 });
 
-// POST /auth/verify-otp { phone, code }
+// POST /auth/verify-otp { phone, code, isSignUp }
 app.post('/auth/verify-otp', async (req, res) => {
   try {
-    const { phone, code } = req.body;
+    const { phone, code, isSignUp } = req.body;
     if (!phone || !code) {
       return res.status(400).json({ error: 'phone and code are required' });
     }
@@ -350,6 +356,10 @@ app.post('/auth/verify-otp', async (req, res) => {
     const existing = await checkPhoneRegistered(phone);
     let userId;
     if (existing.registered) {
+      // Phone is already in user_profiles — block signup attempts
+      if (isSignUp) {
+        return res.status(409).json({ error: 'Phone number already registered. Please log in instead.' });
+      }
       userId = existing.userId;
       const { data: profile } = await supabaseAdmin
         .from('user_profiles')
@@ -6431,6 +6441,20 @@ async function runScheduledPromotions() {
 // ─── Google Maps proxy endpoints ─────────────────────────────────────────────
 // These proxy requests to the Google Maps APIs so the API key stays on the server.
 
+// Google may return the legacy { status, error_message } shape OR the newer
+// { error: { code, message, status } } shape. Normalise to legacy so clients
+// always see the same structure.
+function normaliseMapsResponse(data) {
+  if (data && !data.status && data.error) {
+    return {
+      ...data,
+      status: data.error.status || 'REQUEST_DENIED',
+      error_message: data.error.message || JSON.stringify(data.error),
+    };
+  }
+  return data;
+}
+
 // GET /maps/places/autocomplete?input=...&components=...&types=...
 app.get('/maps/places/autocomplete', async (req, res) => {
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
@@ -6446,7 +6470,7 @@ app.get('/maps/places/autocomplete', async (req, res) => {
     });
     const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?${params}`;
     const r = await axios.get(url, { timeout: 8000 });
-    return res.json(r.data);
+    return res.json(normaliseMapsResponse(r.data));
   } catch (err) {
     console.error('GET /maps/places/autocomplete error:', err.message);
     return res.status(502).json({ status: 'UNKNOWN_ERROR', error_message: err.message });
@@ -6466,7 +6490,7 @@ app.get('/maps/places/details', async (req, res) => {
     });
     const url = `https://maps.googleapis.com/maps/api/place/details/json?${params}`;
     const r = await axios.get(url, { timeout: 8000 });
-    return res.json(r.data);
+    return res.json(normaliseMapsResponse(r.data));
   } catch (err) {
     console.error('GET /maps/places/details error:', err.message);
     return res.status(502).json({ status: 'UNKNOWN_ERROR', error_message: err.message });
@@ -6485,7 +6509,7 @@ app.get('/maps/geocode', async (req, res) => {
     });
     const url = `https://maps.googleapis.com/maps/api/geocode/json?${params}`;
     const r = await axios.get(url, { timeout: 8000 });
-    return res.json(r.data);
+    return res.json(normaliseMapsResponse(r.data));
   } catch (err) {
     console.error('GET /maps/geocode error:', err.message);
     return res.status(502).json({ status: 'UNKNOWN_ERROR', error_message: err.message });
