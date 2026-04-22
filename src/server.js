@@ -4905,8 +4905,7 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
     const isRejected = approvalStatus === 'rejected';
     const rejectedReason = merchant?.rejected_reason || null;
 
-    // At least one store with required address/geo fields
-    // Be lenient - check for any store, not just is_active = true
+    // At least one store row exists for this merchant
     let hasStore = false;
     if (isMerchant) {
       const { data: stores, error: storesError } = await supabase
@@ -4918,7 +4917,9 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
       console.log('[merchant/onboarding-status] Stores found:', stores);
 
       if (!storesError && Array.isArray(stores) && stores.length > 0) {
-        // Find first store with required fields
+        // Any store row counts — merchant clearly completed setup if a store exists
+        hasStore = true;
+        // Prefer a store that also has location data, but don't require it
         for (const store of stores) {
           if (store.address_line1 && store.city && store.latitude != null && store.longitude != null) {
             hasStore = true;
