@@ -1330,11 +1330,17 @@ app.patch('/merchant/products/:id', requireAuth, async (req, res) => {
       .update(update)
       .eq('id', id)
       .select('id, store_id, name, description, price, unit, is_available, is_featured, image_url')
-      .single();
+      .maybeSingle();
 
     if (updateError) {
       console.error('merchant products update error:', updateError);
       throw new Error(updateError.message || 'Failed to update product');
+    }
+
+    if (!updated) {
+      // The pre-check found the product, but the update returned 0 rows (e.g. deleted concurrently).
+      // Don't crash with PGRST116; return a clean 404.
+      return res.status(404).json({ error: 'Product not found' });
     }
 
     return res.json(updated);
