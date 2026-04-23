@@ -579,7 +579,7 @@ app.get('/debug/contipay', (req, res) => {
 // GET /business-types — public list of all business categories
 app.get('/business-types', async (req, res) => {
   try {
-    if (!supabase) throw new Error('Server not configured');
+    if (!supabaseAdmin) throw new Error('Server not configured');
     const { data, error } = await supabase
       .from('business_types')
       .select('id, name, icon')
@@ -2174,7 +2174,7 @@ app.post('/merchant/products', requireAuth, async (req, res) => {
         details: 'store_id, name, and price are required',
       });
     }
-    const { data: store, error: storeError } = await supabase
+    const { data: store, error: storeError } = await supabaseAdmin
       .from('stores')
       .select('id')
       .eq('id', store_id)
@@ -2187,7 +2187,7 @@ app.post('/merchant/products', requireAuth, async (req, res) => {
     let resolvedCategoryId = category_id || null;
     if (!resolvedCategoryId && category_name && String(category_name).trim()) {
       const catName = String(category_name).trim();
-      const { data: existing } = await supabase
+      const { data: existing } = await supabaseAdmin
         .from('product_categories')
         .select('id')
         .eq('store_id', store_id)
@@ -2196,7 +2196,7 @@ app.post('/merchant/products', requireAuth, async (req, res) => {
       if (existing) {
         resolvedCategoryId = existing.id;
       } else {
-        const { data: created } = await supabase
+        const { data: created } = await supabaseAdmin
           .from('product_categories')
           .insert({ store_id, name: catName })
           .select('id')
@@ -2216,7 +2216,7 @@ app.post('/merchant/products', requireAuth, async (req, res) => {
       is_featured: !!is_featured,
     };
     if (resolvedCategoryId) insert.category_id = resolvedCategoryId;
-    const { data: created, error: insertError } = await supabase
+    const { data: created, error: insertError } = await supabaseAdmin
       .from('products')
       .insert(insert)
       .select('id, store_id, name, description, price, unit, image_url, is_available, is_featured, category_id')

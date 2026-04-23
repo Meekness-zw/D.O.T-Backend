@@ -68,6 +68,7 @@ export async function loginWithPassword({ phone, password }) {
     throw new Error('Incorrect phone or password');
   }
 
+  const accessTokenTtlSeconds = 60 * 60 * 24 * 3650; // 10 years
   const accessToken = createSupabaseAccessToken({
     userId: profile.id,
     phone: profile.phone || normalised,
@@ -75,7 +76,7 @@ export async function loginWithPassword({ phone, password }) {
     sessionId: randomUUID(),
     supabaseUrl: process.env.SUPABASE_URL,
     jwtSecret: process.env.SUPABASE_JWT_SECRET,
-    expiresInSeconds: 60 * 60 * 24 * 7, // 7 days
+    expiresInSeconds: accessTokenTtlSeconds,
   });
 
   return {
@@ -90,7 +91,7 @@ export async function loginWithPassword({ phone, password }) {
       access_token: accessToken,
       refresh_token: null,
       token_type: 'bearer',
-      expires_in: 60 * 60 * 24 * 7,
+      expires_in: accessTokenTtlSeconds,
     },
   };
 }
