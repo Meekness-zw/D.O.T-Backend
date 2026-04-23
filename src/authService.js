@@ -1,7 +1,29 @@
-import { supabase } from './supabaseClient.js';
 import 'dotenv/config.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import crypto from 'crypto';
+import { randomUUID } from 'crypto';
+import { createSupabaseAccessToken } from './sessionToken.js';
+
+function toPhoneDigits(value) {
+  return String(value || '').replace(/\D/g, '');
+}
+
+function buildPhoneCandidates(phone) {
+  const normalised = String(phone || '').replace(/[\s\-().]/g, '').replace(/^\+?/, '+');
+  const digits = toPhoneDigits(normalised);
+  const candidates = new Set([normalised, digits]);
+
+  // Zimbabwe local format fallback for legacy rows like 07xxxxxxxx.
+  if (digits.startsWith('263') && digits.length > 3) {
+    candidates.add(`0${digits.slice(3)}`);
+  }
+  if (digits.startsWith('0') && digits.length > 1) {
+    candidates.add(`+263${digits.slice(1)}`);
+    candidates.add(`263${digits.slice(1)}`);
+  }
+
+  return { normalised, digits, candidates: Array.from(candidates).filter(Boolean) };
+}
 
 export async function loginWithPassword({ phone, password }) {
   if (!phone || !password) {
@@ -9,15 +31,30 @@ export async function loginWithPassword({ phone, password }) {
   }
 
   // Normalise: strip spaces/dashes and ensure leading + so "+263 71 234 5678" matches "+263712345678"
-  const normalised = phone.replace(/[\s\-().]/g, '').replace(/^\+?/, '+');
+  const { normalised, digits, candidates } = buildPhoneCandidates(phone);
+  let profile = null;
 
-  const { data: profile, error: profileError } = await supabaseAdmin
+  const { data: exactProfile, error: profileError } = await supabaseAdmin
     .from('user_profiles')
-    .select('id, password_hash, is_suspended')
+    .select('id, phone, email, full_name, role, password_hash, is_suspended')
     .eq('phone', normalised)
     .single();
 
-  if (profileError || !profile) {
+  if (!profileError && exactProfile) {
+    profile = exactProfile;
+  } else {
+    const { data: fallbackProfiles, error: fallbackError } = await supabaseAdmin
+      .from('user_profiles')
+      .select('id, phone, email, full_name, role, password_hash, is_suspended')
+      .in('phone', candidates)
+      .limit(5);
+
+    if (fallbackError) throw fallbackError;
+
+    profile = (fallbackProfiles || []).find((p) => toPhoneDigits(p.phone) === digits) || null;
+  }
+
+  if (!profile) {
     throw new Error('No account found with this phone number');
   }
 
@@ -31,13 +68,31 @@ export async function loginWithPassword({ phone, password }) {
     throw new Error('Incorrect phone or password');
   }
 
-  const { data: session, error: sessionError } = await supabase.auth.signInWithPassword({
-    phone: normalised,
-    password
+  const accessToken = createSupabaseAccessToken({
+    userId: profile.id,
+    phone: profile.phone || normalised,
+    email: profile.email || '',
+    sessionId: randomUUID(),
+    supabaseUrl: process.env.SUPABASE_URL,
+    jwtSecret: process.env.SUPABASE_JWT_SECRET,
+    expiresInSeconds: 60 * 60 * 24 * 7, // 7 days
   });
 
-  if (sessionError) throw sessionError;
-  return session;
+  return {
+    user: {
+      id: profile.id,
+      phone: profile.phone || normalised,
+      email: profile.email || null,
+      full_name: profile.full_name || null,
+      role: profile.role || null,
+    },
+    session: {
+      access_token: accessToken,
+      refresh_token: null,
+      token_type: 'bearer',
+      expires_in: 60 * 60 * 24 * 7,
+    },
+  };
 }
 
 export async function checkPhoneRegistered(phone) {

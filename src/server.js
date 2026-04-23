@@ -197,7 +197,7 @@ app.use(cors({
 
 app.use(express.json({ limit: '20mb' }));
 
-/** Auth middleware: verify Bearer token via Supabase, set req.userId */
+/** Auth middleware: verify Bearer token, set req.userId */
 async function requireAuth(req, res, next) {
   const auth = req.headers.authorization;
   const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
@@ -205,6 +205,14 @@ async function requireAuth(req, res, next) {
     return res.status(401).json({ error: 'Unauthorized', details: 'Valid access token required' });
   }
   try {
+    // Primary path: app-issued JWT (works even when Supabase Auth users are not used)
+    const decoded = verifyAccessToken(token, process.env.SUPABASE_JWT_SECRET);
+    if (decoded?.sub) {
+      req.userId = decoded.sub;
+      return next();
+    }
+
+    // Backward compatibility: existing Supabase Auth sessions
     const { data, error } = await supabaseAdmin.auth.getUser(token);
     if (error || !data?.user?.id) {
       return res.status(401).json({ error: 'Unauthorized', details: 'Invalid or expired token' });
