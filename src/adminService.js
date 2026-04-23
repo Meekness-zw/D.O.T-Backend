@@ -148,22 +148,42 @@ export async function getAdminUsers(options = {}) {
   if (error) throw new Error(error.message || 'Failed to fetch users');
   const users = data || [];
 
-  // Attach all roles from user_roles (multi-role support); fallback to profile.role
+  // Roles: same source of truth as app `getRoles` — membership in customers / merchants / couriers,
+  // plus optional `user_roles` rows, then fallback to `user_profiles.role`.
   if (users.length > 0) {
     const ids = users.map((u) => u.id);
-    const { data: roleRows } = await supabase
-      .from('user_roles')
-      .select('user_id, role')
-      .in('user_id', ids);
-    const rolesByUserId = new Map();
-    (roleRows || []).forEach((r) => {
-      if (!rolesByUserId.has(r.user_id)) rolesByUserId.set(r.user_id, []);
-      rolesByUserId.get(r.user_id).push(r.role);
-    });
+    const ROLE_ORDER = ['customer', 'merchant', 'courier'];
+
+    const [
+      { data: customerRows },
+      { data: merchantRows },
+      { data: courierRows },
+      { data: roleRows },
+    ] = await Promise.all([
+      supabase.from('customers').select('id').in('id', ids),
+      supabase.from('merchants').select('id').in('id', ids),
+      supabase.from('couriers').select('id').in('id', ids),
+      supabase.from('user_roles').select('user_id, role').in('user_id', ids),
+    ]);
+
+    const rolesByUserId = new Map(); // id -> Set
+    const add = (userId, r) => {
+      if (!userId || !r) return;
+      if (!rolesByUserId.has(userId)) rolesByUserId.set(userId, new Set());
+      rolesByUserId.get(userId).add(String(r).toLowerCase());
+    };
+
+    (customerRows || []).forEach((row) => add(row.id, 'customer'));
+    (merchantRows || []).forEach((row) => add(row.id, 'merchant'));
+    (courierRows || []).forEach((row) => add(row.id, 'courier'));
+    (roleRows || []).forEach((row) => add(row.user_id, row.role));
+
     users.forEach((u) => {
-      u.roles = rolesByUserId.get(u.id)?.length
-        ? rolesByUserId.get(u.id)
-        : (u.role ? [u.role] : []);
+      const set = rolesByUserId.get(u.id);
+      let list = set ? [...set] : [];
+      if (list.length === 0 && u.role) list = [String(u.role).toLowerCase()];
+      list.sort((a, b) => ROLE_ORDER.indexOf(a) - ROLE_ORDER.indexOf(b));
+      u.roles = list;
     });
   }
 
