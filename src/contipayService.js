@@ -204,6 +204,12 @@ export async function handleContipayCallback(body) {
   const reference =
     payload.reference ??
     nested.reference ??
+    payload.contiPayRef ??
+    nested.contiPayRef ??
+    payload.contipayRef ??
+    nested.contipayRef ??
+    payload.contipay_ref ??
+    nested.contipay_ref ??
     payload.transaction_id ??
     nested.transaction_id ??
     payload.transactionId ??
@@ -211,8 +217,20 @@ export async function handleContipayCallback(body) {
     payload.merchantReference ??
     nested.merchantReference ??
     payload.merchant_reference ??
-    nested.merchant_reference;
-  if (!reference) throw new Error('Missing reference in ContiPay callback');
+    nested.merchant_reference ??
+    payload.referenceNumber ??
+    nested.referenceNumber ??
+    payload.reference_number ??
+    nested.reference_number ??
+    payload.invoiceNumber ??
+    nested.invoiceNumber;
+  if (!reference) {
+    console.error('[ContiPay] Callback missing reference. Payload keys:', Object.keys(payload || {}));
+    if (nested && typeof nested === 'object') {
+      console.error('[ContiPay] Callback nested payload keys:', Object.keys(nested || {}));
+    }
+    throw new Error('Missing reference in ContiPay callback');
+  }
 
   const paymentStatus = mapContipayStatus(status, statusCode);
   console.log('[ContiPay] Callback received:', { reference, status, statusCode, paymentStatus });

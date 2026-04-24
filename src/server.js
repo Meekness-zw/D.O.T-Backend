@@ -5725,7 +5725,11 @@ app.get('/payments/contipay/return', (req, res) => {
 // POST /payments/contipay/callback — ContiPay server-to-server result callback (no auth)
 app.post('/payments/contipay/callback', async (req, res) => {
   try {
-    await handleContipayCallback(req.body);
+    const callbackPayload = {
+      ...((req.query && typeof req.query === 'object') ? req.query : {}),
+      ...((req.body && typeof req.body === 'object') ? req.body : {}),
+    };
+    await handleContipayCallback(callbackPayload);
     return res.json({ ok: true });
   } catch (error) {
     console.error('ContiPay callback error:', error);
@@ -5739,7 +5743,11 @@ app.post('/payments/contipay/callback', async (req, res) => {
 // Some gateways can send callback via GET query params.
 app.get('/payments/contipay/callback', async (req, res) => {
   try {
-    await handleContipayCallback(req.query || {});
+    const callbackPayload = {
+      ...((req.query && typeof req.query === 'object') ? req.query : {}),
+      ...((req.body && typeof req.body === 'object') ? req.body : {}),
+    };
+    await handleContipayCallback(callbackPayload);
     return res.json({ ok: true });
   } catch (error) {
     console.error('ContiPay callback (GET) error:', error);
