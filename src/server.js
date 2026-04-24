@@ -5672,9 +5672,17 @@ app.post('/payments/contipay/start', requireAuth, async (req, res) => {
     }
 
     const apiBase = process.env.API_BASE_URL || `http://localhost:${process.env.PORT || 4000}`;
-    const callbackUrl = `${apiBase.replace(/\/$/, '')}/payments/contipay/callback`;
-    const returnUrl = `${apiBase.replace(/\/$/, '')}/payments/contipay/return?orderId=${encodeURIComponent(orderId)}&status=success`;
-    const cancelUrl = `${apiBase.replace(/\/$/, '')}/payments/contipay/return?orderId=${encodeURIComponent(orderId)}&status=cancelled`;
+    const callbackBase = apiBase.replace(/\/$/, '');
+    if (/localhost|127\.0\.0\.1|0\.0\.0\.0/i.test(callbackBase)) {
+      return res.status(400).json({
+        error: 'Invalid payment callback URL',
+        details:
+          'API_BASE_URL must be a public HTTPS URL so ContiPay can reach /payments/contipay/callback. localhost cannot receive provider webhooks.',
+      });
+    }
+    const callbackUrl = `${callbackBase}/payments/contipay/callback`;
+    const returnUrl = `${callbackBase}/payments/contipay/return?orderId=${encodeURIComponent(orderId)}&status=success`;
+    const cancelUrl = `${callbackBase}/payments/contipay/return?orderId=${encodeURIComponent(orderId)}&status=cancelled`;
     const reference = `DOT-${ord.order_number || orderId.slice(0, 8)}-${Date.now()}`;
 
     const result = await initiateContipayPayment({
