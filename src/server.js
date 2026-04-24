@@ -22,6 +22,7 @@ import {
   saveCourierPayoutMethod,
   upsertMerchantOnboarding,
 } from './onboardingService.js';
+import { getSuggestedProductCategoryNames } from './storeCategorySuggestions.js';
 import {
   getAdminStats,
   getAdminStatsCharts,
@@ -2081,7 +2082,7 @@ app.get('/merchant/stores/:storeId/categories', requireAuth, async (req, res) =>
 
     const { data: store, error: storeError } = await supabase
       .from('stores')
-      .select('id, merchant_id')
+      .select('id, merchant_id, store_name')
       .eq('id', storeId)
       .maybeSingle();
 
@@ -2102,29 +2103,17 @@ app.get('/merchant/stores/:storeId/categories', requireAuth, async (req, res) =>
       // Look up merchant business_type and seed default categories for this type of shop.
       const { data: merchantRow, error: merchantError } = await supabase
         .from('merchants')
-        .select('business_type')
+        .select('business_type, business_name')
         .eq('id', store.merchant_id)
         .maybeSingle();
 
       if (merchantError) {
         console.error('merchant categories business_type error:', merchantError);
       } else {
-        const type = String(merchantRow?.business_type || '').toLowerCase();
-        let categoriesToInsert = [];
-
-        if (type === 'bakery') {
-          categoriesToInsert = ['Bread', 'Pastries', 'Cakes', 'Cookies', 'Drinks'];
-        } else if (type === 'grocery' || type === 'grocery / retail') {
-          categoriesToInsert = ['Fruits & Vegetables', 'Meat & Poultry', 'Dairy & Eggs', 'Pantry Staples', 'Snacks & Drinks'];
-        } else if (type === 'pharmacy') {
-          categoriesToInsert = ['Prescription Medicines', 'Over-the-counter', 'Vitamins & Supplements', 'Personal Care', 'Baby & Kids'];
-        } else if (type === 'restaurant' || type === 'restaurant / food') {
-          categoriesToInsert = ['Starters', 'Mains', 'Sides', 'Drinks', 'Desserts'];
-        } else if (type === 'hardware' || type === 'hardware store') {
-          categoriesToInsert = ['Tools', 'Building Materials', 'Plumbing', 'Electrical', 'Paint & Finishes'];
-        } else {
-          categoriesToInsert = ['Featured', 'Best Sellers', 'New Arrivals'];
-        }
+        const hint = [merchantRow?.business_name, store?.store_name].filter(Boolean).join(' ').trim();
+        const categoriesToInsert = getSuggestedProductCategoryNames(merchantRow?.business_type || '', {
+          businessName: hint,
+        });
 
         const rows = categoriesToInsert.map((name, index) => ({
           store_id: storeId,
@@ -6570,11 +6559,21 @@ async function runScheduledPromotions() {
 // { error: { code, message, status } } shape. Normalise to legacy so clients
 // always see the same structure.
 function normaliseMapsResponse(data) {
-  if (data && !data.status && data.error) {
+  if (!data || typeof data !== 'object') {
+    return { status: 'INVALID_RESPONSE', error_message: 'Empty or invalid Google Maps response.', results: [] };
+  }
+  if (!data.status && data.error) {
     return {
       ...data,
       status: data.error.status || 'REQUEST_DENIED',
       error_message: data.error.message || JSON.stringify(data.error),
+    };
+  }
+  if (!data.status) {
+    return {
+      ...data,
+      status: 'UNKNOWN_ERROR',
+      error_message: 'Unexpected response shape from Google Maps (no status field).',
     };
   }
   return data;

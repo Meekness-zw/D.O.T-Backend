@@ -1,4 +1,5 @@
 import { supabaseAdmin } from './supabaseAdminClient.js';
+import { getSuggestedProductCategoryNames } from './storeCategorySuggestions.js';
 
 const supabase = supabaseAdmin;
 
@@ -461,22 +462,8 @@ export async function upsertMerchantOnboarding({
   if (categoriesError) {
     console.error('merchant onboarding categories check error:', categoriesError);
   } else if (!existingCategories || existingCategories.length === 0) {
-    const type = String(businessType).toLowerCase();
-    let categoriesToInsert = [];
-
-    if (type === 'bakery') {
-      categoriesToInsert = ['Bread', 'Pastries', 'Cakes', 'Cookies', 'Drinks'];
-    } else if (type === 'grocery' || type === 'grocery / retail') {
-      categoriesToInsert = ['Fruits & Vegetables', 'Meat & Poultry', 'Dairy & Eggs', 'Pantry Staples', 'Snacks & Drinks'];
-    } else if (type === 'pharmacy') {
-      categoriesToInsert = ['Prescription Medicines', 'Over-the-counter', 'Vitamins & Supplements', 'Personal Care', 'Baby & Kids'];
-    } else if (type === 'restaurant' || type === 'restaurant / food') {
-      categoriesToInsert = ['Starters', 'Mains', 'Sides', 'Drinks', 'Desserts'];
-    } else if (type === 'hardware') {
-      categoriesToInsert = ['Tools', 'Building Materials', 'Plumbing', 'Electrical', 'Paint & Finishes'];
-    } else {
-      categoriesToInsert = ['Featured', 'Best Sellers', 'New Arrivals'];
-    }
+    const hint = `${String(businessName || '').trim()} ${String(storeName || '').trim()}`.trim();
+    const categoriesToInsert = getSuggestedProductCategoryNames(businessType, { businessName: hint });
 
     const rows = categoriesToInsert.map((name, index) => ({
       store_id: storeId,
