@@ -201,30 +201,37 @@ export async function handleContipayCallback(body) {
   const nested = payload.data && typeof payload.data === 'object' ? payload.data : {};
   const status = payload.status ?? nested.status ?? payload.transactionStatus ?? nested.transactionStatus;
   const statusCode = payload.statusCode ?? nested.statusCode ?? payload.code ?? nested.code;
-  const reference =
-    payload.reference ??
-    nested.reference ??
-    payload.contiPayRef ??
-    nested.contiPayRef ??
-    payload.contipayRef ??
-    nested.contipayRef ??
-    payload.contipay_ref ??
-    nested.contipay_ref ??
-    payload.transaction_id ??
-    nested.transaction_id ??
-    payload.transactionId ??
-    nested.transactionId ??
-    payload.merchantReference ??
-    nested.merchantReference ??
-    payload.merchant_reference ??
-    nested.merchant_reference ??
-    payload.referenceNumber ??
-    nested.referenceNumber ??
-    payload.reference_number ??
-    nested.reference_number ??
-    payload.invoiceNumber ??
-    nested.invoiceNumber;
-  if (!reference) {
+  const refCandidatesRaw = [
+    payload.reference,
+    nested.reference,
+    payload.contiPayRef,
+    nested.contiPayRef,
+    payload.contipayRef,
+    nested.contipayRef,
+    payload.contipay_ref,
+    nested.contipay_ref,
+    payload.transaction_id,
+    nested.transaction_id,
+    payload.transactionId,
+    nested.transactionId,
+    payload.merchantReference,
+    nested.merchantReference,
+    payload.merchant_reference,
+    nested.merchant_reference,
+    payload.referenceNumber,
+    nested.referenceNumber,
+    payload.reference_number,
+    nested.reference_number,
+    payload.invoiceNumber,
+    nested.invoiceNumber,
+  ];
+  const referenceCandidates = [...new Set(
+    refCandidatesRaw
+      .filter((v) => v !== undefined && v !== null && String(v).trim() !== '')
+      .map((v) => String(v).trim()),
+  )];
+
+  if (referenceCandidates.length === 0) {
     console.error('[ContiPay] Callback missing reference. Payload keys:', Object.keys(payload || {}));
     if (nested && typeof nested === 'object') {
       console.error('[ContiPay] Callback nested payload keys:', Object.keys(nested || {}));
@@ -232,24 +239,46 @@ export async function handleContipayCallback(body) {
     throw new Error('Missing reference in ContiPay callback');
   }
 
-  const paymentStatus = mapContipayStatus(status, statusCode);
-  console.log('[ContiPay] Callback received:', { reference, status, statusCode, paymentStatus });
+  let payment = null;
+  let matchedReference = null;
+  // Try all candidate refs and pick the first matching payment.
+  for (const candidate of referenceCandidates) {
+    const { data: found } = await supabase
+      .from('payments')
+      .select('*')
+      .eq('transaction_id', candidate)
+      .maybeSingle();
+    if (found) {
+      payment = found;
+      matchedReference = candidate;
+      break;
+    }
+  }
 
-  const { data: prevPay } = await supabase
-    .from('payments')
-    .select('metadata')
-    .eq('transaction_id', reference)
-    .maybeSingle();
+  if (!payment) {
+    console.warn('[ContiPay] Callback for unknown reference candidates:', referenceCandidates);
+    return { payment: null };
+  }
+
+  const paymentStatus = mapContipayStatus(status, statusCode);
+  console.log('[ContiPay] Callback received:', {
+    reference: matchedReference,
+    status,
+    statusCode,
+    paymentStatus,
+  });
 
   const mergedMeta = {
-    ...(prevPay?.metadata && typeof prevPay.metadata === 'object' ? prevPay.metadata : {}),
+    ...(payment?.metadata && typeof payment.metadata === 'object' ? payment.metadata : {}),
     ...payload,
+    callback_reference_candidates: referenceCandidates,
+    callback_matched_reference: matchedReference,
   };
 
-  const { data: payment, error: updateError } = await supabase
+  const { data: updatedPayment, error: updateError } = await supabase
     .from('payments')
     .update({ status: paymentStatus, metadata: mergedMeta })
-    .eq('transaction_id', reference)
+    .eq('id', payment.id)
     .select('*')
     .maybeSingle();
 
@@ -258,24 +287,24 @@ export async function handleContipayCallback(body) {
     throw new Error(updateError.message || 'Failed to update payment');
   }
 
-  if (!payment) {
-    console.warn('[ContiPay] Callback for unknown reference:', reference);
+  if (!updatedPayment) {
+    console.warn('[ContiPay] Callback matched payment but update returned no row:', payment.id);
     return { payment: null };
   }
 
-  if (payment.order_id) {
+  if (updatedPayment.order_id) {
     if (paymentStatus === 'completed') {
-      await finalizeOrderPayment(payment);
+      await finalizeOrderPayment(updatedPayment);
     } else if (paymentStatus === 'failed') {
       await supabase
         .from('orders')
         .update({ payment_status: 'failed' })
-        .eq('id', payment.order_id)
+        .eq('id', updatedPayment.order_id)
         .eq('payment_status', 'pending');
     }
   }
 
-  return { payment };
+  return { payment: updatedPayment };
 }
 
 async function finalizeOrderPayment(payment) {
