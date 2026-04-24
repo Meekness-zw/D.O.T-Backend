@@ -196,6 +196,7 @@ app.use(cors({
 }));
 
 app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ extended: true }));
 
 /** Auth middleware: verify Bearer token, set req.userId */
 async function requireAuth(req, res, next) {
@@ -5727,49 +5728,20 @@ app.post('/payments/contipay/callback', async (req, res) => {
   }
 });
 
-// GET /payments/contipay/status?orderId=... — authoritative customer-facing payment confirmation signal
-app.get('/payments/contipay/status', requireAuth, async (req, res) => {
+// Some gateways can send callback via GET query params.
+app.get('/payments/contipay/callback', async (req, res) => {
   try {
-    const { orderId } = req.query || {};
-    if (!orderId) {
-      return res.status(400).json({ error: 'Missing orderId' });
-    }
-
-    const { data: order, error: orderErr } = await supabase
-      .from('orders')
-      .select('id, customer_id, status, payment_method, payment_status, order_number')
-      .eq('id', orderId)
-      .maybeSingle();
-
-    if (orderErr || !order) {
-      return res.status(404).json({ error: 'Order not found' });
-    }
-    if (order.customer_id !== req.userId) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
-
-    const isContipay = String(order.payment_method || '').toLowerCase() === 'contipay';
-    const paymentStatus = String(order.payment_status || '').toLowerCase();
-    const paid = isContipay && ['paid', 'completed'].includes(paymentStatus);
-    const failed = ['failed', 'cancelled', 'canceled'].includes(paymentStatus);
-
-    return res.json({
-      orderId: order.id,
-      orderNumber: order.order_number || null,
-      paymentMethod: order.payment_method,
-      paymentStatus: order.payment_status,
-      orderStatus: order.status,
-      confirmed: paid,
-      failed,
-    });
+    await handleContipayCallback(req.query || {});
+    return res.json({ ok: true });
   } catch (error) {
-    console.error('get /payments/contipay/status error:', error);
+    console.error('ContiPay callback (GET) error:', error);
     return res.status(500).json({
-      error: 'Failed to load payment status',
+      error: 'Failed to process ContiPay callback',
       details: error.message || 'Please try again later',
     });
   }
 });
+
 
 // GET /payments/contipay/status?orderId=... — authoritative customer-facing payment confirmation signal
 app.get('/payments/contipay/status', requireAuth, async (req, res) => {

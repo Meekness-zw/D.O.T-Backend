@@ -197,7 +197,21 @@ export async function initiateContipayPayment({
  * Webhook payload includes: { status, statusCode, reference, contiPayRef, amount, charge, message }
  */
 export async function handleContipayCallback(body) {
-  const { status, statusCode, reference } = body || {};
+  const payload = body && typeof body === 'object' ? body : {};
+  const nested = payload.data && typeof payload.data === 'object' ? payload.data : {};
+  const status = payload.status ?? nested.status ?? payload.transactionStatus ?? nested.transactionStatus;
+  const statusCode = payload.statusCode ?? nested.statusCode ?? payload.code ?? nested.code;
+  const reference =
+    payload.reference ??
+    nested.reference ??
+    payload.transaction_id ??
+    nested.transaction_id ??
+    payload.transactionId ??
+    nested.transactionId ??
+    payload.merchantReference ??
+    nested.merchantReference ??
+    payload.merchant_reference ??
+    nested.merchant_reference;
   if (!reference) throw new Error('Missing reference in ContiPay callback');
 
   const paymentStatus = mapContipayStatus(status, statusCode);
@@ -211,7 +225,7 @@ export async function handleContipayCallback(body) {
 
   const mergedMeta = {
     ...(prevPay?.metadata && typeof prevPay.metadata === 'object' ? prevPay.metadata : {}),
-    ...(body && typeof body === 'object' ? body : {}),
+    ...payload,
   };
 
   const { data: payment, error: updateError } = await supabase
