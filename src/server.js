@@ -5680,10 +5680,12 @@ app.post('/payments/contipay/start', requireAuth, async (req, res) => {
           'API_BASE_URL must be a public HTTPS URL so ContiPay can reach /payments/contipay/callback. localhost cannot receive provider webhooks.',
       });
     }
-    const callbackUrl = `${callbackBase}/payments/contipay/callback`;
+    const reference = `DOT-${ord.order_number || orderId.slice(0, 8)}-${Date.now()}`;
+    // Include our own identifiers in callback query so we can always correlate
+    // even when ContiPay sends only provider-side reference ids in the body.
+    const callbackUrl = `${callbackBase}/payments/contipay/callback?merchant_reference=${encodeURIComponent(reference)}&order_id=${encodeURIComponent(orderId)}`;
     const returnUrl = `${callbackBase}/payments/contipay/return?orderId=${encodeURIComponent(orderId)}&status=success`;
     const cancelUrl = `${callbackBase}/payments/contipay/return?orderId=${encodeURIComponent(orderId)}&status=cancelled`;
-    const reference = `DOT-${ord.order_number || orderId.slice(0, 8)}-${Date.now()}`;
 
     const result = await initiateContipayPayment({
       userId: req.userId,

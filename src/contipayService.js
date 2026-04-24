@@ -224,6 +224,10 @@ export async function handleContipayCallback(body) {
     nested.reference_number,
     payload.invoiceNumber,
     nested.invoiceNumber,
+    payload.order_id,
+    nested.order_id,
+    payload.orderId,
+    nested.orderId,
   ];
   const referenceCandidates = [...new Set(
     refCandidatesRaw
@@ -252,6 +256,53 @@ export async function handleContipayCallback(body) {
       payment = found;
       matchedReference = candidate;
       break;
+    }
+  }
+
+  if (!payment) {
+    // Fallback 1: direct order id in callback query/body
+    const orderIdCandidate =
+      payload.order_id ??
+      nested.order_id ??
+      payload.orderId ??
+      nested.orderId;
+    if (orderIdCandidate) {
+      const { data: byOrder } = await supabase
+        .from('payments')
+        .select('*')
+        .eq('order_id', orderIdCandidate)
+        .eq('payment_method', 'contipay')
+        .eq('status', 'pending')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (byOrder) {
+        payment = byOrder;
+        matchedReference = `order_id:${orderIdCandidate}`;
+      }
+    }
+  }
+
+  if (!payment) {
+    // Fallback 2: if callback carries amount, match unique recent pending contipay payment by amount.
+    const amountCandidate = Number(
+      payload.amount ?? nested.amount ?? payload.transactionAmount ?? nested.transactionAmount,
+    );
+    if (Number.isFinite(amountCandidate) && amountCandidate > 0) {
+      const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+      const { data: pendingByAmount } = await supabase
+        .from('payments')
+        .select('*')
+        .eq('payment_method', 'contipay')
+        .eq('status', 'pending')
+        .eq('amount', amountCandidate)
+        .gte('created_at', thirtyMinutesAgo)
+        .order('created_at', { ascending: false })
+        .limit(2);
+      if ((pendingByAmount || []).length === 1) {
+        payment = pendingByAmount[0];
+        matchedReference = `amount:${amountCandidate}`;
+      }
     }
   }
 
