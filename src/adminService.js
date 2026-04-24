@@ -274,15 +274,19 @@ export async function getAdminDeliveries(options = {}) {
 
   if (deliveries.length > 0) {
     const customerIds = [...new Set(deliveries.map((o) => o.customer_id).filter(Boolean))];
+    const courierIds = [...new Set(deliveries.map((o) => o.courier_id).filter(Boolean))];
     const { data: profiles } = await supabase
       .from('user_profiles')
       .select('id, full_name, phone')
-      .in('id', customerIds);
+      .in('id', [...new Set([...customerIds, ...courierIds])]);
     const profileMap = new Map((profiles || []).map((p) => [p.id, p]));
     deliveries.forEach((o) => {
-      const p = profileMap.get(o.customer_id);
-      o.customer_name = p?.full_name ?? null;
-      o.customer_phone = p?.phone ?? null;
+      const customerProfile = profileMap.get(o.customer_id);
+      const courierProfile = profileMap.get(o.courier_id);
+      o.customer_name = customerProfile?.full_name ?? null;
+      o.customer_phone = customerProfile?.phone ?? null;
+      o.courier_name = courierProfile?.full_name ?? null;
+      o.courier_phone = courierProfile?.phone ?? null;
     });
   }
   return { deliveries, total: count ?? 0 };
