@@ -3056,6 +3056,25 @@ app.patch('/orders/:id', requireAuth, async (req, res) => {
 
     // Merchants may cancel/reject unpaid orders; payment gate applies to other transitions only.
     const isCancelling = status === 'cancelled';
+    const paymentConfirmed = ['paid', 'completed'].includes(
+      String(order.payment_status || '').toLowerCase(),
+    );
+
+    // Self-heal stale status: if payment is confirmed but status is still awaiting_payment,
+    // normalize it to pending so merchant can continue the flow.
+    if (!isCancelling && order.status === 'awaiting_payment' && paymentConfirmed) {
+      const { data: healedOrder } = await supabase
+        .from('orders')
+        .update({ status: 'pending', payment_status: 'paid' })
+        .eq('id', order.id)
+        .select('id, status, payment_status')
+        .maybeSingle();
+      if (healedOrder) {
+        order.status = healedOrder.status;
+        order.payment_status = healedOrder.payment_status;
+      }
+    }
+
     if (!isCancelling && order.status === 'awaiting_payment') {
       return res.status(400).json({
         error: 'Payment not confirmed',
@@ -3066,7 +3085,7 @@ app.patch('/orders/:id', requireAuth, async (req, res) => {
     if (
       !isCancelling &&
       order.payment_method === 'contipay' &&
-      order.payment_status !== 'paid'
+      !['paid', 'completed'].includes(String(order.payment_status || '').toLowerCase())
     ) {
       return res.status(400).json({
         error: 'Payment not confirmed',
@@ -4570,7 +4589,7 @@ app.get('/users/me/payments', requireAuth, async (req, res) => {
 });
 
 // POST /orders — create a new customer order for a single store
-// Body: { items: [{ product_id, product_name, product_price, quantity, unit, weight_kg, subtotal }], store_id, payment_method: 'cash' | 'wallet', delivery_notes? }
+// Body: { items: [{ product_id, product_name, product_price, quantity, unit, weight_kg, subtotal }], store_id, payment_method: 'contipay', delivery_notes? }
 app.post('/orders', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
@@ -4591,10 +4610,10 @@ app.post('/orders', requireAuth, async (req, res) => {
       });
     }
 
-    if (!['cash', 'wallet', 'contipay'].includes(payment_method)) {
+    if (payment_method !== 'contipay') {
       return res.status(400).json({
         error: 'Invalid payment_method',
-        details: 'payment_method must be cash, wallet, or contipay',
+        details: 'payment_method must be contipay',
       });
     }
 
@@ -4710,32 +4729,9 @@ app.post('/orders', requireAuth, async (req, res) => {
       });
     }
 
-    // If paying by wallet, ensure sufficient balance and create a debit transaction
+    // ContiPay-only flow
     let paymentStatus = 'pending';
-    let orderStatus = 'pending';
-
-    if (payment_method === 'contipay') {
-      orderStatus = 'awaiting_payment';
-      paymentStatus = 'pending';
-    } else if (payment_method === 'wallet') {
-      const { data: lastTx } = await supabase
-        .from('wallet_transactions')
-        .select('balance_after')
-        .eq('user_id', req.userId)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      const currentBalance = lastTx?.balance_after || 0;
-      if (currentBalance < totalAmount) {
-        return res.status(400).json({
-          error: 'Insufficient wallet balance',
-          details: 'Your wallet balance is not enough to pay for this order',
-        });
-      }
-
-      paymentStatus = 'paid';
-    }
+    const orderStatus = 'awaiting_payment';
 
     // Generate simple order_number
     const orderNumber = `DOT-${Date.now().toString(36).toUpperCase()}`;
@@ -4788,57 +4784,6 @@ app.post('/orders', requireAuth, async (req, res) => {
     if (itemsError) {
       console.error('create order insert items error:', itemsError);
       throw new Error(itemsError.message || 'Failed to create order items');
-    }
-
-    // If wallet payment, record payment + wallet debit transaction
-    if (payment_method === 'wallet') {
-      const { data: payment, error: paymentError } = await supabase
-        .from('payments')
-        .insert({
-          order_id: order.id,
-          customer_id: req.userId,
-          amount: totalAmount,
-          currency: 'USD',
-          payment_method: 'wallet',
-          payment_provider: 'Wallet',
-          status: 'completed',
-        })
-        .select('*')
-        .single();
-
-      if (paymentError) {
-        console.error('create order insert payment error:', paymentError);
-        throw new Error(paymentError.message || 'Failed to create payment');
-      }
-
-      const { data: lastTxAfter } = await supabase
-        .from('wallet_transactions')
-        .select('balance_after')
-        .eq('user_id', req.userId)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      const prevBalance = lastTxAfter?.balance_after || 0;
-      const newBalance = prevBalance - totalAmount;
-
-      const { error: walletError } = await supabase
-        .from('wallet_transactions')
-        .insert({
-          user_id: req.userId,
-          user_type: 'customer',
-          transaction_type: 'debit',
-          amount: totalAmount,
-          balance_after: newBalance,
-          description: `Order payment ${orderNumber}`,
-          reference_id: payment.id,
-          status: 'completed',
-        });
-
-      if (walletError) {
-        console.error('create order wallet debit error:', walletError);
-        throw new Error(walletError.message || 'Failed to record wallet transaction');
-      }
     }
 
     try {

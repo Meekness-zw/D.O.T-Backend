@@ -61,8 +61,9 @@ export function getContipayConfig() {
  * statusCode is most reliable: 1 = paid, 4 = declined.
  */
 function mapContipayStatus(status, statusCode) {
-  if (statusCode === 1) return 'completed';
-  if (statusCode === 4) return 'failed';
+  const numericCode = Number(statusCode);
+  if (numericCode === 1) return 'completed';
+  if (numericCode === 4) return 'failed';
 
   const s = (status || '').toLowerCase();
   if (['paid', 'success', 'successful', 'complete', 'completed'].includes(s)) return 'completed';
