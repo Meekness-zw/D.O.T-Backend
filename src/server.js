@@ -3336,14 +3336,16 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
 
     let courier_full_name = null;
     let courier_phone = null;
+    let courier_profile_photo_url = null;
     if (order.courier_id) {
       const { data: cp } = await supabase
         .from('user_profiles')
-        .select('full_name, phone')
+        .select('full_name, phone, profile_photo')
         .eq('id', order.courier_id)
         .maybeSingle();
       courier_full_name = cp?.full_name || null;
       courier_phone = cp?.phone || null;
+      courier_profile_photo_url = cp?.profile_photo || null;
     }
 
     let courier_vehicle_type = null;
@@ -3365,6 +3367,7 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
         courier_full_name,
         courier_vehicle_type,
         courier_phone,
+        courier_profile_photo_url,
       },
     });
   } catch (error) {
