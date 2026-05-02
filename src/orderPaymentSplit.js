@@ -3,7 +3,8 @@
  * Industry benchmark: marketplace commission commonly ~15–30% of food subtotal (DoorDash/Uber Eats tiers).
  * Default 20% — override with PLATFORM_COMMISSION_RATE (e.g. 0.15).
  *
- * Delivery fee: credited to courier on POST /courier/orders/:id/complete (see recordCourierDeliveryEarnings).
+ * Courier delivery payout: credited when the customer confirms delivery (see customer confirm endpoint).
+ * Default: share of max(0, delivery_fee − OTD_SERVICE_CHARGE_USD). Env: COURIER_DELIVERY_FEE_SHARE (default 0.8), OTD_PLATFORM_SERVICE_CHARGE_USD (default 0.99).
  */
 
 import { supabaseAdmin } from './supabaseAdminClient.js';
@@ -15,6 +16,32 @@ export function getPlatformCommissionRate() {
   const n = raw != null && raw !== '' ? parseFloat(String(raw), 10) : 0.2;
   if (!Number.isFinite(n) || n < 0 || n > 0.5) return 0.2;
   return n;
+}
+
+export function getCourierDeliveryFeeShare() {
+  const raw = process.env.COURIER_DELIVERY_FEE_SHARE;
+  const n = raw != null && raw !== '' ? parseFloat(String(raw), 10) : 0.8;
+  if (!Number.isFinite(n) || n <= 0 || n > 1) return 0.8;
+  return n;
+}
+
+/** Customer-facing delivery platform fee labeled OTD (“On-Time Delivery”). */
+export function getOtdPlatformServiceChargeUsd() {
+  const raw = process.env.OTD_PLATFORM_SERVICE_CHARGE_USD;
+  const n = raw != null && raw !== '' ? parseFloat(String(raw), 10) : 0.99;
+  if (!Number.isFinite(n) || n < 0) return 0.99;
+  return Math.round(n * 100) / 100;
+}
+
+/**
+ * Courier wallet credit for completing a delivery from the customer's delivery_fee line.
+ */
+export function computeCourierDeliveryPayoutUsd(deliveryFee) {
+  const total = Number(deliveryFee) || 0;
+  const otd = getOtdPlatformServiceChargeUsd();
+  const pool = Math.max(0, Math.round((total - otd) * 100) / 100);
+  const share = getCourierDeliveryFeeShare();
+  return Math.round(pool * share * 100) / 100;
 }
 
 export function computeSubtotalSplit(subtotal) {
@@ -83,7 +110,7 @@ export async function recordMerchantEarningsForOrderPayment({
 }
 
 /**
- * Credit courier when an order is marked delivered. Amount = order delivery_fee (customer-paid delivery).
+ * Credit courier when an order is marked delivered — amount is computed (see computeCourierDeliveryPayoutUsd).
  * Idempotent per order (reference_id = order id). Updates wallet_transactions + couriers.account_balance.
  */
 export async function recordCourierDeliveryEarnings({ courierId, orderId, amount, orderNumber }) {
@@ -125,7 +152,7 @@ export async function recordCourierDeliveryEarnings({ courierId, orderId, amount
       transaction_type: 'earnings',
       amount: credit,
       balance_after: newBalance,
-      description: `Delivery completed — order ${orderNumber || String(orderId).slice(0, 8)}`,
+      description: `Delivery payout — order ${orderNumber || String(orderId).slice(0, 8)}`,
       reference_id: orderId,
       status: 'completed',
     })

@@ -52,7 +52,11 @@ import {
   notifyCustomerOrderPlaced,
   notifyCustomerOrderSelfCancelled,
 } from './orderNotifications.js';
-import { recordCourierDeliveryEarnings } from './orderPaymentSplit.js';
+import {
+  recordCourierDeliveryEarnings,
+  computeCourierDeliveryPayoutUsd,
+  getOtdPlatformServiceChargeUsd,
+} from './orderPaymentSplit.js';
 import crypto from 'crypto';
 import axios from 'axios';
 
@@ -3623,10 +3627,11 @@ app.post('/customer/orders/:id/confirm-delivery', requireAuth, async (req, res) 
     }
 
     if (order.courier_id) {
+      const payoutUsd = computeCourierDeliveryPayoutUsd(Number(order.delivery_fee) || 0);
       await recordCourierDeliveryEarnings({
         courierId: order.courier_id,
         orderId: id,
-        amount: order.delivery_fee,
+        amount: payoutUsd,
         orderNumber: order.order_number,
       });
 
@@ -3882,6 +3887,7 @@ app.get('/courier/orders/active', requireAuth, async (req, res) => {
         id,
         order_number,
         total_amount,
+        delivery_fee,
         status,
         pickup_address,
         pickup_latitude,
@@ -3927,7 +3933,17 @@ app.get('/courier/orders/active', requireAuth, async (req, res) => {
       }
     }
 
-    return res.json({ order: row ? { ...row, customer } : null });
+    const otdFee = getOtdPlatformServiceChargeUsd();
+    return res.json({
+      order: row
+        ? {
+            ...row,
+            customer,
+            courier_payout_estimate: computeCourierDeliveryPayoutUsd(Number(row.delivery_fee) || 0),
+            otd_platform_fee_usd: otdFee,
+          }
+        : null,
+    });
   } catch (error) {
     console.error('get /courier/orders/active error:', error);
     return res.status(500).json({
@@ -4040,8 +4056,10 @@ app.get('/courier/jobs/open', requireAuth, async (req, res) => {
       return acc;
     }, {});
 
+    const otdFee = getOtdPlatformServiceChargeUsd();
     const jobs = (data || []).map((job) => {
       const profile = customerMap[job.customer_id];
+      const df = Number(job.delivery_fee) || 0;
       return {
         ...job,
         customer: profile
@@ -4050,6 +4068,8 @@ app.get('/courier/jobs/open', requireAuth, async (req, res) => {
               profilePhoto: profile.profile_photo || null,
             }
           : null,
+        courier_payout_estimate: computeCourierDeliveryPayoutUsd(df),
+        otd_platform_fee_usd: otdFee,
       };
     });
 
@@ -6621,16 +6641,26 @@ app.get('/maps/places/details', async (req, res) => {
   }
 });
 
-// GET /maps/geocode?latlng=lat,lng  (reverse geocoding — Android only; iOS uses native)
+// GET /maps/geocode?latlng=lat,lng  OR  ?address=...&components=country:ZW  (reverse / forward geocode)
 app.get('/maps/geocode', async (req, res) => {
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
   if (!apiKey) return res.status(503).json({ status: 'REQUEST_DENIED', error_message: 'Google Maps API key not configured on server.' });
-  if (!req.query.latlng) return res.status(400).json({ status: 'INVALID_REQUEST', error_message: 'latlng is required.' });
-  try {
-    const params = new URLSearchParams({
-      key: apiKey,
-      latlng: req.query.latlng,
+  const latlng = req.query.latlng;
+  const address = req.query.address;
+  if (!latlng && (address == null || String(address).trim() === '')) {
+    return res.status(400).json({
+      status: 'INVALID_REQUEST',
+      error_message: 'Provide latlng (reverse) or address (forward geocode).',
     });
+  }
+  try {
+    const params = new URLSearchParams({ key: apiKey });
+    if (latlng) {
+      params.set('latlng', String(latlng));
+    } else {
+      params.set('address', String(address).trim());
+      if (req.query.components) params.set('components', String(req.query.components));
+    }
     const url = `https://maps.googleapis.com/maps/api/geocode/json?${params}`;
     const r = await axios.get(url, { timeout: 8000 });
     return res.json(normaliseMapsResponse(r.data));
