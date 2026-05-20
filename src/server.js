@@ -167,21 +167,20 @@ function calculateDeliveryFee(distanceKm) {
   return Math.round((BASE + (distanceKm - BASE_KM) * rate) * 100) / 100;
 }
 
-// Environment validation (Twilio + Supabase for phone auth)
+// Environment validation (Dexatel + Supabase for phone auth)
 const requiredEnvVars = [
   'SUPABASE_URL',
   'SUPABASE_ANON_KEY',
   'SUPABASE_SERVICE_ROLE_KEY',
   'SUPABASE_JWT_SECRET',
-  'TWILIO_ACCOUNT_SID',
-  'TWILIO_AUTH_TOKEN',
-  'TWILIO_VERIFY_SERVICE_SID',
+  'DEXATEL_API_KEY',
+  'DEXATEL_SENDER',
 ];
 const missingEnvVars = requiredEnvVars.filter((varName) => !process.env[varName]);
 
 if (missingEnvVars.length > 0) {
   console.error('❌ Missing required environment variables:', missingEnvVars.join(', '));
-  console.error('Copy backend/.env.example to backend/.env and fill in your Twilio and Supabase values.');
+  console.error('Copy backend/.env.example to backend/.env and fill in your Dexatel and Supabase values.');
   process.exit(1);
 }
 
@@ -193,9 +192,13 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
 app.use(cors({
   origin: (origin, callback) => {
     // Allow requests with no origin (native mobile apps, Postman, curl, etc.)
-    // Also allow all browser origins — auth is enforced by Bearer token on every
-    // protected endpoint, so open CORS does not weaken security.
-    callback(null, true);
+    if (!origin) return callback(null, true);
+
+    // If ALLOWED_ORIGINS is not configured, keep permissive behavior for development.
+    if (!allowedOrigins.length) return callback(null, true);
+
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error(`CORS blocked for origin: ${origin}`));
   },
   credentials: true,
 }));
