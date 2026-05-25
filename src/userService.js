@@ -1,4 +1,3 @@
-import { supabase } from './supabaseClient.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import crypto from 'crypto';
 

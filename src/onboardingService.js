@@ -292,14 +292,16 @@ export async function saveCourierDriverLicense({
   return { success: true, uploads };
 }
 
-export async function saveCourierPayoutMethod({ userId, methodType, provider, accountNumber, accountName, isDefault = true }) {
+export async function saveCourierPayoutMethod({
+  userId, methodType, provider, providerCode, accountNumber, accountName,
+  detectionMethod, isDefault = true,
+}) {
   requireSupabase();
   if (!userId) throw new Error('userId is required');
   if (!methodType) throw new Error('methodType is required');
   if (!provider || !String(provider).trim()) throw new Error('provider is required');
   if (!accountNumber || !String(accountNumber).trim()) throw new Error('accountNumber is required');
 
-  // Only clear existing defaults when saving a new primary method
   if (isDefault) {
     await supabase
       .from('courier_payout_methods')
@@ -311,8 +313,10 @@ export async function saveCourierPayoutMethod({ userId, methodType, provider, ac
     courier_id: userId,
     method_type: methodType,
     provider: String(provider).trim(),
+    provider_code: providerCode ? String(providerCode).trim().toUpperCase() : null,
     account_number: String(accountNumber).trim(),
     account_name: accountName ? String(accountName).trim() : null,
+    detection_method: detectionMethod || null,
     is_default: isDefault,
   };
 
@@ -322,6 +326,44 @@ export async function saveCourierPayoutMethod({ userId, methodType, provider, ac
     .select('*')
     .single();
   if (error) throw new Error(error.message || 'Failed to save payout method');
+
+  return { success: true, payoutMethodId: data.id };
+}
+
+export async function saveMerchantPayoutMethod({
+  userId, methodType, provider, providerCode, accountNumber, accountName,
+  detectionMethod, isDefault = true,
+}) {
+  requireSupabase();
+  if (!userId) throw new Error('userId is required');
+  if (!methodType) throw new Error('methodType is required');
+  if (!provider || !String(provider).trim()) throw new Error('provider is required');
+  if (!accountNumber || !String(accountNumber).trim()) throw new Error('accountNumber is required');
+
+  if (isDefault) {
+    await supabase
+      .from('merchant_payout_methods')
+      .update({ is_default: false })
+      .eq('merchant_id', userId);
+  }
+
+  const insert = {
+    merchant_id: userId,
+    method_type: methodType,
+    provider: String(provider).trim(),
+    provider_code: providerCode ? String(providerCode).trim().toUpperCase() : null,
+    account_number: String(accountNumber).trim(),
+    account_name: accountName ? String(accountName).trim() : null,
+    detection_method: detectionMethod || null,
+    is_default: isDefault,
+  };
+
+  const { data, error } = await supabase
+    .from('merchant_payout_methods')
+    .insert(insert)
+    .select('*')
+    .single();
+  if (error) throw new Error(error.message || 'Failed to save merchant payout method');
 
   return { success: true, payoutMethodId: data.id };
 }

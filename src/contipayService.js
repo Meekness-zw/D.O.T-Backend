@@ -6,6 +6,7 @@ const RedirectMethod = require('contipay-js/src/helpers/redirect_method.js');
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { computeSubtotalSplit, recordMerchantEarningsForOrderPayment } from './orderPaymentSplit.js';
 import { notifyCustomerPaymentReceived } from './orderNotifications.js';
+import { isDisburseReference, finalizeDisbursementCallback } from './contipayDisburseService.js';
 
 const supabase = supabaseAdmin;
 
@@ -241,6 +242,17 @@ export async function handleContipayCallback(body) {
       console.error('[ContiPay] Callback nested payload keys:', Object.keys(nested || {}));
     }
     throw new Error('Missing reference in ContiPay callback');
+  }
+
+  const disburseRef = referenceCandidates.find(isDisburseReference);
+  if (disburseRef) {
+    const { disbursement } = await finalizeDisbursementCallback({
+      reference:  disburseRef,
+      statusCode: payload.statusCode ?? nested.statusCode ?? payload.code ?? nested.code,
+      status:     payload.status ?? nested.status ?? payload.transactionStatus,
+      rawPayload: payload,
+    });
+    return { payment: null, disbursement };
   }
 
   let payment = null;

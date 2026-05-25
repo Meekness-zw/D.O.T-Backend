@@ -20,8 +20,11 @@ import {
   saveCourierVehicle,
   saveCourierDriverLicense,
   saveCourierPayoutMethod,
+  saveMerchantPayoutMethod,
   upsertMerchantOnboarding,
 } from './onboardingService.js';
+import { detectProviderFromPhone, normalizeZwPhone } from './walletProvider.js';
+import { triggerOrderPayoutsOnDelivery } from './orderPayoutTrigger.js';
 import { getSuggestedProductCategoryNames } from './storeCategorySuggestions.js';
 import {
   getAdminStats,
@@ -894,22 +897,25 @@ app.post('/couriers/onboarding/driver-license', requireAuth, async (req, res) =>
 // POST /couriers/onboarding/payout-method
 app.post('/couriers/onboarding/payout-method', requireAuth, async (req, res) => {
   try {
-    const { methodType, provider, accountNumber, accountName, secondary } = req.body || {};
+    const { methodType, provider, providerCode, accountNumber, accountName, detectionMethod, secondary } = req.body || {};
     const data = await saveCourierPayoutMethod({
       userId: req.userId,
       methodType,
       provider,
+      providerCode,
       accountNumber,
       accountName,
+      detectionMethod,
     });
-    // Save optional secondary payout method
     if (secondary?.provider && secondary?.accountNumber) {
       await saveCourierPayoutMethod({
         userId: req.userId,
         methodType: secondary.methodType || 'mobile_money',
         provider: secondary.provider,
+        providerCode: secondary.providerCode,
         accountNumber: secondary.accountNumber,
         accountName: secondary.accountName || null,
+        detectionMethod: secondary.detectionMethod,
         isDefault: false,
       });
     }
@@ -918,6 +924,77 @@ app.post('/couriers/onboarding/payout-method', requireAuth, async (req, res) => 
     console.error('courier payout onboarding error:', error);
     return res.status(400).json({ error: error.message || 'Failed to save payout method' });
   }
+});
+
+// POST /merchants/onboarding/payout-method — save merchant payout destination
+app.post('/merchants/onboarding/payout-method', requireAuth, async (req, res) => {
+  try {
+    const { methodType, provider, providerCode, accountNumber, accountName, detectionMethod, secondary } = req.body || {};
+    const data = await saveMerchantPayoutMethod({
+      userId: req.userId,
+      methodType,
+      provider,
+      providerCode,
+      accountNumber,
+      accountName,
+      detectionMethod,
+    });
+    if (secondary?.provider && secondary?.accountNumber) {
+      await saveMerchantPayoutMethod({
+        userId: req.userId,
+        methodType: secondary.methodType || 'mobile_money',
+        provider: secondary.provider,
+        providerCode: secondary.providerCode,
+        accountNumber: secondary.accountNumber,
+        accountName: secondary.accountName || null,
+        detectionMethod: secondary.detectionMethod,
+        isDefault: false,
+      });
+    }
+    return res.json(data);
+  } catch (error) {
+    console.error('merchant payout onboarding error:', error);
+    return res.status(400).json({ error: error.message || 'Failed to save payout method' });
+  }
+});
+
+// GET /merchant/payout-method — fetch default merchant payout destination
+app.get('/merchant/payout-method', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { data, error } = await supabase
+      .from('merchant_payout_methods')
+      .select('id, method_type, provider, provider_code, account_number, account_name, is_default, is_verified')
+      .eq('merchant_id', req.userId)
+      .order('is_default', { ascending: false })
+      .order('created_at', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      console.error('get /merchant/payout-method error:', error);
+      throw new Error(error.message || 'Failed to load payout method');
+    }
+    return res.json({ payoutMethod: data || null });
+  } catch (error) {
+    console.error('get /merchant/payout-method error:', error);
+    return res.status(500).json({
+      error: 'Failed to load payout method',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /payments/wallet/detect-provider — phone → likely mobile money provider
+// Public utility; clients can also do this offline via frontend/utils/walletProvider.js
+app.post('/payments/wallet/detect-provider', (req, res) => {
+  const phone = req.body?.phone || req.query?.phone || '';
+  const normalized = normalizeZwPhone(phone);
+  const provider = detectProviderFromPhone(normalized);
+  return res.json({
+    phone: normalized,
+    provider: provider || null,
+  });
 });
 
 // GET /courier/payout-method — get default payout method for courier wallet
@@ -3637,6 +3714,16 @@ app.post('/customer/orders/:id/confirm-delivery', requireAuth, async (req, res) 
         amount: payoutUsd,
         orderNumber: order.order_number,
       });
+
+      // Fire Contipay disbursements to merchant + courier wallets (best-effort,
+      // non-blocking). Failures are logged; earnings stay in wallet for manual cashout.
+      triggerOrderPayoutsOnDelivery({ orderId: id })
+        .then((result) => {
+          console.log('[payout] delivery payouts triggered for order', id, result);
+        })
+        .catch((err) => {
+          console.error('[payout] trigger failed for order', id, err?.message || err);
+        });
 
       // Notify courier that customer confirmed delivery
       try {
