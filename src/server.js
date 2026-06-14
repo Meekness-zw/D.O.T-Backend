@@ -12,7 +12,14 @@ import {
   recordCourierProfilePhotoDocument,
 } from './userService.js';
 import { getOrdersForUser, getWalletTransactionsForUser, getPaymentsForUser, getFullUserMe, getMerchantDashboardStats } from './historyService.js';
-import { initiateContipayPayment, handleContipayCallback, getContipayConfig } from './contipayService.js';
+import {
+  createPesepayTransaction,
+  handlePesepayCallback,
+  checkPesepayStatus,
+  listPesepayActiveCurrencies,
+  listPesepayPaymentMethods,
+} from './paymentService.js';
+import { getPesepayConfig } from './pesepayConfig.js';
 import { createSupabaseAccessToken, verifyAccessToken } from './sessionToken.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import {
@@ -24,7 +31,6 @@ import {
   upsertMerchantOnboarding,
 } from './onboardingService.js';
 import { detectProviderFromPhone, normalizeZwPhone } from './walletProvider.js';
-import { triggerOrderPayoutsOnDelivery } from './orderPayoutTrigger.js';
 import { getSuggestedProductCategoryNames } from './storeCategorySuggestions.js';
 import {
   getAdminStats,
@@ -570,16 +576,16 @@ app.get('/', (req, res) => {
   });
 });
 
-// GET /debug/contipay — test ContiPay configuration
-app.get('/debug/contipay', (req, res) => {
+// GET /debug/pesepay — sanity-check Pesepay configuration (no secrets leaked)
+app.get('/debug/pesepay', (req, res) => {
   try {
-    const config = getContipayConfig();
+    const { integrationKey, encryptionKey } = getPesepayConfig();
     res.json({
-      hasKey: !!config.apiKey,
-      keyPrefix: config.apiKey?.slice(0, 4) || 'none',
-      keyLength: config.apiKey?.length || 0,
-      baseUrl: process.env.CONTIPAY_API_URL || 'https://api.contipay.co.zw',
-      envVars: Object.keys(process.env).filter(k => k.startsWith('CONTI')).join(', ')
+      hasIntegrationKey: !!integrationKey,
+      integrationKeyPrefix: integrationKey?.slice(0, 4) || 'none',
+      hasEncryptionKey: !!encryptionKey,
+      encryptionKeyLength: encryptionKey?.length || 0,
+      baseUrl: process.env.PESEPAY_BASE_URL || 'https://api.pesepay.com/api/payments-engine/',
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -3158,7 +3164,7 @@ app.patch('/orders/:id', requireAuth, async (req, res) => {
     }
     if (
       !isCancelling &&
-      order.payment_method === 'contipay' &&
+      order.payment_method === 'pesepay' &&
       !['paid', 'completed'].includes(String(order.payment_status || '').toLowerCase())
     ) {
       return res.status(400).json({
@@ -3252,7 +3258,7 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
       });
     }
 
-    if (order.payment_status === 'paid' && order.payment_method === 'contipay') {
+    if (order.payment_status === 'paid' && order.payment_method === 'pesepay') {
       return res.status(400).json({
         error: 'Cannot cancel in the app',
         details:
@@ -3715,15 +3721,8 @@ app.post('/customer/orders/:id/confirm-delivery', requireAuth, async (req, res) 
         orderNumber: order.order_number,
       });
 
-      // Fire Contipay disbursements to merchant + courier wallets (best-effort,
-      // non-blocking). Failures are logged; earnings stay in wallet for manual cashout.
-      triggerOrderPayoutsOnDelivery({ orderId: id })
-        .then((result) => {
-          console.log('[payout] delivery payouts triggered for order', id, result);
-        })
-        .catch((err) => {
-          console.error('[payout] trigger failed for order', id, err?.message || err);
-        });
+      // Merchant + courier earnings accrue to their in-app wallet for manual
+      // cashout. (Pesepay is collections-only — there is no auto-disbursement.)
 
       // Notify courier that customer confirmed delivery
       try {
@@ -4689,7 +4688,7 @@ app.get('/users/me/payments', requireAuth, async (req, res) => {
 });
 
 // POST /orders — create a new customer order for a single store
-// Body: { items: [{ product_id, product_name, product_price, quantity, unit, weight_kg, subtotal }], store_id, payment_method: 'contipay', delivery_notes? }
+// Body: { items: [{ product_id, product_name, product_price, quantity, unit, weight_kg, subtotal }], store_id, payment_method: 'pesepay', delivery_notes? }
 app.post('/orders', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
@@ -4710,10 +4709,10 @@ app.post('/orders', requireAuth, async (req, res) => {
       });
     }
 
-    if (payment_method !== 'contipay') {
+    if (payment_method !== 'pesepay') {
       return res.status(400).json({
         error: 'Invalid payment_method',
-        details: 'payment_method must be contipay',
+        details: 'payment_method must be pesepay',
       });
     }
 
@@ -4829,7 +4828,8 @@ app.post('/orders', requireAuth, async (req, res) => {
       });
     }
 
-    // ContiPay-only flow
+    // Pesepay-only online flow: order is created awaiting payment, then the
+    // client calls /payments/pesepay/start to get the hosted checkout URL.
     let paymentStatus = 'pending';
     const orderStatus = 'awaiting_payment';
 
@@ -5725,8 +5725,8 @@ app.post('/users/me/addresses/:id/default', requireAuth, async (req, res) => {
   }
 });
 
-// POST /payments/contipay/start — initiate a ContiPay payment for an order (auth required)
-app.post('/payments/contipay/start', requireAuth, async (req, res) => {
+// POST /payments/pesepay/start — initiate a Pesepay hosted-redirect payment for an order (auth required)
+app.post('/payments/pesepay/start', requireAuth, async (req, res) => {
   try {
     const { orderId, amount } = req.body || {};
 
@@ -5750,25 +5750,16 @@ app.post('/payments/contipay/start', requireAuth, async (req, res) => {
     if (ord.customer_id !== req.userId) {
       return res.status(403).json({ error: 'Forbidden' });
     }
-    if (ord.payment_method !== 'contipay' || ord.status !== 'awaiting_payment') {
-      return res.status(400).json({ error: 'Order is not awaiting ContiPay payment' });
+    if (ord.payment_method !== 'pesepay' || ord.status !== 'awaiting_payment') {
+      return res.status(400).json({ error: 'Order is not awaiting Pesepay payment' });
     }
     const expected = Number(ord.total_amount);
     if (!Number.isFinite(expected) || Math.abs(expected - Number(amount)) > 0.02) {
       return res.status(400).json({ error: 'Amount mismatch', details: 'amount must match the order total' });
     }
 
-    // Get customer profile for phone/email
+    // Get customer profile for the hosted page (informational)
     const profile = await getProfile(req.userId);
-    const phone = profile?.phone;
-    const email = profile?.email || '';
-
-    if (!phone) {
-      return res.status(400).json({
-        error: 'Phone number required',
-        details: 'Add a phone number to your profile so ContiPay can process payment.',
-      });
-    }
 
     const apiBase = process.env.API_BASE_URL || `http://localhost:${process.env.PORT || 4000}`;
     const callbackBase = apiBase.replace(/\/$/, '');
@@ -5776,42 +5767,77 @@ app.post('/payments/contipay/start', requireAuth, async (req, res) => {
       return res.status(400).json({
         error: 'Invalid payment callback URL',
         details:
-          'API_BASE_URL must be a public HTTPS URL so ContiPay can reach /payments/contipay/callback. localhost cannot receive provider webhooks.',
+          'API_BASE_URL must be a public HTTPS URL so Pesepay can reach /payments/pesepay/callback. localhost cannot receive provider webhooks.',
       });
     }
     const reference = `DOT-${ord.order_number || orderId.slice(0, 8)}-${Date.now()}`;
-    // Include our own identifiers in callback query so we can always correlate
-    // even when ContiPay sends only provider-side reference ids in the body.
-    const callbackUrl = `${callbackBase}/payments/contipay/callback?merchant_reference=${encodeURIComponent(reference)}&order_id=${encodeURIComponent(orderId)}`;
-    const returnUrl = `${callbackBase}/payments/contipay/return?orderId=${encodeURIComponent(orderId)}&status=success`;
-    const cancelUrl = `${callbackBase}/payments/contipay/return?orderId=${encodeURIComponent(orderId)}&status=cancelled`;
+    const resultUrl = `${callbackBase}/payments/pesepay/callback`;
+    const returnUrl = `${callbackBase}/payments/pesepay/return?orderId=${encodeURIComponent(orderId)}`;
 
-    const result = await initiateContipayPayment({
+    const result = await createPesepayTransaction({
       userId: req.userId,
       orderId: ord.id,
       amount: Number(amount),
-      phone,
-      email,
-      fullName: profile?.full_name || '',
-      reference,
-      callbackUrl,
+      currencyCode: 'USD',
+      reasonForPayment: `DOT order ${ord.order_number || orderId} payment`,
+      merchantReference: reference,
+      resultUrl,
       returnUrl,
-      cancelUrl,
+      customer: {
+        phoneNumber: profile?.phone || '',
+        email: profile?.email || '',
+        name: profile?.full_name || 'GUEST',
+      },
     });
 
-    return res.json({ paymentUrl: result.paymentUrl, reference });
+    return res.json({
+      paymentUrl: result.redirectUrl,
+      pollUrl: result.pollUrl,
+      referenceNumber: result.referenceNumber,
+      reference,
+    });
   } catch (error) {
-    console.error('ContiPay start error:', error);
-    console.error('ContiPay start error details:', error.response?.data || error.message);
+    console.error('Pesepay start error:', error);
+    console.error('Pesepay start error details:', error.response?.data || error.message);
     return res.status(500).json({
-      error: 'Failed to start ContiPay payment',
+      error: 'Failed to start Pesepay payment',
       details: error.response?.data?.message || error.response?.data?.error || error.message || 'Please try again later',
     });
   }
 });
 
-// GET /payments/contipay/return — browser redirect after ContiPay hosted page; forwards to app deep link
-app.get('/payments/contipay/return', (req, res) => {
+// GET /payments/pesepay/payment-methods?currencyCode=USD — payment methods (and their
+// codes) Pesepay offers for a currency. Codes feed PESEPAY_*_METHOD_CODE env vars.
+app.get('/payments/pesepay/payment-methods', requireAuth, async (req, res) => {
+  try {
+    const currencyCode = String(req.query?.currencyCode || 'USD').toUpperCase();
+    const methods = await listPesepayPaymentMethods(currencyCode);
+    return res.json({ currencyCode, paymentMethods: methods });
+  } catch (error) {
+    console.error('get /payments/pesepay/payment-methods error:', error);
+    return res.status(502).json({
+      error: 'Failed to load Pesepay payment methods',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// GET /payments/pesepay/currencies — currencies the Pesepay account can collect in
+app.get('/payments/pesepay/currencies', requireAuth, async (req, res) => {
+  try {
+    const currencies = await listPesepayActiveCurrencies();
+    return res.json({ currencies });
+  } catch (error) {
+    console.error('get /payments/pesepay/currencies error:', error);
+    return res.status(502).json({
+      error: 'Failed to load Pesepay currencies',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// GET /payments/pesepay/return — browser redirect after Pesepay hosted page; forwards to app deep link
+app.get('/payments/pesepay/return', (req, res) => {
   const scheme = process.env.APP_PAYMENT_DEEP_LINK_SCHEME || 'dotdeliveryontime';
   const q = new URLSearchParams(req.query || {});
   const target = `${scheme}://payment-return?${q.toString()}`;
@@ -5823,45 +5849,24 @@ app.get('/payments/contipay/return', (req, res) => {
   return res.status(200).send(html);
 });
 
-// POST /payments/contipay/callback — ContiPay server-to-server result callback (no auth)
-app.post('/payments/contipay/callback', async (req, res) => {
+// POST /payments/pesepay/callback — Pesepay server-to-server result webhook (no auth).
+// Body is { payload: '<AES-encrypted-transaction>' }.
+app.post('/payments/pesepay/callback', async (req, res) => {
   try {
-    const callbackPayload = {
-      ...((req.query && typeof req.query === 'object') ? req.query : {}),
-      ...((req.body && typeof req.body === 'object') ? req.body : {}),
-    };
-    await handleContipayCallback(callbackPayload);
+    await handlePesepayCallback(req.body || {});
     return res.json({ ok: true });
   } catch (error) {
-    console.error('ContiPay callback error:', error);
+    console.error('Pesepay callback error:', error);
     return res.status(500).json({
-      error: 'Failed to process ContiPay callback',
+      error: 'Failed to process Pesepay callback',
       details: error.message || 'Please try again later',
     });
   }
 });
 
-// Some gateways can send callback via GET query params.
-app.get('/payments/contipay/callback', async (req, res) => {
-  try {
-    const callbackPayload = {
-      ...((req.query && typeof req.query === 'object') ? req.query : {}),
-      ...((req.body && typeof req.body === 'object') ? req.body : {}),
-    };
-    await handleContipayCallback(callbackPayload);
-    return res.json({ ok: true });
-  } catch (error) {
-    console.error('ContiPay callback (GET) error:', error);
-    return res.status(500).json({
-      error: 'Failed to process ContiPay callback',
-      details: error.message || 'Please try again later',
-    });
-  }
-});
-
-
-// GET /payments/contipay/status?orderId=... — authoritative customer-facing payment confirmation signal
-app.get('/payments/contipay/status', requireAuth, async (req, res) => {
+// GET /payments/pesepay/status?orderId=... — authoritative customer-facing payment confirmation signal.
+// Actively reconciles against Pesepay (check-payment) when the order is still awaiting payment.
+app.get('/payments/pesepay/status', requireAuth, async (req, res) => {
   try {
     const { orderId } = req.query || {};
     if (!orderId) {
@@ -5881,22 +5886,45 @@ app.get('/payments/contipay/status', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    const isContipay = String(order.payment_method || '').toLowerCase() === 'contipay';
-    const paymentStatus = String(order.payment_status || '').toLowerCase();
-    const paid = isContipay && ['paid', 'completed'].includes(paymentStatus);
+    const isPesepay = String(order.payment_method || '').toLowerCase() === 'pesepay';
+    let paymentStatus = String(order.payment_status || '').toLowerCase();
+
+    // If still unconfirmed, poll Pesepay directly in case the webhook was missed.
+    if (isPesepay && !['paid', 'completed', 'failed', 'cancelled'].includes(paymentStatus)) {
+      const { data: pay } = await supabase
+        .from('payments')
+        .select('transaction_id')
+        .eq('order_id', order.id)
+        .eq('payment_method', 'pesepay')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (pay?.transaction_id) {
+        try {
+          const reconciled = await checkPesepayStatus(pay.transaction_id);
+          if (reconciled?.order?.payment_status) {
+            paymentStatus = String(reconciled.order.payment_status).toLowerCase();
+          }
+        } catch (pollErr) {
+          console.warn('[Pesepay] status poll failed:', pollErr?.message || pollErr);
+        }
+      }
+    }
+
+    const paid = isPesepay && ['paid', 'completed'].includes(paymentStatus);
     const failed = ['failed', 'cancelled', 'canceled'].includes(paymentStatus);
 
     return res.json({
       orderId: order.id,
       orderNumber: order.order_number || null,
       paymentMethod: order.payment_method,
-      paymentStatus: order.payment_status,
+      paymentStatus,
       orderStatus: order.status,
       confirmed: paid,
       failed,
     });
   } catch (error) {
-    console.error('get /payments/contipay/status error:', error);
+    console.error('get /payments/pesepay/status error:', error);
     return res.status(500).json({
       error: 'Failed to load payment status',
       details: error.message || 'Please try again later',
@@ -6764,13 +6792,10 @@ app.listen(PORT, () => {
   console.log('✅ DOT Backend API started successfully');
   console.log(`📍 Server: http://localhost:${PORT}`);
   console.log(`🌍 Environment: ${NODE_ENV}`);
-  console.log('[ENV CHECK] ContiPay vars present at startup:', {
-    CONTIPAY_API_KEY:          !!process.env.CONTIPAY_API_KEY,
-    CONTIPAY_API_SECRET:       !!process.env.CONTIPAY_API_SECRET,
-    CONTIPAY_AUTH_KEY:         !!process.env.CONTIPAY_AUTH_KEY,
-    CONTIPAY_AUTH_SECRET:      !!process.env.CONTIPAY_AUTH_SECRET,
-    CONTIPAY_MERCHANT_ID:      !!process.env.CONTIPAY_MERCHANT_ID,
-    CONTIPAY_ENV:              process.env.CONTIPAY_ENV || '(not set, defaults to DEV)',
+  console.log('[ENV CHECK] Pesepay vars present at startup:', {
+    PAYMENT_INTEGRATION_ID:    !!process.env.PAYMENT_INTEGRATION_ID,
+    PAYMENT_ENCRYPTION_KEY:    !!process.env.PAYMENT_ENCRYPTION_KEY,
+    PESEPAY_BASE_URL:          process.env.PESEPAY_BASE_URL || '(default: production)',
     SUPABASE_SERVICE_ROLE_KEY: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
   });
   console.log(`🔒 CORS allowed origins:`, allowedOrigins);

@@ -2,9 +2,9 @@
  * Zimbabwean mobile money provider detection from phone number prefix.
  * Mirrors frontend/utils/walletProvider.js — keep both in sync.
  *
- * Contipay provider codes (used by /disburse/payment transaction.providerCode):
- *   EC = EcoCash, NM = OneMoney (NetOne Money), TC = Telecash
- *   IB = InnBucks, OM = O'Mari, TF = generic Transfer (let Contipay route by phone)
+ * Used to label a customer's likely wallet provider in the UI
+ * (GET /payments/wallet/detect-provider). The short `code` values
+ * (EC/NM/TC/IB/OM) are retained for display/grouping only.
  */
 
 export const WALLET_PROVIDERS = {

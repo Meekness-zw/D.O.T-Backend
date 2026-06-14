@@ -8,8 +8,16 @@ import { notifyCustomerPaymentReceived } from './orderNotifications.js';
 
 const supabase = supabaseAdmin;
 
-// Always use the production URL — Pesepay production URL for BOTH sandbox/live credentials.
-const PESEPAY_BASE_URL = 'https://api.pesepay.com/api/payments-engine/';
+// Pesepay payments-engine base URLs. Note the sandbox host has no `/api` prefix.
+// Set PESEPAY_ENV=sandbox to use the sandbox host (with sandbox keys), or
+// override the full base with PESEPAY_BASE_URL.
+const PESEPAY_PROD_BASE_URL = 'https://api.pesepay.com/api/payments-engine/';
+const PESEPAY_SANDBOX_BASE_URL = 'https://api.test.sandbox.pesepay.com/payments-engine/';
+const PESEPAY_BASE_URL =
+  process.env.PESEPAY_BASE_URL ||
+  (String(process.env.PESEPAY_ENV || '').toLowerCase() === 'sandbox'
+    ? PESEPAY_SANDBOX_BASE_URL
+    : PESEPAY_PROD_BASE_URL);
 
 class PesepaySecurity {
   constructor(encryptionKey) {
@@ -74,30 +82,35 @@ function mapPesepayStatusToPaymentStatus(transactionStatus) {
 }
 
 /**
- * Create a seamless Pesepay transaction for a user.
+ * Initiate a hosted (redirect) Pesepay transaction for a user.
+ *
+ * Uses POST v1/payments/initiate — Pesepay returns a hosted checkout page
+ * (redirectUrl) where the customer picks their method (card, EcoCash, etc.).
+ * The final result arrives later on the resultUrl webhook (handlePesepayCallback),
+ * and can also be polled via checkPesepayStatus(referenceNumber).
  *
  * Params:
  * - userId: UUID from auth/users
  * - amount: number
  * - currencyCode: e.g. 'USD', 'ZWL'
- * - paymentMethodCode: Pesepay payment method code
  * - reasonForPayment: description, shown to user
  * - merchantReference: app-generated reference (e.g. order number)
- * - resultUrl: HTTPS URL Pesepay will POST result to (your backend endpoint)
- * - returnUrl: optional URL app/web will be redirected to after payment
- * - customer: { phoneNumber, email?, name? }
+ * - resultUrl: HTTPS URL Pesepay will POST the encrypted result to (your backend endpoint)
+ * - returnUrl: URL the browser is redirected to after payment (deep-links back into the app)
+ * - customer: optional { phoneNumber?, email?, name? } — informational only for the hosted page
  * - customerPaymentMethodId: optional UUID linking to customer_payment_methods
+ *
+ * Returns: { redirectUrl, pollUrl, referenceNumber, transaction, payment }
  */
 export async function createPesepayTransaction({
   userId,
   amount,
   currencyCode = 'USD',
-  paymentMethodCode,
   reasonForPayment,
   merchantReference,
   resultUrl,
   returnUrl,
-  customer,
+  customer = null,
   orderId = null,
   customerPaymentMethodId = null,
 }) {
@@ -107,9 +120,8 @@ export async function createPesepayTransaction({
 
   if (!userId) throw new Error('userId is required');
   if (!amount || amount <= 0) throw new Error('amount must be > 0');
-  if (!paymentMethodCode) throw new Error('paymentMethodCode is required');
   if (!reasonForPayment) throw new Error('reasonForPayment is required');
-  if (!customer?.phoneNumber) throw new Error('customer.phoneNumber is required');
+  if (!resultUrl) throw new Error('resultUrl is required');
 
   const { integrationKey, encryptionKey } = getPesepayConfig();
   if (!integrationKey || !encryptionKey) {
@@ -119,38 +131,41 @@ export async function createPesepayTransaction({
   const http = createPesepayHttpClient(integrationKey);
   const security = new PesepaySecurity(encryptionKey);
 
-  const makePaymentRequest = {
+  const reference = merchantReference || `DOT-${Date.now()}-${userId.slice(0, 8)}`;
+
+  const initiateRequest = {
     amountDetails: {
       amount,
       currencyCode,
     },
-    merchantReference: merchantReference || `DOT-${Date.now()}-${userId.slice(0, 8)}`,
+    merchantReference: reference,
     reasonForPayment,
     resultUrl,
     returnUrl: returnUrl || resultUrl,
-    paymentMethodCode,
-    customer: {
-      phoneNumber: customer.phoneNumber,
-      email: customer.email || '',
-      name: customer.name || 'GUEST',
-    },
-    paymentMethodRequiredFields: {},
   };
 
-  const payload = security.encryptData(makePaymentRequest);
-  const response = await http.post('v2/payments/make-payment', { payload });
+  const payload = security.encryptData(initiateRequest);
+  const response = await http.post('v1/payments/initiate', { payload });
 
   if (!response?.data?.payload) {
-    console.error('[Pesepay] Unexpected response:', response.status, JSON.stringify(response.data));
+    console.error('[Pesepay] Unexpected initiate response:', response.status, JSON.stringify(response.data));
     throw new Error(`Pesepay error: invalid response (${response.status})`);
   }
 
   const transaction = security.decryptData(response.data.payload);
+  const redirectUrl = transaction.redirectUrl || transaction.redirect_url || null;
+  const pollUrl = transaction.pollUrl || transaction.poll_url || null;
+
+  if (!redirectUrl) {
+    console.error('[Pesepay] initiate returned no redirectUrl:', JSON.stringify(transaction));
+    throw new Error('Pesepay did not return a checkout URL');
+  }
 
   const paymentStatus = mapPesepayStatusToPaymentStatus(transaction.transactionStatus);
 
   const metadataBase =
     transaction && typeof transaction === 'object' ? { ...transaction } : { gatewayPayload: transaction };
+  if (customer) metadataBase.customer = customer;
   if (customerPaymentMethodId) {
     metadataBase.customer_payment_method_id = customerPaymentMethodId;
   }
@@ -176,22 +191,90 @@ export async function createPesepayTransaction({
     throw new Error(paymentError.message || 'Failed to save payment');
   }
 
-  // Wallet top-up only (no order): credit customer wallet when gateway returns success immediately.
-  let walletTx = null;
-  if (paymentStatus === 'completed' && !orderId) {
-    walletTx = await createWalletTransactionForPayment({
-      userId,
-      amount,
-      currencyCode,
-      paymentId: insertedPayment.id,
-    });
-  }
-
   return {
     transaction,
+    redirectUrl,
+    pollUrl,
+    referenceNumber: transaction.referenceNumber,
     payment: insertedPayment,
-    walletTransaction: walletTx,
   };
+}
+
+/**
+ * GET v1/currencies/active — list currencies the merchant account can collect in.
+ * Returns the raw array from Pesepay (e.g. [{ code: 'USD', name: ... }, ...]).
+ */
+export async function listPesepayActiveCurrencies() {
+  const { integrationKey } = getPesepayConfig();
+  if (!integrationKey) {
+    throw new Error('Pesepay integrationKey not configured');
+  }
+
+  const http = createPesepayHttpClient(integrationKey);
+  const response = await http.get('v1/currencies/active');
+
+  if (response.status !== 200 || !Array.isArray(response.data)) {
+    console.error('[Pesepay] Unexpected currencies response:', response.status, JSON.stringify(response.data));
+    throw new Error(`Pesepay error: invalid currencies response (${response.status})`);
+  }
+  return response.data;
+}
+
+/**
+ * GET v1/payment-methods/for-currency?currencyCode=... — list payment methods
+ * (with their codes, e.g. PZW211) available for a currency. Use this to find
+ * the code for PESEPAY_USD_PAYMENT_METHOD_CODE instead of dashboard digging.
+ */
+export async function listPesepayPaymentMethods(currencyCode = 'USD') {
+  const { integrationKey } = getPesepayConfig();
+  if (!integrationKey) {
+    throw new Error('Pesepay integrationKey not configured');
+  }
+
+  const http = createPesepayHttpClient(integrationKey);
+  const response = await http.get(
+    `v1/payment-methods/for-currency?currencyCode=${encodeURIComponent(currencyCode)}`,
+  );
+
+  if (response.status !== 200 || !Array.isArray(response.data)) {
+    console.error('[Pesepay] Unexpected payment-methods response:', response.status, JSON.stringify(response.data));
+    throw new Error(`Pesepay error: invalid payment-methods response (${response.status})`);
+  }
+  return response.data;
+}
+
+/**
+ * Poll Pesepay for the status of a transaction by reference number, then
+ * reconcile our local payment row + order/wallet exactly like the webhook does.
+ * Useful as a fallback when the result webhook is delayed or missed.
+ *
+ * GET v1/payments/check-payment?referenceNumber=...
+ * Returns: { transaction, paymentStatus } or null if nothing to do.
+ */
+export async function checkPesepayStatus(referenceNumber) {
+  if (!referenceNumber) throw new Error('referenceNumber is required');
+
+  const { integrationKey, encryptionKey } = getPesepayConfig();
+  if (!integrationKey || !encryptionKey) {
+    throw new Error('Pesepay integrationKey or encryptionKey not configured');
+  }
+
+  const http = createPesepayHttpClient(integrationKey);
+  const security = new PesepaySecurity(encryptionKey);
+
+  const response = await http.get(
+    `v1/payments/check-payment?referenceNumber=${encodeURIComponent(referenceNumber)}`,
+  );
+
+  if (!response?.data?.payload) {
+    console.error('[Pesepay] Unexpected check-payment response:', response.status, JSON.stringify(response.data));
+    throw new Error(`Pesepay error: invalid check-payment response (${response.status})`);
+  }
+
+  const transaction = security.decryptData(response.data.payload);
+  // Reuse the callback path so order/wallet finalization stays in one place.
+  const result = await handlePesepayCallback({ payload: response.data.payload });
+  return { transaction, ...result };
 }
 
 async function createWalletTransactionForPayment({ userId, amount, currencyCode, paymentId }) {
