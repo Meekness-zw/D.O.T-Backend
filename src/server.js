@@ -14,6 +14,7 @@ import {
 import { getOrdersForUser, getWalletTransactionsForUser, getPaymentsForUser, getFullUserMe, getMerchantDashboardStats } from './historyService.js';
 import {
   createPesepayTransaction,
+  makeDirectPesepayPayment,
   handlePesepayCallback,
   checkPesepayStatus,
   listPesepayActiveCurrencies,
@@ -580,12 +581,15 @@ app.get('/', (req, res) => {
 app.get('/debug/pesepay', (req, res) => {
   try {
     const { integrationKey, encryptionKey } = getPesepayConfig();
+    const publicApiBase = process.env.PUBLIC_API_BASE_URL || process.env.API_BASE_URL || null;
     res.json({
       hasIntegrationKey: !!integrationKey,
       integrationKeyPrefix: integrationKey?.slice(0, 4) || 'none',
       hasEncryptionKey: !!encryptionKey,
       encryptionKeyLength: encryptionKey?.length || 0,
       baseUrl: process.env.PESEPAY_BASE_URL || 'https://api.pesepay.com/api/payments-engine/',
+      env: process.env.PESEPAY_ENV || 'production',
+      callbackBase: publicApiBase ? `${publicApiBase.replace(/\/$/, '')}/payments/pesepay/callback` : 'NOT SET — payments will fail',
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -5761,13 +5765,13 @@ app.post('/payments/pesepay/start', requireAuth, async (req, res) => {
     // Get customer profile for the hosted page (informational)
     const profile = await getProfile(req.userId);
 
-    const apiBase = process.env.API_BASE_URL || `http://localhost:${process.env.PORT || 4000}`;
+    const apiBase = (process.env.PUBLIC_API_BASE_URL || process.env.API_BASE_URL || `http://localhost:${process.env.PORT || 4000}`);
     const callbackBase = apiBase.replace(/\/$/, '');
     if (/localhost|127\.0\.0\.1|0\.0\.0\.0/i.test(callbackBase)) {
       return res.status(400).json({
         error: 'Invalid payment callback URL',
         details:
-          'API_BASE_URL must be a public HTTPS URL so Pesepay can reach /payments/pesepay/callback. localhost cannot receive provider webhooks.',
+          'Set PUBLIC_API_BASE_URL (or API_BASE_URL) to the public HTTPS URL of this backend so Pesepay can reach /payments/pesepay/callback. localhost cannot receive provider webhooks.',
       });
     }
     const reference = `DOT-${ord.order_number || orderId.slice(0, 8)}-${Date.now()}`;
@@ -5802,6 +5806,74 @@ app.post('/payments/pesepay/start', requireAuth, async (req, res) => {
     return res.status(500).json({
       error: 'Failed to start Pesepay payment',
       details: error.response?.data?.message || error.response?.data?.error || error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /payments/pesepay/direct — direct (no-WebView) payment using a saved payment method code.
+// Customer receives a USSD/push prompt; no hosted redirect page is shown.
+// Falls back to /payments/pesepay/start (hosted checkout) when paymentMethodCode is unavailable.
+app.post('/payments/pesepay/direct', requireAuth, async (req, res) => {
+  try {
+    const { orderId, amount, paymentMethodCode } = req.body || {};
+
+    if (!orderId) return res.status(400).json({ error: 'Missing orderId' });
+    if (!amount || amount <= 0) return res.status(400).json({ error: 'Invalid amount', details: 'amount must be > 0' });
+    if (!paymentMethodCode) return res.status(400).json({ error: 'Missing paymentMethodCode', details: 'paymentMethodCode is required for direct payment' });
+
+    const { data: ord, error: ordErr } = await supabase
+      .from('orders')
+      .select('id, customer_id, order_number, status, payment_method, payment_status, total_amount')
+      .eq('id', orderId)
+      .maybeSingle();
+
+    if (ordErr || !ord) return res.status(404).json({ error: 'Order not found' });
+    if (ord.customer_id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    if (ord.payment_method !== 'pesepay' || ord.status !== 'awaiting_payment') {
+      return res.status(400).json({ error: 'Order is not awaiting Pesepay payment' });
+    }
+    const expected = Number(ord.total_amount);
+    if (!Number.isFinite(expected) || Math.abs(expected - Number(amount)) > 0.02) {
+      return res.status(400).json({ error: 'Amount mismatch', details: 'amount must match the order total' });
+    }
+
+    const apiBase = (process.env.PUBLIC_API_BASE_URL || process.env.API_BASE_URL || '').replace(/\/$/, '');
+    if (/localhost|127\.0\.0\.1|0\.0\.0\.0/i.test(apiBase) || !apiBase) {
+      return res.status(400).json({
+        error: 'Invalid callback URL',
+        details: 'Set PUBLIC_API_BASE_URL (or API_BASE_URL) to the public HTTPS URL of this backend so Pesepay can reach /payments/pesepay/callback.',
+      });
+    }
+
+    const profile = await getProfile(req.userId);
+    const reference = `DOT-${ord.order_number || orderId.slice(0, 8)}-${Date.now()}`;
+    const resultUrl = `${apiBase}/payments/pesepay/callback`;
+
+    const result = await makeDirectPesepayPayment({
+      userId: req.userId,
+      orderId: ord.id,
+      amount: Number(amount),
+      currencyCode: 'USD',
+      reasonForPayment: `DOT order ${ord.order_number || orderId}`,
+      merchantReference: reference,
+      resultUrl,
+      paymentMethodCode,
+      customer: {
+        phoneNumber: profile?.phone || '',
+        email: profile?.email || '',
+        name: profile?.full_name || 'GUEST',
+      },
+    });
+
+    return res.json({
+      referenceNumber: result.referenceNumber,
+      status: result.status,
+    });
+  } catch (error) {
+    console.error('Pesepay direct payment error:', error);
+    return res.status(500).json({
+      error: 'Failed to initiate direct payment',
+      details: error.response?.data?.message || error.response?.data?.error || error.message || 'Please try again',
     });
   }
 });

@@ -4,7 +4,7 @@ import CryptoJS from 'crypto-js';
 import { getPesepayConfig } from './pesepayConfig.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { computeSubtotalSplit, recordMerchantEarningsForOrderPayment } from './orderPaymentSplit.js';
-import { notifyCustomerPaymentReceived } from './orderNotifications.js';
+import { notifyCustomerPaymentReceived, insertUserNotification } from './orderNotifications.js';
 
 const supabase = supabaseAdmin;
 
@@ -197,6 +197,106 @@ export async function createPesepayTransaction({
     pollUrl,
     referenceNumber: transaction.referenceNumber,
     payment: insertedPayment,
+  };
+}
+
+/**
+ * POST v2/payments/make-payment (prod) / v1/payments/make-payment (sandbox)
+ * Direct/silent payment — initiates without a hosted redirect page.
+ * Customer receives a USSD/push prompt on their phone (e.g. EcoCash PIN entry).
+ * Final result arrives via the resultUrl webhook (same as hosted flow).
+ *
+ * Requires paymentMethodCode (e.g. the EcoCash USD code from the Pesepay dashboard).
+ * No returnUrl needed — there is no browser redirect.
+ *
+ * Returns: { transaction, referenceNumber, payment, status }
+ */
+export async function makeDirectPesepayPayment({
+  userId,
+  amount,
+  currencyCode = 'USD',
+  reasonForPayment,
+  merchantReference,
+  resultUrl,
+  paymentMethodCode,
+  customer = null,
+  orderId = null,
+  customerPaymentMethodId = null,
+}) {
+  if (!supabase) throw new Error('Supabase admin client not configured');
+  if (!userId) throw new Error('userId is required');
+  if (!amount || amount <= 0) throw new Error('amount must be > 0');
+  if (!reasonForPayment) throw new Error('reasonForPayment is required');
+  if (!resultUrl) throw new Error('resultUrl is required');
+  if (!paymentMethodCode) throw new Error('paymentMethodCode is required for direct payment');
+
+  const { integrationKey, encryptionKey } = getPesepayConfig();
+  if (!integrationKey || !encryptionKey) {
+    throw new Error('Pesepay integrationKey or encryptionKey not configured');
+  }
+
+  const http = createPesepayHttpClient(integrationKey);
+  const security = new PesepaySecurity(encryptionKey);
+
+  const reference = merchantReference || `DOT-${Date.now()}-${userId.slice(0, 8)}`;
+
+  const makePaymentRequest = {
+    amountDetails: { amount, currencyCode },
+    merchantReference: reference,
+    reasonForPayment,
+    resultUrl,
+    paymentMethodCode,
+    ...(customer && { customer }),
+  };
+
+  // Sandbox base URL has no /api prefix — sandbox exposes make-payment under v1 while production is v2
+  const makePaymentPath =
+    PESEPAY_BASE_URL === PESEPAY_SANDBOX_BASE_URL
+      ? 'v1/payments/make-payment'
+      : 'v2/payments/make-payment';
+
+  const payload = security.encryptData(makePaymentRequest);
+  const response = await http.post(makePaymentPath, { payload });
+
+  if (!response?.data?.payload) {
+    console.error('[Pesepay] Unexpected make-payment response:', response.status, JSON.stringify(response.data));
+    throw new Error(`Pesepay error: invalid make-payment response (${response.status})`);
+  }
+
+  const transaction = security.decryptData(response.data.payload);
+  const paymentStatus = mapPesepayStatusToPaymentStatus(transaction.transactionStatus);
+
+  const metadataBase =
+    transaction && typeof transaction === 'object' ? { ...transaction } : { gatewayPayload: transaction };
+  if (customer) metadataBase.customer = customer;
+  if (customerPaymentMethodId) metadataBase.customer_payment_method_id = customerPaymentMethodId;
+
+  const { data: insertedPayment, error: paymentError } = await supabase
+    .from('payments')
+    .insert({
+      order_id: orderId,
+      customer_id: userId,
+      amount,
+      currency: currencyCode,
+      payment_method: 'pesepay',
+      payment_provider: 'Pesepay',
+      transaction_id: transaction.referenceNumber,
+      status: paymentStatus,
+      metadata: metadataBase,
+    })
+    .select('*')
+    .single();
+
+  if (paymentError) {
+    console.error('[Pesepay] Failed to insert payment record for direct payment:', paymentError);
+    throw new Error(paymentError.message || 'Failed to save payment record');
+  }
+
+  return {
+    transaction,
+    referenceNumber: transaction.referenceNumber,
+    payment: insertedPayment,
+    status: paymentStatus,
   };
 }
 
@@ -467,6 +567,47 @@ async function finalizeOrderPaymentFromPesepay({ payment, paymentStatus, transac
         amount: merchantEarnings,
         orderNumber: order.order_number,
       });
+    }
+
+    // Notify merchant: payment confirmed — order is now ready to prepare
+    if (store?.merchant_id) {
+      const numLabel = order.order_number ? `#${order.order_number}` : 'New order';
+      try {
+        await insertUserNotification(supabase, {
+          userId: store.merchant_id,
+          title: 'Payment confirmed — start preparing',
+          message: `${numLabel} payment received ($${Number(order.total_amount || 0).toFixed(2)}). The order is waiting for your confirmation.`,
+          type: 'order',
+          referenceId: updatedOrder.id,
+          data: { orderId: updatedOrder.id, orderNumber: order.order_number },
+        });
+      } catch (notifyErr) {
+        console.warn('[Pesepay] merchant in-app notification failed (non-fatal):', notifyErr?.message);
+      }
+
+      try {
+        const { data: merchantProfile } = await supabase
+          .from('user_profiles')
+          .select('push_token')
+          .eq('id', store.merchant_id)
+          .maybeSingle();
+        const token = merchantProfile?.push_token;
+        if (token?.startsWith('ExponentPushToken')) {
+          await axios.post(
+            'https://exp.host/push/send',
+            {
+              to: token,
+              title: 'Payment confirmed — new order',
+              body: `${numLabel} is paid ($${Number(order.total_amount || 0).toFixed(2)}). Start preparing now.`,
+              data: { type: 'new_order', orderId: updatedOrder.id },
+              sound: 'default',
+            },
+            { headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 10000 },
+          );
+        }
+      } catch (pushErr) {
+        console.warn('[Pesepay] merchant push notification failed (non-fatal):', pushErr?.message);
+      }
     }
 
     return { order: updatedOrder, walletTransaction: merchantTx };
