@@ -5964,10 +5964,19 @@ app.post('/payments/pesepay/callback', async (req, res) => {
   }
 });
 
-// GET /payments/pesepay/status?orderId=... — fast payment confirmation signal for the app.
-// Returns the current DB state immediately, then fires Pesepay reconciliation in the background
-// so the NEXT poll (4 s later) will see the updated status. This avoids blocking each poll on
-// an outbound Pesepay HTTP call, which was causing the "stuck confirming" UX.
+// In-process tracker: prevents concurrent Pesepay check-payment calls for the same order.
+// Stores { inFlight: bool, lastChecked: ms }
+const _pesepayReconcileTracker = new Map();
+
+// GET /payments/pesepay/status?orderId=... — payment confirmation signal for the app.
+// Strategy:
+//  1. Read current order status from DB (fast, always done).
+//  2. If not yet confirmed: race a Pesepay check-payment call against a 6-second timeout.
+//     Only one call per order runs at a time (in-flight guard) with an 8-second cooldown
+//     between attempts so we don't hammer Pesepay while the app polls every 2.5 seconds.
+//  3. If the Pesepay call completes within 6 seconds AND shows SUCCESSFUL, return confirmed
+//     in the same response. Otherwise return current DB state — the DB will be updated in
+//     the background and the next poll picks it up.
 app.get('/payments/pesepay/status', requireAuth, async (req, res) => {
   try {
     const { orderId } = req.query || {};
@@ -5989,26 +5998,55 @@ app.get('/payments/pesepay/status', requireAuth, async (req, res) => {
     }
 
     const isPesepay = String(order.payment_method || '').toLowerCase() === 'pesepay';
-    const paymentStatus = String(order.payment_status || '').toLowerCase();
+    let paymentStatus = String(order.payment_status || '').toLowerCase();
+    const alreadyTerminal = ['paid', 'completed', 'failed', 'cancelled'].includes(paymentStatus);
 
-    // If still unconfirmed, trigger Pesepay reconciliation in the background so the NEXT poll
-    // picks up the result. We do NOT await it — the response goes back to the app immediately.
-    if (isPesepay && !['paid', 'completed', 'failed', 'cancelled'].includes(paymentStatus)) {
-      supabase
-        .from('payments')
-        .select('transaction_id, created_at')
-        .eq('order_id', order.id)
-        .eq('payment_method', 'pesepay')
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle()
-        .then(({ data: pay }) => {
-          if (!pay?.transaction_id) return;
-          checkPesepayStatus(pay.transaction_id).catch((err) => {
-            console.warn('[Pesepay] background reconciliation failed:', err?.message || err);
-          });
-        })
-        .catch(() => {});
+    if (isPesepay && !alreadyTerminal) {
+      const tracker = _pesepayReconcileTracker.get(orderId) || {};
+      const now = Date.now();
+      const COOLDOWN_MS = 8000; // don't call Pesepay more than once per 8 seconds per order
+
+      if (!tracker.inFlight && (!tracker.lastChecked || now - tracker.lastChecked > COOLDOWN_MS)) {
+        _pesepayReconcileTracker.set(orderId, { inFlight: true, lastChecked: now });
+
+        // Look up the stored Pesepay reference number
+        const { data: pay } = await supabase
+          .from('payments')
+          .select('transaction_id')
+          .eq('order_id', order.id)
+          .eq('payment_method', 'pesepay')
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (pay?.transaction_id) {
+          const TIMEOUT_MS = 6000;
+          let reconcileUpdatedStatus = null;
+
+          try {
+            const reconciled = await Promise.race([
+              checkPesepayStatus(pay.transaction_id),
+              new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('Pesepay reconcile timeout')), TIMEOUT_MS),
+              ),
+            ]);
+            reconcileUpdatedStatus = String(reconciled?.order?.payment_status || '').toLowerCase();
+            console.log(`[Pesepay] reconciled order ${orderId}: pesepay=${reconciled?.transaction?.transactionStatus} → local=${reconcileUpdatedStatus || 'no change'}`);
+          } catch (err) {
+            console.warn(`[Pesepay] reconcile for order ${orderId}:`, err?.message || err);
+          } finally {
+            _pesepayReconcileTracker.set(orderId, { inFlight: false, lastChecked: Date.now() });
+          }
+
+          // If reconciliation confirmed or failed the payment, use the live status in this response
+          if (reconcileUpdatedStatus && reconcileUpdatedStatus !== paymentStatus) {
+            paymentStatus = reconcileUpdatedStatus;
+          }
+        } else {
+          _pesepayReconcileTracker.set(orderId, { inFlight: false, lastChecked: now });
+          console.warn(`[Pesepay] no payment row found for order ${orderId} — payment initiation may have failed`);
+        }
+      }
     }
 
     const paid = isPesepay && ['paid', 'completed'].includes(paymentStatus);
