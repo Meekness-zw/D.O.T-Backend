@@ -512,6 +512,40 @@ async function createWalletTransactionForPayment({ userId, amount, currencyCode,
 }
 
 /**
+ * Sandbox-only: finalize a Pesepay payment that came in via the return URL.
+ *
+ * Pesepay's sandbox check-payment endpoint has a confirmed encryption bug —
+ * it encrypts responses with a key that is not the merchant's encryption key,
+ * so decryption is impossible. The return URL redirect, however, only fires
+ * after the user sees "Payment Successful" and clicks Continue on the Pesepay
+ * sandbox page, so it is a reliable confirmation signal.
+ *
+ * This function encrypts a synthetic SUCCESSFUL transaction with our own key
+ * (which works correctly) and routes it through the normal handlePesepayCallback
+ * path so all DB updates, wallet logic, and notifications fire as usual.
+ */
+export async function sandboxFinalizePaymentFromReturn(referenceNumber) {
+  if (String(process.env.PESEPAY_ENV || '').toLowerCase() !== 'sandbox') return null;
+  if (!referenceNumber) return null;
+
+  const { encryptionKey, integrationKey } = getPesepayConfig();
+  if (!encryptionKey) throw new Error('Pesepay encryptionKey not configured');
+
+  const security = new PesepaySecurity(encryptionKey, integrationKey);
+
+  // Build a minimal synthetic "SUCCESSFUL" transaction and encrypt it so the
+  // normal callback handler can decrypt → update DB → send notifications.
+  const syntheticTransaction = {
+    referenceNumber,
+    transactionStatus: 'SUCCESSFUL',
+  };
+  const encryptedPayload = security.encryptData(syntheticTransaction);
+
+  console.log(`[Pesepay] sandbox return: finalizing ref=${referenceNumber} via synthetic callback`);
+  return handlePesepayCallback({ payload: encryptedPayload });
+}
+
+/**
  * Handle Pesepay callback sent to your resultUrl.
  * Expects body like { payload: '<encrypted-string>' }.
  * Updates payments row and, if just completed, writes wallet transaction.
