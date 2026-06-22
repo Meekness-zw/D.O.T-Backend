@@ -5762,6 +5762,34 @@ app.post('/payments/pesepay/start', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'Amount mismatch', details: 'amount must match the order total' });
     }
 
+    // Guard: if a previous Pesepay payment exists for this order, reconcile with Pesepay before
+    // allowing a new charge. Prevents double-billing when the webhook was delayed or missed.
+    const { data: existingPay } = await supabase
+      .from('payments')
+      .select('transaction_id, status')
+      .eq('order_id', orderId)
+      .eq('payment_method', 'pesepay')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (existingPay?.transaction_id) {
+      try {
+        const reconciled = await checkPesepayStatus(existingPay.transaction_id);
+        const reconciledPaymentStatus = String(reconciled?.order?.payment_status || '').toLowerCase();
+        if (['paid', 'completed'].includes(reconciledPaymentStatus)) {
+          return res.status(409).json({
+            error: 'Order already paid',
+            alreadyPaid: true,
+            paymentStatus: reconciledPaymentStatus,
+          });
+        }
+      } catch (reconcileErr) {
+        // Non-fatal: could not reach Pesepay to reconcile. Allow the new attempt to proceed.
+        console.warn('[Pesepay] Pre-start reconciliation failed (non-fatal):', reconcileErr?.message);
+      }
+    }
+
     // Get customer profile for the hosted page (informational)
     const profile = await getProfile(req.userId);
 
