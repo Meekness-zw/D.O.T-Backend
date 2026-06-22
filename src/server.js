@@ -5938,8 +5938,10 @@ app.get('/payments/pesepay/currencies', requireAuth, async (req, res) => {
 });
 
 // GET /payments/pesepay/return — browser redirect after Pesepay hosted page; forwards to app deep link.
-// Also kicks off Pesepay reconciliation immediately so the DB is updated before the app's first poll.
-app.get('/payments/pesepay/return', (req, res) => {
+// Sandbox: finalise payment BEFORE sending the HTML so the DB is already updated when the app's
+//          first poll fires (avoids a race between the async finalization and immediate polling).
+// Production: send HTML immediately, reconcile in background via check-payment.
+app.get('/payments/pesepay/return', async (req, res) => {
   const scheme = process.env.APP_PAYMENT_DEEP_LINK_SCHEME || 'dotdeliveryontime';
   const q = new URLSearchParams(req.query || {});
   const target = `${scheme}://payment-return?${q.toString()}`;
@@ -5947,20 +5949,40 @@ app.get('/payments/pesepay/return', (req, res) => {
 <meta http-equiv="refresh" content="0;url=${target.replace(/"/g, '&quot;')}">
 <script>window.location.replace(${JSON.stringify(target)});</script></head>
 <body><p>Returning to the app…</p></body></html>`;
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.status(200).send(html);
 
-  // After the browser is already redirecting, mark the payment as confirmed.
-  // Strategy depends on environment:
-  //   Sandbox: Pesepay's check-payment response uses a broken encryption key (confirmed sandbox
-  //            bug — 23 decryption strategies all fail). The return URL only fires after the user
-  //            sees "Payment Successful" on the Pesepay page and clicks Continue, so it is a
-  //            reliable success signal. We synthesise a SUCCESSFUL callback locally.
-  //   Production: call check-payment (standard reconciliation path).
   const orderId = req.query?.orderId;
   const isSandbox = String(process.env.PESEPAY_ENV || '').toLowerCase() === 'sandbox';
 
-  if (orderId) {
+  if (orderId && isSandbox) {
+    // Sandbox: await finalization before sending HTML so DB is ready when app polls.
+    // check-payment is broken in sandbox (confirmed encryption bug) so we synthesise a
+    // SUCCESSFUL callback using our own encryption, which works correctly.
+    try {
+      const { data: pay } = await supabase
+        .from('payments')
+        .select('transaction_id')
+        .eq('order_id', orderId)
+        .eq('payment_method', 'pesepay')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (pay?.transaction_id) {
+        const result = await sandboxFinalizePaymentFromReturn(pay.transaction_id);
+        console.log(`[Pesepay] return: sandbox finalized order ${orderId}, status=${result?.order?.payment_status}`);
+      } else {
+        console.warn(`[Pesepay] return: no payment row for order ${orderId}`);
+      }
+    } catch (err) {
+      console.warn(`[Pesepay] return: sandbox finalization error for order ${orderId}:`, err?.message || err);
+    }
+  }
+
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.status(200).send(html);
+
+  if (orderId && !isSandbox) {
+    // Production: reconcile with Pesepay in background after the browser is already redirecting.
     supabase
       .from('payments')
       .select('transaction_id')
@@ -5974,11 +5996,6 @@ app.get('/payments/pesepay/return', (req, res) => {
           console.warn(`[Pesepay] return: no payment row for order ${orderId}`);
           return;
         }
-
-        if (isSandbox) {
-          return sandboxFinalizePaymentFromReturn(pay.transaction_id);
-        }
-
         console.log(`[Pesepay] return: triggering reconcile for order ${orderId}, ref=${pay.transaction_id}`);
         return checkPesepayStatus(pay.transaction_id);
       })
