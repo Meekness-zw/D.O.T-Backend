@@ -156,6 +156,8 @@ export async function createPesepayTransaction({
   const redirectUrl = transaction.redirectUrl || transaction.redirect_url || null;
   const pollUrl = transaction.pollUrl || transaction.poll_url || null;
 
+  console.log(`[Pesepay] initiate: ref=${transaction.referenceNumber} redirectUrl=${redirectUrl?.slice(0,60)} status=${transaction.transactionStatus}`);
+
   if (!redirectUrl) {
     console.error('[Pesepay] initiate returned no redirectUrl:', JSON.stringify(transaction));
     throw new Error('Pesepay did not return a checkout URL');
@@ -362,18 +364,32 @@ export async function checkPesepayStatus(referenceNumber) {
   const http = createPesepayHttpClient(integrationKey);
   const security = new PesepaySecurity(encryptionKey);
 
+  console.log(`[Pesepay] check-payment: querying ref=${referenceNumber}`);
   const response = await http.get(
     `v1/payments/check-payment?referenceNumber=${encodeURIComponent(referenceNumber)}`,
   );
 
-  if (!response?.data?.payload) {
+  const rawPayload = response?.data?.payload;
+  console.log(`[Pesepay] check-payment: httpStatus=${response.status} hasPayload=${!!rawPayload} payloadPreview=${String(rawPayload || '').slice(0, 100)}`);
+
+  if (!rawPayload) {
     console.error('[Pesepay] Unexpected check-payment response:', response.status, JSON.stringify(response.data));
     throw new Error(`Pesepay error: invalid check-payment response (${response.status})`);
   }
 
-  const transaction = security.decryptData(response.data.payload);
+  // Attempt decryption; if it fails log the raw payload so we can diagnose the format
+  let transaction;
+  try {
+    transaction = security.decryptData(rawPayload);
+  } catch (decryptErr) {
+    console.error(`[Pesepay] check-payment decryption failed. ref=${referenceNumber} error=${decryptErr?.message} rawPayload=${rawPayload}`);
+    throw decryptErr;
+  }
+
+  console.log(`[Pesepay] check-payment: decrypted ref=${transaction?.referenceNumber} status=${transaction?.transactionStatus}`);
+
   // Reuse the callback path so order/wallet finalization stays in one place.
-  const result = await handlePesepayCallback({ payload: response.data.payload });
+  const result = await handlePesepayCallback({ payload: rawPayload });
   return { transaction, ...result };
 }
 
