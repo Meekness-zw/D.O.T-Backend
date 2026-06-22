@@ -36,13 +36,36 @@ class PesepaySecurity {
   }
 
   decryptData(encryptedData) {
-    const decrypted = CryptoJS.AES.decrypt(encryptedData, this.key, {
-      iv: this.iv,
-      mode: CryptoJS.mode.CBC,
-      padding: CryptoJS.pad.Pkcs7,
-    });
-    const jsonString = decrypted.toString(CryptoJS.enc.Utf8);
-    return JSON.parse(jsonString);
+    // Strategy 1: fixed IV derived from key (standard Pesepay scheme, used by initiate)
+    try {
+      const decrypted = CryptoJS.AES.decrypt(encryptedData, this.key, {
+        iv: this.iv,
+        mode: CryptoJS.mode.CBC,
+        padding: CryptoJS.pad.Pkcs7,
+      });
+      const jsonString = decrypted.toString(CryptoJS.enc.Utf8);
+      if (jsonString) return JSON.parse(jsonString);
+    } catch (_) {}
+
+    // Strategy 2: random IV prepended as first 16 bytes of ciphertext (sandbox check-payment)
+    try {
+      const decoded = CryptoJS.enc.Base64.parse(encryptedData);
+      const iv = CryptoJS.lib.WordArray.create(decoded.words.slice(0, 4), 16);
+      const ciphertext = CryptoJS.lib.WordArray.create(
+        decoded.words.slice(4),
+        decoded.sigBytes - 16,
+      );
+      const cipherParams = CryptoJS.lib.CipherParams.create({ ciphertext });
+      const decrypted2 = CryptoJS.AES.decrypt(cipherParams, this.key, {
+        iv,
+        mode: CryptoJS.mode.CBC,
+        padding: CryptoJS.pad.Pkcs7,
+      });
+      const jsonString2 = decrypted2.toString(CryptoJS.enc.Utf8);
+      if (jsonString2) return JSON.parse(jsonString2);
+    } catch (_) {}
+
+    throw new Error('Malformed UTF-8 data');
   }
 }
 
@@ -377,12 +400,11 @@ export async function checkPesepayStatus(referenceNumber) {
     throw new Error(`Pesepay error: invalid check-payment response (${response.status})`);
   }
 
-  // Attempt decryption; if it fails log the raw payload so we can diagnose the format
   let transaction;
   try {
     transaction = security.decryptData(rawPayload);
   } catch (decryptErr) {
-    console.error(`[Pesepay] check-payment decryption failed. ref=${referenceNumber} error=${decryptErr?.message} rawPayload=${rawPayload}`);
+    console.error(`[Pesepay] check-payment decryption failed. ref=${referenceNumber} error=${decryptErr?.message}`);
     throw decryptErr;
   }
 
