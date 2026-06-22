@@ -20,7 +20,9 @@ const PESEPAY_BASE_URL =
     : PESEPAY_PROD_BASE_URL);
 
 class PesepaySecurity {
-  constructor(encryptionKey) {
+  constructor(encryptionKey, integrationKey = '') {
+    this.rawEncryptionKey = encryptionKey;
+    this.rawIntegrationKey = integrationKey;
     this.key = CryptoJS.enc.Utf8.parse(encryptionKey);
     this.iv = CryptoJS.enc.Utf8.parse(encryptionKey.slice(0, 16));
   }
@@ -36,33 +38,89 @@ class PesepaySecurity {
   }
 
   decryptData(encryptedData) {
-    // Strategy 1: fixed IV derived from key (standard Pesepay scheme, used by initiate)
+    // Normalise: strip whitespace/newlines that some servers embed in base64
+    const clean = String(encryptedData).replace(/\s+/g, '');
+
+    // Strategy 1: fixed IV from key prefix — the canonical Pesepay scheme (all SDKs)
     try {
-      const decrypted = CryptoJS.AES.decrypt(encryptedData, this.key, {
+      const d1 = CryptoJS.AES.decrypt(clean, this.key, {
         iv: this.iv,
         mode: CryptoJS.mode.CBC,
         padding: CryptoJS.pad.Pkcs7,
       });
-      const jsonString = decrypted.toString(CryptoJS.enc.Utf8);
-      if (jsonString) return JSON.parse(jsonString);
+      const s1 = d1.toString(CryptoJS.enc.Utf8);
+      if (s1) return JSON.parse(s1);
     } catch (_) {}
 
-    // Strategy 2: random IV prepended as first 16 bytes of ciphertext (sandbox check-payment)
+    // Strategy 2: IV prepended as first 16 bytes of ciphertext
     try {
-      const decoded = CryptoJS.enc.Base64.parse(encryptedData);
-      const iv = CryptoJS.lib.WordArray.create(decoded.words.slice(0, 4), 16);
-      const ciphertext = CryptoJS.lib.WordArray.create(
-        decoded.words.slice(4),
-        decoded.sigBytes - 16,
-      );
-      const cipherParams = CryptoJS.lib.CipherParams.create({ ciphertext });
-      const decrypted2 = CryptoJS.AES.decrypt(cipherParams, this.key, {
-        iv,
+      const decoded2 = CryptoJS.enc.Base64.parse(clean);
+      const iv2 = CryptoJS.lib.WordArray.create(decoded2.words.slice(0, 4), 16);
+      const ct2 = CryptoJS.lib.WordArray.create(decoded2.words.slice(4), decoded2.sigBytes - 16);
+      const d2 = CryptoJS.AES.decrypt(CryptoJS.lib.CipherParams.create({ ciphertext: ct2 }), this.key, {
+        iv: iv2,
         mode: CryptoJS.mode.CBC,
         padding: CryptoJS.pad.Pkcs7,
       });
-      const jsonString2 = decrypted2.toString(CryptoJS.enc.Utf8);
-      if (jsonString2) return JSON.parse(jsonString2);
+      const s2 = d2.toString(CryptoJS.enc.Utf8);
+      if (s2) return JSON.parse(s2);
+    } catch (_) {}
+
+    // Strategy 3: zero IV (some sandbox implementations omit/zero the IV)
+    try {
+      const zeroIv = CryptoJS.enc.Hex.parse('00000000000000000000000000000000');
+      const d3 = CryptoJS.AES.decrypt(clean, this.key, {
+        iv: zeroIv,
+        mode: CryptoJS.mode.CBC,
+        padding: CryptoJS.pad.Pkcs7,
+      });
+      const s3 = d3.toString(CryptoJS.enc.Utf8);
+      if (s3) return JSON.parse(s3);
+    } catch (_) {}
+
+    // Strategy 4: integration key (UUID without hyphens = 32 chars) as AES-256 key + first 16 as IV
+    try {
+      const ikNoHyphens = this.rawIntegrationKey.replace(/-/g, '');
+      if (ikNoHyphens.length === 32) {
+        const k4 = CryptoJS.enc.Utf8.parse(ikNoHyphens);
+        const iv4 = CryptoJS.enc.Utf8.parse(ikNoHyphens.slice(0, 16));
+        const d4 = CryptoJS.AES.decrypt(clean, k4, {
+          iv: iv4,
+          mode: CryptoJS.mode.CBC,
+          padding: CryptoJS.pad.Pkcs7,
+        });
+        const s4 = d4.toString(CryptoJS.enc.Utf8);
+        if (s4) return JSON.parse(s4);
+      }
+    } catch (_) {}
+
+    // Strategy 5: hex-decoded encryption key → AES-128, key = IV
+    try {
+      if (/^[0-9a-fA-F]{32}$/.test(this.rawEncryptionKey)) {
+        const k5 = CryptoJS.enc.Hex.parse(this.rawEncryptionKey);
+        const d5 = CryptoJS.AES.decrypt(clean, k5, {
+          iv: k5,
+          mode: CryptoJS.mode.CBC,
+          padding: CryptoJS.pad.Pkcs7,
+        });
+        const s5 = d5.toString(CryptoJS.enc.Utf8);
+        if (s5) return JSON.parse(s5);
+      }
+    } catch (_) {}
+
+    // Strategy 6: hex-decoded key (AES-128) + zero IV
+    try {
+      if (/^[0-9a-fA-F]{32}$/.test(this.rawEncryptionKey)) {
+        const k6 = CryptoJS.enc.Hex.parse(this.rawEncryptionKey);
+        const zeroIv6 = CryptoJS.enc.Hex.parse('00000000000000000000000000000000');
+        const d6 = CryptoJS.AES.decrypt(clean, k6, {
+          iv: zeroIv6,
+          mode: CryptoJS.mode.CBC,
+          padding: CryptoJS.pad.Pkcs7,
+        });
+        const s6 = d6.toString(CryptoJS.enc.Utf8);
+        if (s6) return JSON.parse(s6);
+      }
     } catch (_) {}
 
     throw new Error('Malformed UTF-8 data');
@@ -152,7 +210,7 @@ export async function createPesepayTransaction({
   }
 
   const http = createPesepayHttpClient(integrationKey);
-  const security = new PesepaySecurity(encryptionKey);
+  const security = new PesepaySecurity(encryptionKey, integrationKey);
 
   const reference = merchantReference || `DOT-${Date.now()}-${userId.slice(0, 8)}`;
 
@@ -261,7 +319,7 @@ export async function makeDirectPesepayPayment({
   }
 
   const http = createPesepayHttpClient(integrationKey);
-  const security = new PesepaySecurity(encryptionKey);
+  const security = new PesepaySecurity(encryptionKey, integrationKey);
 
   const reference = merchantReference || `DOT-${Date.now()}-${userId.slice(0, 8)}`;
 
@@ -385,7 +443,7 @@ export async function checkPesepayStatus(referenceNumber) {
   }
 
   const http = createPesepayHttpClient(integrationKey);
-  const security = new PesepaySecurity(encryptionKey);
+  const security = new PesepaySecurity(encryptionKey, integrationKey);
 
   console.log(`[Pesepay] check-payment: querying ref=${referenceNumber}`);
   const response = await http.get(
@@ -393,7 +451,9 @@ export async function checkPesepayStatus(referenceNumber) {
   );
 
   const rawPayload = response?.data?.payload;
-  console.log(`[Pesepay] check-payment: httpStatus=${response.status} hasPayload=${!!rawPayload} payloadPreview=${String(rawPayload || '').slice(0, 100)}`);
+  const rawResponseKeys = response?.data ? Object.keys(response.data) : [];
+  console.log(`[Pesepay] check-payment: httpStatus=${response.status} responseFields=${rawResponseKeys.join(',')} hasPayload=${!!rawPayload} payloadLen=${String(rawPayload || '').length}`);
+  console.log(`[Pesepay] check-payment: FULL_PAYLOAD=${String(rawPayload || '')}`);
 
   if (!rawPayload) {
     console.error('[Pesepay] Unexpected check-payment response:', response.status, JSON.stringify(response.data));
@@ -404,7 +464,7 @@ export async function checkPesepayStatus(referenceNumber) {
   try {
     transaction = security.decryptData(rawPayload);
   } catch (decryptErr) {
-    console.error(`[Pesepay] check-payment decryption failed. ref=${referenceNumber} error=${decryptErr?.message}`);
+    console.error(`[Pesepay] check-payment decryption failed. ref=${referenceNumber} error=${decryptErr?.message} encKeyLen=${encryptionKey.length} ikLen=${integrationKey.length}`);
     throw decryptErr;
   }
 
@@ -466,7 +526,7 @@ export async function handlePesepayCallback(callbackBody) {
     throw new Error('Missing payload in Pesepay callback');
   }
 
-  const security = new PesepaySecurity(encryptionKey);
+  const security = new PesepaySecurity(encryptionKey, integrationKey);
   const transaction = security.decryptData(callbackBody.payload);
 
   console.log(`[Pesepay] callback: ref=${transaction?.referenceNumber} status=${transaction?.transactionStatus}`);
