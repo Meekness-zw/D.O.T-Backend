@@ -431,6 +431,7 @@ export async function handlePesepayCallback(callbackBody) {
   const security = new PesepaySecurity(encryptionKey);
   const transaction = security.decryptData(callbackBody.payload);
 
+  console.log(`[Pesepay] callback: ref=${transaction?.referenceNumber} status=${transaction?.transactionStatus}`);
   const paymentStatus = mapPesepayStatusToPaymentStatus(transaction.transactionStatus);
 
   const { data: prevPay } = await supabase
@@ -460,9 +461,10 @@ export async function handlePesepayCallback(callbackBody) {
   }
 
   if (!payment) {
-    console.warn('[Pesepay] Callback for unknown transaction reference:', transaction.referenceNumber);
+    console.warn('[Pesepay] Callback for unknown transaction reference:', transaction.referenceNumber, '— no matching payments row');
     return { transaction, payment: null, walletTransaction: null };
   }
+  console.log(`[Pesepay] callback: payment row updated → status=${paymentStatus}, order_id=${payment.order_id}`);
 
   // Order checkout: update order + merchant ledger — never credit customer wallet for order payments.
   if (payment.order_id) {

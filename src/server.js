@@ -5936,7 +5936,8 @@ app.get('/payments/pesepay/currencies', requireAuth, async (req, res) => {
   }
 });
 
-// GET /payments/pesepay/return — browser redirect after Pesepay hosted page; forwards to app deep link
+// GET /payments/pesepay/return — browser redirect after Pesepay hosted page; forwards to app deep link.
+// Also kicks off Pesepay reconciliation immediately so the DB is updated before the app's first poll.
 app.get('/payments/pesepay/return', (req, res) => {
   const scheme = process.env.APP_PAYMENT_DEEP_LINK_SCHEME || 'dotdeliveryontime';
   const q = new URLSearchParams(req.query || {});
@@ -5946,7 +5947,37 @@ app.get('/payments/pesepay/return', (req, res) => {
 <script>window.location.replace(${JSON.stringify(target)});</script></head>
 <body><p>Returning to the app…</p></body></html>`;
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  return res.status(200).send(html);
+  res.status(200).send(html);
+
+  // Immediately reconcile with Pesepay so the order is marked paid before the app polls.
+  // This runs after the response is sent — the customer's WebView is already redirecting.
+  const orderId = req.query?.orderId;
+  if (orderId) {
+    supabase
+      .from('payments')
+      .select('transaction_id')
+      .eq('order_id', orderId)
+      .eq('payment_method', 'pesepay')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+      .then(({ data: pay }) => {
+        if (!pay?.transaction_id) {
+          console.warn(`[Pesepay] return: no payment row for order ${orderId}`);
+          return;
+        }
+        console.log(`[Pesepay] return: triggering reconcile for order ${orderId}, ref=${pay.transaction_id}`);
+        return checkPesepayStatus(pay.transaction_id);
+      })
+      .then((result) => {
+        if (result) {
+          console.log(`[Pesepay] return: reconcile done for order ${orderId}, pesepay=${result?.transaction?.transactionStatus}, order=${result?.order?.payment_status}`);
+        }
+      })
+      .catch((err) => {
+        console.warn(`[Pesepay] return: reconcile error for order ${orderId}:`, err?.message || err);
+      });
+  }
 });
 
 // POST /payments/pesepay/callback — Pesepay server-to-server result webhook (no auth).
