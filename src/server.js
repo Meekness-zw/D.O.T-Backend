@@ -5964,8 +5964,10 @@ app.post('/payments/pesepay/callback', async (req, res) => {
   }
 });
 
-// GET /payments/pesepay/status?orderId=... — authoritative customer-facing payment confirmation signal.
-// Actively reconciles against Pesepay (check-payment) when the order is still awaiting payment.
+// GET /payments/pesepay/status?orderId=... — fast payment confirmation signal for the app.
+// Returns the current DB state immediately, then fires Pesepay reconciliation in the background
+// so the NEXT poll (4 s later) will see the updated status. This avoids blocking each poll on
+// an outbound Pesepay HTTP call, which was causing the "stuck confirming" UX.
 app.get('/payments/pesepay/status', requireAuth, async (req, res) => {
   try {
     const { orderId } = req.query || {};
@@ -5987,28 +5989,26 @@ app.get('/payments/pesepay/status', requireAuth, async (req, res) => {
     }
 
     const isPesepay = String(order.payment_method || '').toLowerCase() === 'pesepay';
-    let paymentStatus = String(order.payment_status || '').toLowerCase();
+    const paymentStatus = String(order.payment_status || '').toLowerCase();
 
-    // If still unconfirmed, poll Pesepay directly in case the webhook was missed.
+    // If still unconfirmed, trigger Pesepay reconciliation in the background so the NEXT poll
+    // picks up the result. We do NOT await it — the response goes back to the app immediately.
     if (isPesepay && !['paid', 'completed', 'failed', 'cancelled'].includes(paymentStatus)) {
-      const { data: pay } = await supabase
+      supabase
         .from('payments')
-        .select('transaction_id')
+        .select('transaction_id, created_at')
         .eq('order_id', order.id)
         .eq('payment_method', 'pesepay')
         .order('created_at', { ascending: false })
         .limit(1)
-        .maybeSingle();
-      if (pay?.transaction_id) {
-        try {
-          const reconciled = await checkPesepayStatus(pay.transaction_id);
-          if (reconciled?.order?.payment_status) {
-            paymentStatus = String(reconciled.order.payment_status).toLowerCase();
-          }
-        } catch (pollErr) {
-          console.warn('[Pesepay] status poll failed:', pollErr?.message || pollErr);
-        }
-      }
+        .maybeSingle()
+        .then(({ data: pay }) => {
+          if (!pay?.transaction_id) return;
+          checkPesepayStatus(pay.transaction_id).catch((err) => {
+            console.warn('[Pesepay] background reconciliation failed:', err?.message || err);
+          });
+        })
+        .catch(() => {});
     }
 
     const paid = isPesepay && ['paid', 'completed'].includes(paymentStatus);
