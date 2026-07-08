@@ -5677,6 +5677,34 @@ app.get('/courier/performance', requireAuth, async (req, res) => {
   }
 });
 
+// GET /users/me/wallet-balance-24h — earnings from jobs/orders in the last
+// 24 hours. Balances shown in the app reset on this rolling window since
+// distributions are run daily.
+app.get('/users/me/wallet-balance-24h', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const { data, error } = await supabase
+      .from('wallet_transactions')
+      .select('amount, transaction_type')
+      .eq('user_id', req.userId)
+      .gte('created_at', since);
+    if (error) throw new Error(error.message || 'Failed to load wallet ledger');
+
+    const balance = (data || [])
+      .filter((t) => Number(t.amount) > 0 && String(t.transaction_type || '') !== 'withdrawal')
+      .reduce((sum, t) => sum + Number(t.amount), 0);
+
+    return res.json({ balance: Math.round(balance * 100) / 100, windowHours: 24 });
+  } catch (error) {
+    console.error('get /users/me/wallet-balance-24h error:', error);
+    return res.status(500).json({
+      error: 'Failed to load balance',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // GET /users/me/notifications — notifications for current user (filter by ?role=customer|merchant|courier)
 app.get('/users/me/notifications', requireAuth, async (req, res) => {
   try {
