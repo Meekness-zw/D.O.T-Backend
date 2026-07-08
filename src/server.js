@@ -7020,6 +7020,104 @@ app.get('/admin/couriers', requireAdmin, async (req, res) => {
   }
 });
 
+// GET /admin/payout-details — everything needed to run distributions through
+// Pesepay (or any rail): each merchant/courier with earnings, their current
+// wallet balance, and their saved payout destination.
+app.get('/admin/payout-details', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    // Latest running balance per user from the wallet ledger
+    const { data: txs, error: txError } = await supabase
+      .from('wallet_transactions')
+      .select('user_id, user_type, balance_after, created_at')
+      .in('user_type', ['merchant', 'courier'])
+      .order('created_at', { ascending: false })
+      .limit(5000);
+    if (txError) throw new Error(txError.message || 'Failed to load wallet ledger');
+
+    const balances = new Map(); // user_id -> { balance, role }
+    for (const tx of txs || []) {
+      if (!balances.has(tx.user_id)) {
+        balances.set(tx.user_id, { balance: Number(tx.balance_after) || 0, role: tx.user_type });
+      }
+    }
+
+    // Default payout destinations for both roles
+    const [{ data: merchantMethods }, { data: courierMethods }] = await Promise.all([
+      supabase
+        .from('merchant_payout_methods')
+        .select('merchant_id, method_type, provider, provider_code, account_number, account_name, is_verified')
+        .eq('is_default', true),
+      supabase
+        .from('courier_payout_methods')
+        .select('courier_id, method_type, provider, provider_code, account_number, account_name')
+        .eq('is_default', true),
+    ]);
+
+    const payoutByUser = new Map();
+    for (const m of merchantMethods || []) {
+      payoutByUser.set(m.merchant_id, { ...m, role: 'merchant' });
+    }
+    for (const c of courierMethods || []) {
+      payoutByUser.set(c.courier_id, { ...c, role: 'courier' });
+    }
+
+    // Everyone with a balance or a payout method on file
+    const userIds = [...new Set([...balances.keys(), ...payoutByUser.keys()])];
+    if (userIds.length === 0) return res.json({ recipients: [] });
+
+    const { data: profiles } = await supabase
+      .from('user_profiles')
+      .select('id, full_name, phone')
+      .in('id', userIds);
+    const profileById = new Map((profiles || []).map((p) => [p.id, p]));
+
+    // Store names for merchant rows
+    const { data: storeRows } = await supabase
+      .from('stores')
+      .select('merchant_id, store_name')
+      .in('merchant_id', userIds);
+    const storeByMerchant = new Map((storeRows || []).map((s) => [s.merchant_id, s.store_name]));
+
+    const recipients = userIds.map((id) => {
+      const bal = balances.get(id);
+      const pm = payoutByUser.get(id);
+      const profile = profileById.get(id);
+      const role = bal?.role || pm?.role || 'merchant';
+      return {
+        user_id: id,
+        role,
+        name: profile?.full_name || null,
+        phone: profile?.phone || null,
+        store_name: role === 'merchant' ? storeByMerchant.get(id) || null : null,
+        balance: bal ? bal.balance : 0,
+        needs_payout_setup: !pm,
+        payout: pm
+          ? {
+              method_type: pm.method_type,
+              provider: pm.provider,
+              provider_code: pm.provider_code || null,
+              account_number: pm.account_number,
+              account_name: pm.account_name,
+            }
+          : null,
+      };
+    });
+
+    // Highest balances first — the ones a distribution run cares about
+    recipients.sort((a, b) => b.balance - a.balance);
+
+    return res.json({ recipients });
+  } catch (error) {
+    console.error('get /admin/payout-details error:', error);
+    return res.status(500).json({
+      error: 'Failed to load payout details',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 app.get('/admin/documents/pending', requireAdmin, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
