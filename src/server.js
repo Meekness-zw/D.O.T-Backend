@@ -7144,6 +7144,441 @@ app.get('/merchant/reviews', requireAuth, async (req, res) => {
   }
 });
 
+// ─── Merchant-to-merchant product list sharing (multi-branch chains) ────────
+// One merchant (e.g. a restaurant branch) can offer to share their product
+// list with another merchant. Once accepted, the recipient can import
+// (copy) products they don't already have — a one-time copy, not a live
+// sync — as many times as they like; already-present items (by name) are
+// skipped automatically.
+
+// GET /merchant/search-merchants?q=... — find another merchant's store to share with/from (excludes own stores)
+app.get('/merchant/search-merchants', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const q = String(req.query.q || '').trim();
+    if (q.length < 2) return res.json({ stores: [] });
+
+    const { data, error } = await supabase
+      .from('stores')
+      .select('id, store_name, city, merchant_id, merchants!inner ( business_name, is_active, approval_status )')
+      .neq('merchant_id', req.userId)
+      .eq('is_active', true)
+      .eq('merchants.is_active', true)
+      .eq('merchants.approval_status', 'approved')
+      .ilike('store_name', `%${q}%`)
+      .limit(20);
+
+    if (error) throw new Error(error.message || 'Search failed');
+
+    const stores = (data || []).map((s) => ({
+      store_id: s.id,
+      store_name: s.store_name,
+      city: s.city,
+      merchant_id: s.merchant_id,
+      business_name: s.merchants?.business_name || null,
+    }));
+    return res.json({ stores });
+  } catch (error) {
+    console.error('get /merchant/search-merchants error:', error);
+    return res.status(500).json({ error: 'Search failed', details: error.message || 'Please try again later' });
+  }
+});
+
+// POST /merchant/share-links — offer to share a store's product list with another merchant's store
+app.post('/merchant/share-links', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { from_store_id, to_store_id } = req.body || {};
+    if (!from_store_id || !to_store_id) {
+      return res.status(400).json({ error: 'Missing fields', details: 'from_store_id and to_store_id are required' });
+    }
+
+    const { data: fromStore, error: fromError } = await supabase
+      .from('stores')
+      .select('id, store_name, merchant_id')
+      .eq('id', from_store_id)
+      .maybeSingle();
+    if (fromError || !fromStore || fromStore.merchant_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden', details: 'from_store_id must be one of your own stores' });
+    }
+
+    const { data: toStore, error: toError } = await supabase
+      .from('stores')
+      .select('id, store_name, merchant_id')
+      .eq('id', to_store_id)
+      .maybeSingle();
+    if (toError || !toStore) {
+      return res.status(404).json({ error: 'Store not found' });
+    }
+    if (toStore.merchant_id === req.userId) {
+      return res.status(400).json({ error: 'Invalid recipient', details: 'You cannot share with your own store' });
+    }
+
+    const { data: senderMerchant } = await supabase
+      .from('merchants')
+      .select('business_name')
+      .eq('id', req.userId)
+      .maybeSingle();
+
+    const { data: created, error: insertError } = await supabase
+      .from('merchant_share_links')
+      .insert({
+        from_merchant_id: req.userId,
+        from_store_id,
+        to_merchant_id: toStore.merchant_id,
+      })
+      .select('id, status, created_at')
+      .single();
+
+    if (insertError) {
+      if (insertError.code === '23505') {
+        return res.status(409).json({ error: 'Already shared', details: 'A pending or active share already exists with this store' });
+      }
+      console.error('post /merchant/share-links error:', insertError);
+      throw new Error(insertError.message || 'Failed to create share request');
+    }
+
+    try {
+      await insertUserNotification(supabase, {
+        userId: toStore.merchant_id,
+        title: 'Product list share request',
+        message: `${senderMerchant?.business_name || fromStore.store_name} wants to share their product list with ${toStore.store_name}. Accept to import their menu items.`,
+        type: 'system',
+        referenceId: created.id,
+        data: { kind: 'merchant_share_request', shareLinkId: created.id },
+      });
+    } catch (notifyErr) {
+      console.error('share-link notification failed (non-fatal):', notifyErr);
+    }
+
+    return res.status(201).json(created);
+  } catch (error) {
+    console.error('post /merchant/share-links error:', error);
+    return res.status(500).json({ error: 'Failed to create share request', details: error.message || 'Please try again later' });
+  }
+});
+
+// GET /merchant/share-links — this merchant's incoming + outgoing share requests/links
+app.get('/merchant/share-links', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    const selectCols =
+      'id, status, created_at, responded_at, from_merchant_id, from_store_id, to_merchant_id, from_store:stores!merchant_share_links_from_store_id_fkey ( store_name )';
+
+    const [{ data: incoming, error: inError }, { data: outgoing, error: outError }] = await Promise.all([
+      supabase.from('merchant_share_links').select(selectCols).eq('to_merchant_id', req.userId).order('created_at', { ascending: false }),
+      supabase.from('merchant_share_links').select(selectCols).eq('from_merchant_id', req.userId).order('created_at', { ascending: false }),
+    ]);
+    if (inError) throw new Error(inError.message || 'Failed to load incoming share links');
+    if (outError) throw new Error(outError.message || 'Failed to load outgoing share links');
+
+    const merchantIds = [
+      ...new Set([
+        ...(incoming || []).map((r) => r.from_merchant_id),
+        ...(outgoing || []).map((r) => r.to_merchant_id),
+      ]),
+    ];
+    let businessNameById = {};
+    if (merchantIds.length > 0) {
+      const { data: merchants } = await supabase.from('merchants').select('id, business_name').in('id', merchantIds);
+      businessNameById = Object.fromEntries((merchants || []).map((m) => [m.id, m.business_name]));
+    }
+
+    const shapeIncoming = (r) => ({
+      id: r.id,
+      status: r.status,
+      created_at: r.created_at,
+      responded_at: r.responded_at,
+      from_merchant_id: r.from_merchant_id,
+      from_store_id: r.from_store_id,
+      from_store_name: r.from_store?.store_name || null,
+      from_business_name: businessNameById[r.from_merchant_id] || null,
+    });
+    const shapeOutgoing = (r) => ({
+      id: r.id,
+      status: r.status,
+      created_at: r.created_at,
+      responded_at: r.responded_at,
+      to_merchant_id: r.to_merchant_id,
+      from_store_id: r.from_store_id,
+      from_store_name: r.from_store?.store_name || null,
+      to_business_name: businessNameById[r.to_merchant_id] || null,
+    });
+
+    return res.json({
+      incoming: (incoming || []).map(shapeIncoming),
+      outgoing: (outgoing || []).map(shapeOutgoing),
+    });
+  } catch (error) {
+    console.error('get /merchant/share-links error:', error);
+    return res.status(500).json({ error: 'Failed to load share links', details: error.message || 'Please try again later' });
+  }
+});
+
+// Load + ownership-check a share link the current user is party to. `side` is 'to' (recipient) or 'from' (sender) or 'either'.
+async function loadShareLinkForUser(linkId, userId, side = 'either') {
+  const { data: link, error } = await supabase
+    .from('merchant_share_links')
+    .select('id, status, from_merchant_id, from_store_id, to_merchant_id, stores:stores!merchant_share_links_from_store_id_fkey ( store_name )')
+    .eq('id', linkId)
+    .maybeSingle();
+  if (error) throw new Error(error.message || 'Failed to load share link');
+  if (!link) return { link: null, allowed: false };
+  const isRecipient = link.to_merchant_id === userId;
+  const isSender = link.from_merchant_id === userId;
+  const allowed = side === 'to' ? isRecipient : side === 'from' ? isSender : isRecipient || isSender;
+  return { link, allowed, isRecipient, isSender };
+}
+
+// POST /merchant/share-links/:id/accept — recipient accepts a pending share offer
+app.post('/merchant/share-links/:id/accept', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { link, allowed } = await loadShareLinkForUser(req.params.id, req.userId, 'to');
+    if (!link) return res.status(404).json({ error: 'Share link not found' });
+    if (!allowed) return res.status(403).json({ error: 'Forbidden' });
+    if (link.status !== 'pending') {
+      return res.status(400).json({ error: 'Already responded', details: `This request is already ${link.status}` });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('merchant_share_links')
+      .update({ status: 'accepted', responded_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .select('id, status, responded_at')
+      .single();
+    if (updateError) throw new Error(updateError.message || 'Failed to accept share request');
+
+    try {
+      await insertUserNotification(supabase, {
+        userId: link.from_merchant_id,
+        title: 'Share request accepted',
+        message: `Your product list share offer was accepted. They can now import your items anytime.`,
+        type: 'system',
+        referenceId: link.id,
+        data: { kind: 'merchant_share_accepted', shareLinkId: link.id },
+      });
+    } catch (notifyErr) {
+      console.error('share-link accept notification failed (non-fatal):', notifyErr);
+    }
+
+    return res.json(updated);
+  } catch (error) {
+    console.error('post /merchant/share-links/:id/accept error:', error);
+    return res.status(500).json({ error: 'Failed to accept share request', details: error.message || 'Please try again later' });
+  }
+});
+
+// POST /merchant/share-links/:id/decline — recipient declines a pending share offer
+app.post('/merchant/share-links/:id/decline', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { link, allowed } = await loadShareLinkForUser(req.params.id, req.userId, 'to');
+    if (!link) return res.status(404).json({ error: 'Share link not found' });
+    if (!allowed) return res.status(403).json({ error: 'Forbidden' });
+    if (link.status !== 'pending') {
+      return res.status(400).json({ error: 'Already responded', details: `This request is already ${link.status}` });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('merchant_share_links')
+      .update({ status: 'declined', responded_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .select('id, status, responded_at')
+      .single();
+    if (updateError) throw new Error(updateError.message || 'Failed to decline share request');
+    return res.json(updated);
+  } catch (error) {
+    console.error('post /merchant/share-links/:id/decline error:', error);
+    return res.status(500).json({ error: 'Failed to decline share request', details: error.message || 'Please try again later' });
+  }
+});
+
+// DELETE /merchant/share-links/:id — sender cancels a pending offer, or either side unlinks an accepted share
+app.delete('/merchant/share-links/:id', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { link, allowed } = await loadShareLinkForUser(req.params.id, req.userId, 'either');
+    if (!link) return res.status(404).json({ error: 'Share link not found' });
+    if (!allowed) return res.status(403).json({ error: 'Forbidden' });
+
+    const { error: updateError } = await supabase
+      .from('merchant_share_links')
+      .update({ status: 'cancelled', responded_at: new Date().toISOString() })
+      .eq('id', req.params.id);
+    if (updateError) throw new Error(updateError.message || 'Failed to remove share link');
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('delete /merchant/share-links/:id error:', error);
+    return res.status(500).json({ error: 'Failed to remove share link', details: error.message || 'Please try again later' });
+  }
+});
+
+// GET /merchant/share-links/:id/importable?target_store_id=... — products from the shared store the recipient doesn't already have
+app.get('/merchant/share-links/:id/importable', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const targetStoreId = String(req.query.target_store_id || '');
+    if (!targetStoreId) return res.status(400).json({ error: 'target_store_id is required' });
+
+    const { link, allowed } = await loadShareLinkForUser(req.params.id, req.userId, 'to');
+    if (!link) return res.status(404).json({ error: 'Share link not found' });
+    if (!allowed) return res.status(403).json({ error: 'Forbidden' });
+    if (link.status !== 'accepted') {
+      return res.status(400).json({ error: 'Not accepted', details: 'This share request has not been accepted yet' });
+    }
+
+    const { data: targetStore, error: targetError } = await supabase
+      .from('stores')
+      .select('id, merchant_id')
+      .eq('id', targetStoreId)
+      .maybeSingle();
+    if (targetError || !targetStore || targetStore.merchant_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden', details: 'target_store_id must be one of your own stores' });
+    }
+
+    const [{ data: sourceProducts, error: sourceError }, { data: existingProducts, error: existingError }] = await Promise.all([
+      supabase
+        .from('products')
+        .select('id, name, description, price, unit, image_url, is_featured, product_categories ( name )')
+        .eq('store_id', link.from_store_id),
+      supabase.from('products').select('name').eq('store_id', targetStoreId),
+    ]);
+    if (sourceError) throw new Error(sourceError.message || 'Failed to load shared products');
+    if (existingError) throw new Error(existingError.message || 'Failed to load your products');
+
+    const existingNames = new Set((existingProducts || []).map((p) => String(p.name).trim().toLowerCase()));
+    const importable = (sourceProducts || []).filter((p) => !existingNames.has(String(p.name).trim().toLowerCase()));
+
+    const groupsMap = await fetchOptionGroupsForProducts(importable.map((p) => p.id));
+    const products = importable.map((p) => ({
+      id: p.id,
+      name: p.name,
+      description: p.description,
+      price: p.price,
+      unit: p.unit,
+      image_url: p.image_url,
+      is_featured: p.is_featured,
+      category_name:
+        (Array.isArray(p.product_categories) ? p.product_categories[0]?.name : p.product_categories?.name) || null,
+      option_groups: groupsMap[p.id] || [],
+    }));
+
+    return res.json({ products, from_store_name: link.stores?.store_name || null });
+  } catch (error) {
+    console.error('get /merchant/share-links/:id/importable error:', error);
+    return res.status(500).json({ error: 'Failed to load importable products', details: error.message || 'Please try again later' });
+  }
+});
+
+// POST /merchant/share-links/:id/import — copy selected products (with variants) into the recipient's chosen store
+app.post('/merchant/share-links/:id/import', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { target_store_id, product_ids } = req.body || {};
+    if (!target_store_id || !Array.isArray(product_ids) || product_ids.length === 0) {
+      return res.status(400).json({ error: 'Missing fields', details: 'target_store_id and product_ids[] are required' });
+    }
+
+    const { link, allowed } = await loadShareLinkForUser(req.params.id, req.userId, 'to');
+    if (!link) return res.status(404).json({ error: 'Share link not found' });
+    if (!allowed) return res.status(403).json({ error: 'Forbidden' });
+    if (link.status !== 'accepted') {
+      return res.status(400).json({ error: 'Not accepted', details: 'This share request has not been accepted yet' });
+    }
+
+    const { data: targetStore, error: targetError } = await supabase
+      .from('stores')
+      .select('id, merchant_id')
+      .eq('id', target_store_id)
+      .maybeSingle();
+    if (targetError || !targetStore || targetStore.merchant_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden', details: 'target_store_id must be one of your own stores' });
+    }
+
+    const { data: sourceProducts, error: sourceError } = await supabase
+      .from('products')
+      .select('id, name, description, price, unit, image_url, is_featured, product_categories ( name )')
+      .eq('store_id', link.from_store_id)
+      .in('id', product_ids);
+    if (sourceError) throw new Error(sourceError.message || 'Failed to load shared products');
+
+    const { data: existingProducts } = await supabase.from('products').select('name').eq('store_id', target_store_id);
+    const existingNames = new Set((existingProducts || []).map((p) => String(p.name).trim().toLowerCase()));
+
+    const groupsMap = await fetchOptionGroupsForProducts((sourceProducts || []).map((p) => p.id));
+
+    const categoryCache = {};
+    const resolveCategoryId = async (catName) => {
+      if (!catName) return null;
+      const key = catName.trim().toLowerCase();
+      if (categoryCache[key] !== undefined) return categoryCache[key];
+      const { data: existingCat } = await supabase
+        .from('product_categories')
+        .select('id')
+        .eq('store_id', target_store_id)
+        .ilike('name', catName.trim())
+        .maybeSingle();
+      if (existingCat) {
+        categoryCache[key] = existingCat.id;
+        return existingCat.id;
+      }
+      const { data: createdCat, error: catError } = await supabase
+        .from('product_categories')
+        .insert({ store_id: target_store_id, name: catName.trim() })
+        .select('id')
+        .single();
+      if (catError) throw new Error(catError.message || 'Failed to create category');
+      categoryCache[key] = createdCat.id;
+      return createdCat.id;
+    };
+
+    const imported = [];
+    const skipped = [];
+    for (const p of sourceProducts || []) {
+      if (existingNames.has(String(p.name).trim().toLowerCase())) {
+        skipped.push(p.name);
+        continue;
+      }
+      const categoryName =
+        (Array.isArray(p.product_categories) ? p.product_categories[0]?.name : p.product_categories?.name) || null;
+      const categoryId = await resolveCategoryId(categoryName);
+
+      const { data: createdProduct, error: createError } = await supabase
+        .from('products')
+        .insert({
+          store_id: target_store_id,
+          category_id: categoryId,
+          name: p.name,
+          description: p.description,
+          price: p.price,
+          unit: p.unit === 'kg' ? 'kg' : 'item',
+          image_url: p.image_url,
+          is_available: true,
+          is_featured: !!p.is_featured,
+        })
+        .select('id, name')
+        .single();
+      if (createError) {
+        console.error('share import product insert error:', createError);
+        continue;
+      }
+
+      const groups = groupsMap[p.id] || [];
+      if (groups.length > 0) {
+        await replaceProductOptionGroups(createdProduct.id, groups);
+      }
+      imported.push({ id: createdProduct.id, name: createdProduct.name });
+    }
+
+    return res.json({ imported, skipped });
+  } catch (error) {
+    console.error('post /merchant/share-links/:id/import error:', error);
+    return res.status(500).json({ error: 'Failed to import products', details: error.message || 'Please try again later' });
+  }
+});
+
 // ─── Admin: manage products in any merchant store ────────────────────────────
 // Lets support staff add/edit products on a merchant's behalf when they're busy.
 
