@@ -7030,6 +7030,91 @@ app.get('/admin/merchants/:id/detail', requireAdmin, async (req, res) => {
   }
 });
 
+// Load reviews for a set of stores and/or couriers and attach reviewer name/phone + order number.
+// Pass storeIds for merchant/store reviews, courierIds for delivery reviews (exactly one should be set).
+// Returns newest-first: [{ id, rating, comment, created_at, store_id, courier_id, order_number, customer: { id, full_name, phone } }]
+async function fetchReviews({ storeIds, courierIds }) {
+  const ids = storeIds || courierIds;
+  const column = storeIds ? 'store_id' : 'courier_id';
+  if (!supabase || !Array.isArray(ids) || ids.length === 0) return [];
+
+  const { data: reviews, error } = await supabase
+    .from('reviews')
+    .select('id, rating, comment, created_at, store_id, courier_id, customer_id, order_id, orders ( order_number )')
+    .in(column, ids)
+    .order('created_at', { ascending: false });
+  if (error) throw new Error(error.message || 'Failed to load reviews');
+
+  const customerIds = [...new Set((reviews || []).map((r) => r.customer_id).filter(Boolean))];
+  let profilesById = {};
+  if (customerIds.length > 0) {
+    const { data: profiles } = await supabase
+      .from('user_profiles')
+      .select('id, full_name, phone')
+      .in('id', customerIds);
+    profilesById = Object.fromEntries((profiles || []).map((p) => [p.id, p]));
+  }
+
+  return (reviews || []).map((r) => {
+    const profile = profilesById[r.customer_id] || null;
+    return {
+      id: r.id,
+      rating: r.rating,
+      comment: r.comment,
+      created_at: r.created_at,
+      store_id: r.store_id,
+      courier_id: r.courier_id,
+      order_number: r.orders?.order_number || null,
+      customer: profile
+        ? { id: profile.id, full_name: profile.full_name || null, phone: profile.phone || null }
+        : { id: r.customer_id, full_name: null, phone: null },
+    };
+  });
+}
+
+// Back-compat alias used by the merchant/admin store-review routes below.
+const fetchStoreReviews = (storeIds) => fetchReviews({ storeIds });
+
+function summarizeReviews(reviews) {
+  const total = reviews.length;
+  const counts = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+  let sum = 0;
+  for (const r of reviews) {
+    const rating = Math.min(5, Math.max(1, Number(r.rating) || 0));
+    counts[rating] += 1;
+    sum += rating;
+  }
+  return {
+    total,
+    average: total > 0 ? Math.round((sum / total) * 10) / 10 : null,
+    counts,
+  };
+}
+
+// GET /merchant/reviews — reviews for the logged-in merchant's stores (with reviewer name)
+app.get('/merchant/reviews', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { data: stores, error: storesError } = await supabase
+      .from('stores')
+      .select('id, store_name')
+      .eq('merchant_id', req.userId);
+    if (storesError) throw new Error(storesError.message || 'Failed to load stores');
+
+    const storeIds = (stores || []).map((s) => s.id);
+    const storeNameById = Object.fromEntries((stores || []).map((s) => [s.id, s.store_name]));
+    const reviews = (await fetchStoreReviews(storeIds)).map((r) => ({
+      ...r,
+      store_name: storeNameById[r.store_id] || null,
+    }));
+
+    return res.json({ reviews, summary: summarizeReviews(reviews) });
+  } catch (error) {
+    console.error('get /merchant/reviews error:', error);
+    return res.status(500).json({ error: 'Failed to load reviews', details: error.message || 'Please try again later' });
+  }
+});
+
 // ─── Admin: manage products in any merchant store ────────────────────────────
 // Lets support staff add/edit products on a merchant's behalf when they're busy.
 
@@ -7070,6 +7155,63 @@ app.get('/admin/stores/:storeId/products', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('get /admin/stores/:storeId/products error:', error);
     return res.status(500).json({ error: 'Failed to load products', details: error.message || 'Try again later' });
+  }
+});
+
+// GET /admin/stores/:storeId/reviews — all reviews for a store, with reviewer identity
+app.get('/admin/stores/:storeId/reviews', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { storeId } = req.params;
+
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('id, store_name, rating, total_reviews')
+      .eq('id', storeId)
+      .maybeSingle();
+    if (storeError || !store) return res.status(404).json({ error: 'Store not found' });
+
+    const reviews = await fetchStoreReviews([storeId]);
+    return res.json({
+      store: { id: store.id, store_name: store.store_name, rating: store.rating, total_reviews: store.total_reviews },
+      reviews,
+      summary: summarizeReviews(reviews),
+    });
+  } catch (error) {
+    console.error('get /admin/stores/:storeId/reviews error:', error);
+    return res.status(500).json({ error: 'Failed to load reviews', details: error.message || 'Try again later' });
+  }
+});
+
+// GET /admin/couriers/:courierId/reviews — all delivery reviews for a courier, with reviewer identity
+app.get('/admin/couriers/:courierId/reviews', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { courierId } = req.params;
+
+    const { data: courier, error: courierError } = await supabase
+      .from('couriers')
+      .select('id, rating, total_deliveries, user_profiles ( full_name, phone )')
+      .eq('id', courierId)
+      .maybeSingle();
+    if (courierError || !courier) return res.status(404).json({ error: 'Courier not found' });
+
+    const profile = Array.isArray(courier.user_profiles) ? courier.user_profiles[0] : courier.user_profiles;
+    const reviews = await fetchReviews({ courierIds: [courierId] });
+    return res.json({
+      courier: {
+        id: courier.id,
+        full_name: profile?.full_name || null,
+        phone: profile?.phone || null,
+        rating: courier.rating,
+        total_deliveries: courier.total_deliveries,
+      },
+      reviews,
+      summary: summarizeReviews(reviews),
+    });
+  } catch (error) {
+    console.error('get /admin/couriers/:courierId/reviews error:', error);
+    return res.status(500).json({ error: 'Failed to load reviews', details: error.message || 'Try again later' });
   }
 });
 
