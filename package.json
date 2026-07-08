@@ -9,6 +9,7 @@
     "dev": "NODE_ENV=development node src/server.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.110.0",
     "@supabase/supabase-js": "^2.48.0",
     "axios": "^1.7.0",
     "cors": "^2.8.5",

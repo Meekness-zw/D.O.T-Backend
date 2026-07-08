@@ -86,6 +86,7 @@ export async function getOrdersForUser(userId, options = {}) {
         order_items (
           product_name,
           quantity,
+          selected_options,
           products (
             image_url
           )
@@ -123,7 +124,8 @@ export async function getOrdersForUser(userId, options = {}) {
         order_items (
           product_id,
           product_name,
-          quantity
+          quantity,
+          selected_options
         )
       `)
       .in('store_id', ids)

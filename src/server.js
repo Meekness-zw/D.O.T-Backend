@@ -68,6 +68,7 @@ import {
   computeCourierDeliveryPayoutUsd,
   getOtdPlatformServiceChargeUsd,
 } from './orderPaymentSplit.js';
+import { categorizeStoreWithAI, isAiCategorizationConfigured } from './storeCategorizationAI.js';
 import crypto from 'crypto';
 import axios from 'axios';
 
@@ -176,6 +177,89 @@ function calculateDeliveryFee(distanceKm) {
   if (distanceKm <= BASE_KM) return BASE;
   const rate = isRushHour() ? 0.55 : 0.50;
   return Math.round((BASE + (distanceKm - BASE_KM) * rate) * 100) / 100;
+}
+
+// ─── Product variants (option groups + options) ────────────────────────────
+
+// Load option groups (with their options) for a set of products.
+// Returns { [productId]: [{ id, name, is_required, max_select, options: [...] }] }
+async function fetchOptionGroupsForProducts(productIds) {
+  if (!supabase || !Array.isArray(productIds) || productIds.length === 0) return {};
+  const { data, error } = await supabase
+    .from('product_option_groups')
+    .select(
+      'id, product_id, name, is_required, max_select, display_order, product_options ( id, name, price_adjustment, is_available, display_order )',
+    )
+    .in('product_id', productIds)
+    .order('display_order', { ascending: true });
+  if (error) {
+    console.error('fetchOptionGroupsForProducts error:', error);
+    return {};
+  }
+  const byProduct = {};
+  for (const g of data || []) {
+    const options = (g.product_options || [])
+      .slice()
+      .sort((a, b) => (a.display_order || 0) - (b.display_order || 0))
+      .map((o) => ({
+        id: o.id,
+        name: o.name,
+        price_adjustment: Number(o.price_adjustment) || 0,
+        is_available: o.is_available !== false,
+      }));
+    if (!byProduct[g.product_id]) byProduct[g.product_id] = [];
+    byProduct[g.product_id].push({
+      id: g.id,
+      name: g.name,
+      is_required: !!g.is_required,
+      max_select: Math.max(1, parseInt(g.max_select, 10) || 1),
+      options,
+    });
+  }
+  return byProduct;
+}
+
+// Full replace of a product's option groups (delete + reinsert).
+// Accepts [{ name, is_required, max_select, options: [{ name, price_adjustment, is_available }] }]
+async function replaceProductOptionGroups(productId, optionGroups) {
+  if (!supabase) throw new Error('Server not configured');
+  const { error: delError } = await supabase
+    .from('product_option_groups')
+    .delete()
+    .eq('product_id', productId);
+  if (delError) throw new Error(delError.message || 'Failed to clear option groups');
+
+  const groups = (Array.isArray(optionGroups) ? optionGroups : [])
+    .filter((g) => g && String(g.name || '').trim())
+    .map((g, gi) => ({
+      name: String(g.name).trim(),
+      is_required: !!g.is_required,
+      max_select: Math.max(1, parseInt(g.max_select, 10) || 1),
+      display_order: gi,
+      options: (Array.isArray(g.options) ? g.options : [])
+        .filter((o) => o && String(o.name || '').trim())
+        .map((o, oi) => ({
+          name: String(o.name).trim(),
+          price_adjustment: Number(o.price_adjustment) || 0,
+          is_available: o.is_available !== false,
+          display_order: oi,
+        })),
+    }))
+    .filter((g) => g.options.length > 0);
+
+  for (const group of groups) {
+    const { options, ...groupRow } = group;
+    const { data: createdGroup, error: groupError } = await supabase
+      .from('product_option_groups')
+      .insert({ ...groupRow, product_id: productId })
+      .select('id')
+      .single();
+    if (groupError) throw new Error(groupError.message || 'Failed to save option group');
+    const { error: optionsError } = await supabase
+      .from('product_options')
+      .insert(options.map((o) => ({ ...o, group_id: createdGroup.id })));
+    if (optionsError) throw new Error(optionsError.message || 'Failed to save options');
+  }
 }
 
 // Environment validation (Dexatel + Supabase for phone auth)
@@ -639,6 +723,61 @@ app.post('/business-types', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('POST /business-types error:', err);
     return res.status(500).json({ error: 'Failed to create business type', details: err.message });
+  }
+});
+
+// POST /business-types/suggest — AI-pick the best category for a store (auth required)
+// Body: { name, description }. Returns { business_type: {id, name, icon}, is_new }.
+// Falls back to 503 when ANTHROPIC_API_KEY is not configured so clients can
+// keep manual selection as the fallback.
+app.post('/business-types/suggest', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    if (!isAiCategorizationConfigured()) {
+      return res.status(503).json({ error: 'AI categorization not configured', details: 'Set ANTHROPIC_API_KEY in server env' });
+    }
+    const { name, description } = req.body || {};
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+
+    const { data: types, error: typesError } = await supabase
+      .from('business_types')
+      .select('id, name, icon')
+      .order('name', { ascending: true });
+    if (typesError) throw new Error(typesError.message);
+
+    const result = await categorizeStoreWithAI({
+      storeName: String(name).trim(),
+      description: description ? String(description).trim() : '',
+      businessTypes: types || [],
+    });
+
+    if (result.match_type === 'existing' && result.business_type_id) {
+      const matched = (types || []).find((t) => t.id === result.business_type_id);
+      if (matched) {
+        return res.json({ business_type: matched, is_new: false });
+      }
+    }
+
+    // No existing type fits — create the AI-proposed category so it appears
+    // in the customer app's category tabs (same upsert path as POST /business-types).
+    const label = String(result.new_type_name || '').trim();
+    if (!label) {
+      return res.status(422).json({ error: 'Could not categorize business', details: 'Try selecting a category manually' });
+    }
+    const id = label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+    const { data: createdType, error: upsertError } = await supabase
+      .from('business_types')
+      .upsert({ id, name: label, icon: result.new_type_icon || 'shopping-bag', is_default: false }, { onConflict: 'id' })
+      .select('id, name, icon')
+      .single();
+    if (upsertError) throw new Error(upsertError.message);
+
+    return res.json({ business_type: createdType, is_new: true });
+  } catch (err) {
+    console.error('POST /business-types/suggest error:', err);
+    return res.status(500).json({ error: 'Failed to suggest business type', details: err.message });
   }
 });
 
@@ -1217,6 +1356,8 @@ app.get('/merchant/products', requireAuth, async (req, res) => {
       throw new Error(error.message || 'Failed to load products');
     }
 
+    const groupsMap = await fetchOptionGroupsForProducts((data || []).map((p) => p.id));
+
     const products = (data || []).map((p) => ({
       id: p.id,
       store_id: p.store_id,
@@ -1232,6 +1373,7 @@ app.get('/merchant/products', requireAuth, async (req, res) => {
         (Array.isArray(p.product_categories)
           ? p.product_categories[0]?.name
           : p.product_categories?.name) || null,
+      option_groups: groupsMap[p.id] || [],
     }));
 
     return res.json({ products });
@@ -1291,6 +1433,8 @@ app.get('/stores/:storeId/menu', async (req, res) => {
       throw new Error(productsError.message || 'Failed to load menu');
     }
 
+    const menuGroupsMap = await fetchOptionGroupsForProducts((productsData || []).map((p) => p.id));
+
     const products = (productsData || []).map((p) => {
       const categoryName =
         (Array.isArray(p.product_categories)
@@ -1307,6 +1451,10 @@ app.get('/stores/:storeId/menu', async (req, res) => {
         is_featured: p.is_featured,
         image_url: p.image_url,
         category: categoryName,
+        option_groups: (menuGroupsMap[p.id] || []).map((g) => ({
+          ...g,
+          options: g.options.filter((o) => o.is_available !== false),
+        })),
       };
     });
 
@@ -1388,7 +1536,7 @@ app.patch('/merchant/products/:id', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden', details: 'Cannot modify this product' });
     }
 
-    const { name, description, price, is_available, is_featured, image_url, category_id, category_name, unit } = req.body || {};
+    const { name, description, price, is_available, is_featured, image_url, category_id, category_name, unit, option_groups } = req.body || {};
 
     let resolvedCategoryId = category_id !== undefined ? (category_id || null) : undefined;
     if (resolvedCategoryId === undefined && category_name !== undefined && String(category_name || '').trim()) {
@@ -1423,32 +1571,48 @@ app.patch('/merchant/products/:id', requireAuth, async (req, res) => {
     if (resolvedCategoryId !== undefined) update.category_id = resolvedCategoryId;
     if (unit !== undefined) update.unit = unit === 'kg' ? 'kg' : 'item';
 
-    if (Object.keys(update).length === 0) {
+    if (Object.keys(update).length === 0 && option_groups === undefined) {
       return res.status(400).json({
         error: 'No fields to update',
         details: 'Provide at least one updatable field',
       });
     }
 
-    const { data: updated, error: updateError } = await supabase
-      .from('products')
-      .update(update)
-      .eq('id', id)
-      .select('id, store_id, name, description, price, unit, is_available, is_featured, image_url')
-      .maybeSingle();
+    let updated;
+    if (Object.keys(update).length > 0) {
+      const { data, error: updateError } = await supabase
+        .from('products')
+        .update(update)
+        .eq('id', id)
+        .select('id, store_id, name, description, price, unit, is_available, is_featured, image_url')
+        .maybeSingle();
 
-    if (updateError) {
-      console.error('merchant products update error:', updateError);
-      throw new Error(updateError.message || 'Failed to update product');
+      if (updateError) {
+        console.error('merchant products update error:', updateError);
+        throw new Error(updateError.message || 'Failed to update product');
+      }
+
+      if (!data) {
+        // The pre-check found the product, but the update returned 0 rows (e.g. deleted concurrently).
+        // Don't crash with PGRST116; return a clean 404.
+        return res.status(404).json({ error: 'Product not found' });
+      }
+      updated = data;
+    } else {
+      const { data } = await supabase
+        .from('products')
+        .select('id, store_id, name, description, price, unit, is_available, is_featured, image_url')
+        .eq('id', id)
+        .maybeSingle();
+      if (!data) return res.status(404).json({ error: 'Product not found' });
+      updated = data;
     }
 
-    if (!updated) {
-      // The pre-check found the product, but the update returned 0 rows (e.g. deleted concurrently).
-      // Don't crash with PGRST116; return a clean 404.
-      return res.status(404).json({ error: 'Product not found' });
+    if (option_groups !== undefined) {
+      await replaceProductOptionGroups(id, option_groups);
     }
-
-    return res.json(updated);
+    const groupsMap = await fetchOptionGroupsForProducts([id]);
+    return res.json({ ...updated, option_groups: groupsMap[id] || [] });
   } catch (error) {
     console.error('patch /merchant/products/:id error:', error);
     return res.status(500).json({
@@ -2252,7 +2416,7 @@ app.get('/merchant/stores/:storeId/categories', requireAuth, async (req, res) =>
 app.post('/merchant/products', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
-    const { store_id, name, description, price, category_id, category_name, unit, image_url, is_available, is_featured } = req.body || {};
+    const { store_id, name, description, price, category_id, category_name, unit, image_url, is_available, is_featured, option_groups } = req.body || {};
     if (!store_id || !name || price === undefined || price === null) {
       return res.status(400).json({
         error: 'Missing required fields',
@@ -2310,7 +2474,11 @@ app.post('/merchant/products', requireAuth, async (req, res) => {
       console.error('post /merchant/products error:', insertError);
       throw new Error(insertError.message || 'Failed to create product');
     }
-    return res.status(201).json(created);
+    if (Array.isArray(option_groups)) {
+      await replaceProductOptionGroups(created.id, option_groups);
+    }
+    const groupsMap = await fetchOptionGroupsForProducts([created.id]);
+    return res.status(201).json({ ...created, option_groups: groupsMap[created.id] || [] });
   } catch (error) {
     console.error('post /merchant/products error:', error);
     return res.status(500).json({
@@ -3402,7 +3570,8 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
           quantity,
           unit,
           weight_kg,
-          subtotal
+          subtotal,
+          selected_options
         )
       `,
       )
@@ -4871,16 +5040,30 @@ app.post('/orders', requireAuth, async (req, res) => {
       throw new Error(orderError.message || 'Failed to create order');
     }
 
-    const orderItemsPayload = items.map((item) => ({
-      order_id: order.id,
-      product_id: item.product_id,
-      product_name: item.product_name,
-      product_price: item.product_price,
-      quantity: item.unit === 'kg' ? 1 : item.quantity,
-      unit: item.unit === 'kg' ? 'kg' : 'item',
-      weight_kg: item.unit === 'kg' ? item.quantity : null,
-      subtotal: item.subtotal,
-    }));
+    const orderItemsPayload = items.map((item) => {
+      // Snapshot of variant picks: [{ group, option, price_adjustment }]
+      const selectedOptions = Array.isArray(item.selected_options)
+        ? item.selected_options
+            .filter((s) => s && String(s.group || '').trim() && String(s.option || '').trim())
+            .map((s) => ({
+              group: String(s.group).trim(),
+              option: String(s.option).trim(),
+              price_adjustment: Number(s.price_adjustment) || 0,
+            }))
+        : null;
+
+      return {
+        order_id: order.id,
+        product_id: item.product_id,
+        product_name: item.product_name,
+        product_price: item.product_price,
+        quantity: item.unit === 'kg' ? 1 : item.quantity,
+        unit: item.unit === 'kg' ? 'kg' : 'item',
+        weight_kg: item.unit === 'kg' ? item.quantity : null,
+        subtotal: item.subtotal,
+        selected_options: selectedOptions && selectedOptions.length > 0 ? selectedOptions : null,
+      };
+    });
 
     const { error: itemsError } = await supabase
       .from('order_items')
@@ -6844,6 +7027,281 @@ app.get('/admin/merchants/:id/detail', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('admin/merchants/:id/detail error:', error);
     return res.status(500).json({ error: 'Failed to load merchant', details: error.message || 'Try again later' });
+  }
+});
+
+// ─── Admin: manage products in any merchant store ────────────────────────────
+// Lets support staff add/edit products on a merchant's behalf when they're busy.
+
+// GET /admin/stores/:storeId/products — all products in a store (incl. variants)
+app.get('/admin/stores/:storeId/products', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { storeId } = req.params;
+
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('id, store_name, merchant_id')
+      .eq('id', storeId)
+      .maybeSingle();
+    if (storeError || !store) return res.status(404).json({ error: 'Store not found' });
+
+    const { data, error } = await supabase
+      .from('products')
+      .select(
+        'id, store_id, category_id, name, description, price, unit, is_available, is_featured, image_url, created_at, product_categories ( name )',
+      )
+      .eq('store_id', storeId)
+      .order('created_at', { ascending: false });
+    if (error) throw new Error(error.message || 'Failed to load products');
+
+    const groupsMap = await fetchOptionGroupsForProducts((data || []).map((p) => p.id));
+    const products = (data || []).map((p) => ({
+      ...p,
+      product_categories: undefined,
+      category_name:
+        (Array.isArray(p.product_categories)
+          ? p.product_categories[0]?.name
+          : p.product_categories?.name) || null,
+      option_groups: groupsMap[p.id] || [],
+    }));
+
+    return res.json({ store: { id: store.id, store_name: store.store_name }, products });
+  } catch (error) {
+    console.error('get /admin/stores/:storeId/products error:', error);
+    return res.status(500).json({ error: 'Failed to load products', details: error.message || 'Try again later' });
+  }
+});
+
+// GET /admin/stores/:storeId/categories — product categories of a store
+app.get('/admin/stores/:storeId/categories', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { storeId } = req.params;
+    const { data, error } = await supabase
+      .from('product_categories')
+      .select('id, name')
+      .eq('store_id', storeId)
+      .order('name', { ascending: true });
+    if (error) throw new Error(error.message || 'Failed to load categories');
+    return res.json({ categories: data || [] });
+  } catch (error) {
+    console.error('get /admin/stores/:storeId/categories error:', error);
+    return res.status(500).json({ error: 'Failed to load categories', details: error.message || 'Try again later' });
+  }
+});
+
+// POST /admin/stores/:storeId/products — create a product in any store
+app.post('/admin/stores/:storeId/products', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { storeId } = req.params;
+    const { name, description, price, category_id, category_name, unit, image_url, is_available, is_featured, option_groups } = req.body || {};
+    if (!name || price === undefined || price === null) {
+      return res.status(400).json({ error: 'Missing required fields', details: 'name and price are required' });
+    }
+
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('id')
+      .eq('id', storeId)
+      .maybeSingle();
+    if (storeError || !store) return res.status(404).json({ error: 'Store not found' });
+
+    let resolvedCategoryId = category_id || null;
+    if (!resolvedCategoryId && category_name && String(category_name).trim()) {
+      const catName = String(category_name).trim();
+      const { data: existing } = await supabase
+        .from('product_categories')
+        .select('id')
+        .eq('store_id', storeId)
+        .ilike('name', catName)
+        .maybeSingle();
+      if (existing) {
+        resolvedCategoryId = existing.id;
+      } else {
+        const { data: created } = await supabase
+          .from('product_categories')
+          .insert({ store_id: storeId, name: catName })
+          .select('id')
+          .single();
+        if (created) resolvedCategoryId = created.id;
+      }
+    }
+
+    const insert = {
+      store_id: storeId,
+      name: String(name).trim(),
+      description: description ? String(description).trim() : null,
+      price: Number(price),
+      unit: unit === 'kg' ? 'kg' : 'item',
+      image_url: image_url ? String(image_url).trim() : null,
+      is_available: is_available !== false,
+      is_featured: !!is_featured,
+    };
+    if (resolvedCategoryId) insert.category_id = resolvedCategoryId;
+
+    const { data: created, error: insertError } = await supabase
+      .from('products')
+      .insert(insert)
+      .select('id, store_id, name, description, price, unit, image_url, is_available, is_featured, category_id')
+      .single();
+    if (insertError) throw new Error(insertError.message || 'Failed to create product');
+
+    if (Array.isArray(option_groups)) {
+      await replaceProductOptionGroups(created.id, option_groups);
+    }
+    const groupsMap = await fetchOptionGroupsForProducts([created.id]);
+    return res.status(201).json({ ...created, option_groups: groupsMap[created.id] || [] });
+  } catch (error) {
+    console.error('post /admin/stores/:storeId/products error:', error);
+    return res.status(500).json({ error: 'Failed to create product', details: error.message || 'Try again later' });
+  }
+});
+
+// PATCH /admin/products/:id — update any product
+app.patch('/admin/products/:id', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+
+    const { data: product, error: productError } = await supabase
+      .from('products')
+      .select('id, store_id')
+      .eq('id', id)
+      .maybeSingle();
+    if (productError) throw new Error(productError.message || 'Failed to load product');
+    if (!product) return res.status(404).json({ error: 'Product not found' });
+
+    const { name, description, price, is_available, is_featured, image_url, category_id, category_name, unit, option_groups } = req.body || {};
+
+    let resolvedCategoryId = category_id !== undefined ? (category_id || null) : undefined;
+    if (resolvedCategoryId === undefined && category_name !== undefined && String(category_name || '').trim()) {
+      const catName = String(category_name).trim();
+      const { data: existing } = await supabase
+        .from('product_categories')
+        .select('id')
+        .eq('store_id', product.store_id)
+        .ilike('name', catName)
+        .maybeSingle();
+      if (existing) {
+        resolvedCategoryId = existing.id;
+      } else {
+        const { data: created } = await supabase
+          .from('product_categories')
+          .insert({ store_id: product.store_id, name: catName })
+          .select('id')
+          .single();
+        if (created) resolvedCategoryId = created.id;
+      }
+    }
+
+    const update = {};
+    if (name !== undefined) update.name = String(name).trim();
+    if (description !== undefined) update.description = description ? String(description).trim() : null;
+    if (price !== undefined && price !== null && price !== '') update.price = Number(price);
+    if (is_available !== undefined) update.is_available = !!is_available;
+    if (is_featured !== undefined) update.is_featured = !!is_featured;
+    if (image_url !== undefined) update.image_url = image_url ? String(image_url).trim() : null;
+    if (resolvedCategoryId !== undefined) update.category_id = resolvedCategoryId;
+    if (unit !== undefined) update.unit = unit === 'kg' ? 'kg' : 'item';
+
+    if (Object.keys(update).length === 0 && option_groups === undefined) {
+      return res.status(400).json({ error: 'No fields to update', details: 'Provide at least one updatable field' });
+    }
+
+    let updated;
+    if (Object.keys(update).length > 0) {
+      const { data, error: updateError } = await supabase
+        .from('products')
+        .update(update)
+        .eq('id', id)
+        .select('id, store_id, name, description, price, unit, is_available, is_featured, image_url, category_id')
+        .maybeSingle();
+      if (updateError) throw new Error(updateError.message || 'Failed to update product');
+      if (!data) return res.status(404).json({ error: 'Product not found' });
+      updated = data;
+    } else {
+      const { data } = await supabase
+        .from('products')
+        .select('id, store_id, name, description, price, unit, is_available, is_featured, image_url, category_id')
+        .eq('id', id)
+        .maybeSingle();
+      if (!data) return res.status(404).json({ error: 'Product not found' });
+      updated = data;
+    }
+
+    if (option_groups !== undefined) {
+      await replaceProductOptionGroups(id, option_groups);
+    }
+    const groupsMap = await fetchOptionGroupsForProducts([id]);
+    return res.json({ ...updated, option_groups: groupsMap[id] || [] });
+  } catch (error) {
+    console.error('patch /admin/products/:id error:', error);
+    return res.status(500).json({ error: 'Failed to update product', details: error.message || 'Try again later' });
+  }
+});
+
+// DELETE /admin/products/:id — remove any product
+app.delete('/admin/products/:id', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { data: product } = await supabase
+      .from('products')
+      .select('id')
+      .eq('id', id)
+      .maybeSingle();
+    if (!product) return res.status(404).json({ error: 'Product not found' });
+
+    const { error } = await supabase.from('products').delete().eq('id', id);
+    if (error) throw new Error(error.message || 'Failed to delete product');
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('delete /admin/products/:id error:', error);
+    return res.status(500).json({ error: 'Failed to delete product', details: error.message || 'Try again later' });
+  }
+});
+
+// POST /admin/stores/:storeId/products/upload-image — product image upload on behalf of a merchant
+app.post('/admin/stores/:storeId/products/upload-image', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { storeId } = req.params;
+    const { image_base64 } = req.body || {};
+    if (!image_base64) {
+      return res.status(400).json({ error: 'Missing required fields', details: 'image_base64 is required' });
+    }
+
+    const { data: store } = await supabase
+      .from('stores')
+      .select('id')
+      .eq('id', storeId)
+      .maybeSingle();
+    if (!store) return res.status(404).json({ error: 'Store not found' });
+
+    const match = String(image_base64).match(/^data:([^;]+);base64,(.+)$/);
+    if (!match) {
+      return res.status(400).json({ error: 'Invalid image payload', details: 'Expected base64 data URL' });
+    }
+    const mime = match[1];
+    const buffer = Buffer.from(match[2], 'base64');
+    const ext = mime.includes('png') ? 'png' : mime.includes('jpeg') || mime.includes('jpg') ? 'jpg' : 'bin';
+    const filename = `${storeId}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('product-images')
+      .upload(filename, buffer, { contentType: mime, upsert: true });
+    if (uploadError) throw new Error(uploadError.message || 'Failed to upload image');
+
+    const { data: urlData } = supabase.storage.from('product-images').getPublicUrl(filename);
+    if (!urlData?.publicUrl) {
+      return res.status(500).json({ error: 'Failed to resolve image URL' });
+    }
+    return res.json({ image_url: urlData.publicUrl });
+  } catch (error) {
+    console.error('post /admin/stores/:storeId/products/upload-image error:', error);
+    return res.status(500).json({ error: 'Failed to upload image', details: error.message || 'Try again later' });
   }
 });
 
