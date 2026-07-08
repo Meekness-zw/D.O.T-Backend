@@ -2650,20 +2650,49 @@ app.get('/public/promotions', async (req, res) => {
         )
       `,
       )
-      .eq('is_active', true)
-      .or('starts_at.is.null,starts_at.lte.' + now)
-      .or('ends_at.is.null,ends_at.gte.' + now)
       .order('created_at', { ascending: false })
-      .limit(20);
+      .limit(50);
 
     if (error) {
       console.error('[PublicPromos] Supabase error', { code: error.code, message: error.message, details: error.details });
       throw new Error(error.message || 'Failed to load promotions');
     }
 
-    console.log('[PublicPromos] Raw rows count:', Array.isArray(data) ? data.length : 0);
+    console.log('[PublicPromos] Total rows count:', Array.isArray(data) ? data.length : 0);
 
-    const deals = (data || []).map((p) => ({
+    // Filtering in JS so every exclusion is loggable, with one forgiving
+    // rule: an ends_at stored at exactly midnight (a date-only pick like
+    // "ends July 8") means end OF that day, not its first second.
+    const nowMs = Date.now();
+    const live = (data || []).filter((p) => {
+      if (p.is_active !== true) {
+        console.log(`[PublicPromos] Excluding "${p.title}" (${p.id}): is_active=${p.is_active}`);
+        return false;
+      }
+      if (p.starts_at) {
+        const startMs = Date.parse(p.starts_at);
+        if (Number.isFinite(startMs) && startMs > nowMs) {
+          console.log(`[PublicPromos] Excluding "${p.title}" (${p.id}): starts_at ${p.starts_at} is in the future`);
+          return false;
+        }
+      }
+      if (p.ends_at) {
+        let endMs = Date.parse(p.ends_at);
+        if (Number.isFinite(endMs)) {
+          const end = new Date(endMs);
+          if (end.getUTCHours() === 0 && end.getUTCMinutes() === 0 && end.getUTCSeconds() === 0) {
+            endMs += 24 * 60 * 60 * 1000 - 1000; // date-only → inclusive end of day
+          }
+          if (endMs < nowMs) {
+            console.log(`[PublicPromos] Excluding "${p.title}" (${p.id}): ends_at ${p.ends_at} has passed`);
+            return false;
+          }
+        }
+      }
+      return true;
+    }).slice(0, 20);
+
+    const deals = live.map((p) => ({
       id: p.id,
       store_id: p.store_id,
       title: p.title,
