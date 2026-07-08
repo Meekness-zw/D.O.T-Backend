@@ -62,6 +62,7 @@ import {
   notifyCustomerCourierAssigned,
   notifyCustomerOrderPlaced,
   notifyCustomerOrderSelfCancelled,
+  notifyMerchantStockLevel,
 } from './orderNotifications.js';
 import {
   recordCourierDeliveryEarnings,
@@ -126,7 +127,7 @@ async function notifyAvailableCouriers(orderId, orderNumber, storeName) {
       pushMessages.push({ to: token, title: 'New delivery available', body: `${numLabel} from ${store} is ready for pickup.`, data: { type: 'new_job', orderId }, sound: 'default' });
     }
     if (!pushMessages.length) return;
-    await axios.post('https://exp.host/push/send', pushMessages, {
+    await axios.post('https://exp.host/--/api/v2/push/send', pushMessages, {
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       timeout: 10000,
     });
@@ -1534,7 +1535,7 @@ app.patch('/merchant/products/:id', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden', details: 'Cannot modify this product' });
     }
 
-    const { name, description, price, is_available, is_featured, image_url, category_id, category_name, unit, option_groups } = req.body || {};
+    const { name, description, price, is_available, is_featured, image_url, category_id, category_name, unit, option_groups, stock_quantity } = req.body || {};
 
     let resolvedCategoryId = category_id !== undefined ? (category_id || null) : undefined;
     if (resolvedCategoryId === undefined && category_name !== undefined && String(category_name || '').trim()) {
@@ -1568,6 +1569,13 @@ app.patch('/merchant/products/:id', requireAuth, async (req, res) => {
     if (image_url !== undefined) update.image_url = image_url ? String(image_url).trim() : null;
     if (resolvedCategoryId !== undefined) update.category_id = resolvedCategoryId;
     if (unit !== undefined) update.unit = unit === 'kg' ? 'kg' : 'item';
+    // Optional inventory tracking: null clears tracking; restocking >0 re-enables
+    if (stock_quantity !== undefined) {
+      const qty = stock_quantity === null || stock_quantity === '' ? null : Math.max(0, Math.floor(Number(stock_quantity)));
+      update.stock_quantity = Number.isFinite(qty) || qty === null ? qty : null;
+      if (update.stock_quantity === 0) update.is_available = false;
+      else if (update.stock_quantity > 0 && is_available === undefined) update.is_available = true;
+    }
 
     if (Object.keys(update).length === 0 && option_groups === undefined) {
       return res.status(400).json({
@@ -1582,7 +1590,7 @@ app.patch('/merchant/products/:id', requireAuth, async (req, res) => {
         .from('products')
         .update(update)
         .eq('id', id)
-        .select('id, store_id, name, description, price, unit, is_available, is_featured, image_url')
+        .select('id, store_id, name, description, price, unit, is_available, is_featured, image_url, stock_quantity')
         .maybeSingle();
 
       if (updateError) {
@@ -1599,7 +1607,7 @@ app.patch('/merchant/products/:id', requireAuth, async (req, res) => {
     } else {
       const { data } = await supabase
         .from('products')
-        .select('id, store_id, name, description, price, unit, is_available, is_featured, image_url')
+        .select('id, store_id, name, description, price, unit, is_available, is_featured, image_url, stock_quantity')
         .eq('id', id)
         .maybeSingle();
       if (!data) return res.status(404).json({ error: 'Product not found' });
@@ -2414,7 +2422,7 @@ app.get('/merchant/stores/:storeId/categories', requireAuth, async (req, res) =>
 app.post('/merchant/products', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
-    const { store_id, name, description, price, category_id, category_name, unit, image_url, is_available, is_featured, option_groups } = req.body || {};
+    const { store_id, name, description, price, category_id, category_name, unit, image_url, is_available, is_featured, option_groups, stock_quantity } = req.body || {};
     if (!store_id || !name || price === undefined || price === null) {
       return res.status(400).json({
         error: 'Missing required fields',
@@ -2462,11 +2470,17 @@ app.post('/merchant/products', requireAuth, async (req, res) => {
       is_available: is_available !== false,
       is_featured: !!is_featured,
     };
+    // Optional inventory tracking: null = untracked (never auto-disabled)
+    if (stock_quantity !== undefined) {
+      const qty = stock_quantity === null || stock_quantity === '' ? null : Math.max(0, Math.floor(Number(stock_quantity)));
+      insert.stock_quantity = Number.isFinite(qty) || qty === null ? qty : null;
+      if (insert.stock_quantity === 0) insert.is_available = false;
+    }
     if (resolvedCategoryId) insert.category_id = resolvedCategoryId;
     const { data: created, error: insertError } = await supabaseAdmin
       .from('products')
       .insert(insert)
-      .select('id, store_id, name, description, price, unit, image_url, is_available, is_featured, category_id')
+      .select('id, store_id, name, description, price, unit, image_url, is_available, is_featured, category_id, stock_quantity')
       .single();
     if (insertError) {
       console.error('post /merchant/products error:', insertError);
@@ -3734,7 +3748,7 @@ app.post('/courier/orders/:id/arrived', requireAuth, async (req, res) => {
           .maybeSingle();
         const token = merchantProfile?.push_token;
         if (token?.startsWith('ExponentPushToken')) {
-          await axios.post('https://exp.host/push/send', {
+          await axios.post('https://exp.host/--/api/v2/push/send', {
             to: token,
             title: 'Courier has arrived',
             body: `The courier for order #${order.order_number} is at your location. Please confirm pickup.`,
@@ -3823,7 +3837,7 @@ app.post('/merchant/orders/:id/confirm-dispatch', requireAuth, async (req, res) 
           .maybeSingle();
         const token = courierProfile?.push_token;
         if (token?.startsWith('ExponentPushToken')) {
-          await axios.post('https://exp.host/push/send', {
+          await axios.post('https://exp.host/--/api/v2/push/send', {
             to: token,
             title: 'Pickup confirmed',
             body: `The merchant has confirmed order #${updated.order_number}. You can now start delivery.`,
@@ -3935,7 +3949,7 @@ app.post('/customer/orders/:id/confirm-delivery', requireAuth, async (req, res) 
         const courierToken = courierProfile?.push_token;
         if (courierToken && courierToken.startsWith('ExponentPushToken')) {
           const orderLabel = order.order_number ? `#${order.order_number}` : 'Your delivery';
-          await axios.post('https://exp.host/push/send', [{
+          await axios.post('https://exp.host/--/api/v2/push/send', [{
             to: courierToken,
             title: 'Delivery confirmed!',
             body: `${orderLabel} has been confirmed by the customer. Great work!`,
@@ -4834,7 +4848,7 @@ app.post('/courier/orders/:id/complete', requireAuth, async (req, res) => {
       const customerToken = customerProfile?.push_token;
       if (customerToken && customerToken.startsWith('ExponentPushToken')) {
         const orderLabel = order.order_number ? `#${order.order_number}` : 'Your order';
-        await axios.post('https://exp.host/push/send', [{
+        await axios.post('https://exp.host/--/api/v2/push/send', [{
           to: customerToken,
           title: 'Your order has arrived!',
           body: `${orderLabel} has been delivered. Please confirm you received it.`,
@@ -5125,11 +5139,49 @@ app.post('/orders', requireAuth, async (req, res) => {
           message: `Order ${orderNumber} — ${itemCount} item${itemCount !== 1 ? 's' : ''} — $${totalAmount.toFixed(2)}`,
           type: 'order',
           referenceId: order.id,
+          audience: 'merchant',
           data: { orderId: order.id, orderNumber },
         });
       } catch (merchantNotifyErr) {
         console.error('merchant order notification failed (non-fatal):', merchantNotifyErr);
       }
+    }
+
+    // Inventory: decrement stock for tracked products (stock_quantity set).
+    // At 0 the product auto-disables; the merchant is alerted at ≤5 and at 0.
+    try {
+      const LOW_STOCK_THRESHOLD = 5;
+      const qtyByProduct = new Map();
+      for (const item of items) {
+        if (!item.product_id) continue;
+        const qty = item.unit === 'kg' ? 1 : Math.max(1, Math.floor(Number(item.quantity) || 1));
+        qtyByProduct.set(item.product_id, (qtyByProduct.get(item.product_id) || 0) + qty);
+      }
+      if (qtyByProduct.size > 0) {
+        const { data: tracked } = await supabase
+          .from('products')
+          .select('id, name, stock_quantity')
+          .in('id', [...qtyByProduct.keys()])
+          .not('stock_quantity', 'is', null);
+        for (const p of tracked || []) {
+          const newQty = Math.max(0, Number(p.stock_quantity) - qtyByProduct.get(p.id));
+          const upd = { stock_quantity: newQty };
+          if (newQty === 0) upd.is_available = false;
+          await supabase.from('products').update(upd).eq('id', p.id);
+          if (store.merchant_id && (newQty === 0 || newQty <= LOW_STOCK_THRESHOLD)) {
+            await notifyMerchantStockLevel(supabase, {
+              merchantId: store.merchant_id,
+              productId: p.id,
+              productName: p.name,
+              stockQuantity: newQty,
+              outOfStock: newQty === 0,
+            });
+          }
+        }
+      }
+    } catch (stockErr) {
+      // Non-fatal: order stands even if stock tracking fails (e.g. column not migrated yet)
+      console.warn('stock decrement failed (non-fatal):', stockErr?.message);
     }
 
     return res.status(201).json({ order });
@@ -5644,12 +5696,13 @@ app.get('/users/me/notifications', requireAuth, async (req, res) => {
 
     let query = supabase
       .from('notifications')
-      .select('id, title, message, type, reference_id, is_read, created_at')
+      .select('id, title, message, type, reference_id, is_read, created_at, data')
       .eq('user_id', req.userId);
 
-    // Filter by role if provided (only if role column exists in your table)
+    // Audience lives inside the data jsonb (set by insertUserNotification).
+    // Untagged legacy rows are shown to every role.
     if (requestedRole) {
-      query = query.eq('role', requestedRole);
+      query = query.or(`data->>audience.is.null,data->>audience.eq.${requestedRole}`);
     }
 
     const { data, error } = await query
@@ -5838,6 +5891,16 @@ app.post('/users/me/addresses', requireAuth, async (req, res) => {
         error: 'Missing required fields',
         details: 'label and address are required',
       });
+    }
+
+    // Ensure the customer row exists — customer_addresses has an FK to
+    // customers, and users who never hit another customer feature first
+    // would fail the insert with a foreign-key violation.
+    const { error: ensureErr } = await supabase
+      .from('customers')
+      .upsert({ id: req.userId }, { onConflict: 'id' });
+    if (ensureErr) {
+      console.warn('addresses: ensure customer row:', ensureErr.message);
     }
 
     const insert = {
@@ -7243,6 +7306,7 @@ app.post('/merchant/share-links', requireAuth, async (req, res) => {
         message: `${senderMerchant?.business_name || fromStore.store_name} wants to share their product list with ${toStore.store_name}. Accept to import their menu items.`,
         type: 'system',
         referenceId: created.id,
+        audience: 'merchant',
         data: { kind: 'merchant_share_request', shareLinkId: created.id },
       });
     } catch (notifyErr) {
@@ -7355,6 +7419,7 @@ app.post('/merchant/share-links/:id/accept', requireAuth, async (req, res) => {
         message: `Your product list share offer was accepted. They can now import your items anytime.`,
         type: 'system',
         referenceId: link.id,
+        audience: 'merchant',
         data: { kind: 'merchant_share_accepted', shareLinkId: link.id },
       });
     } catch (notifyErr) {
@@ -7596,7 +7661,7 @@ app.get('/admin/stores/:storeId/products', requireAdmin, async (req, res) => {
     const { data, error } = await supabase
       .from('products')
       .select(
-        'id, store_id, category_id, name, description, price, unit, is_available, is_featured, image_url, created_at, product_categories ( name )',
+        'id, store_id, category_id, name, description, price, unit, is_available, is_featured, image_url, created_at, stock_quantity, product_categories ( name )',
       )
       .eq('store_id', storeId)
       .order('created_at', { ascending: false });
