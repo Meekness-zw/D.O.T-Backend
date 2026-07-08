@@ -1402,10 +1402,8 @@ app.get('/stores/:storeId/menu', async (req, res) => {
       return res.status(404).json({ error: 'Store not found' });
     }
 
-    const closed = assertStoreAcceptingOrders(store);
-    if (!closed.ok) {
-      return res.status(closed.status).json(closed.body);
-    }
+    // Closed stores are still browsable — ordering is blocked separately
+    // at POST /orders, which keeps assertStoreAcceptingOrders.
 
     const { data: productsData, error: productsError } = await supabase
       .from('products')
