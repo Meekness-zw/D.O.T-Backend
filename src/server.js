@@ -72,9 +72,9 @@ import {
 import {
   categorizeStoreWithAI,
   isAiCategorizationConfigured,
-  pickCategoryEmoji,
-  fallbackCategoryEmoji,
-  isEmojiIcon,
+  pickCategoryImage,
+  fallbackCategoryImage,
+  isImageIcon,
 } from './storeCategorizationAI.js';
 import crypto from 'crypto';
 import axios from 'axios';
@@ -691,25 +691,25 @@ app.get('/debug/pesepay', (req, res) => {
 // ─── Business Types ─────────────────────────────────────────────────────────
 
 // GET /business-types — public list of all business categories
-// Backfill emoji icons for categories created before picture icons
+// Backfill photo icons for categories created before picture icons
 // existed. Runs at most once at a time, in the background; results are
 // cached in the icon column so each category is only ever resolved once.
-let emojiBackfillRunning = false;
-async function backfillCategoryEmojis(rows) {
-  if (emojiBackfillRunning) return;
-  const missing = (rows || []).filter((r) => !isEmojiIcon(r.icon)).slice(0, 10);
+let imageBackfillRunning = false;
+async function backfillCategoryImages(rows) {
+  if (imageBackfillRunning) return;
+  const missing = (rows || []).filter((r) => !isImageIcon(r.icon)).slice(0, 10);
   if (missing.length === 0) return;
-  emojiBackfillRunning = true;
+  imageBackfillRunning = true;
   try {
     for (const row of missing) {
-      const emoji = await pickCategoryEmoji(row.name);
-      await supabase.from('business_types').update({ icon: emoji }).eq('id', row.id);
-      console.log(`[CategoryEmoji] ${row.name} → ${emoji}`);
+      const imageUrl = await pickCategoryImage(row.name);
+      await supabase.from('business_types').update({ icon: imageUrl }).eq('id', row.id);
+      console.log(`[CategoryImage] ${row.name} → ${imageUrl}`);
     }
   } catch (err) {
-    console.warn('[CategoryEmoji] backfill error:', err?.message);
+    console.warn('[CategoryImage] backfill error:', err?.message);
   } finally {
-    emojiBackfillRunning = false;
+    imageBackfillRunning = false;
   }
 }
 
@@ -722,14 +722,14 @@ app.get('/business-types', async (req, res) => {
       .order('name', { ascending: true });
     if (error) throw new Error(error.message);
 
-    // Serve immediately; emoji-fill legacy rows in the background and
+    // Serve immediately; photo-fill legacy rows in the background and
     // patch this response with fallbacks so the UI never shows blanks
-    backfillCategoryEmojis(data);
-    const withEmoji = (data || []).map((t) =>
-      isEmojiIcon(t.icon) ? t : { ...t, icon: fallbackCategoryEmoji(t.name) },
+    backfillCategoryImages(data);
+    const withImages = (data || []).map((t) =>
+      isImageIcon(t.icon) ? t : { ...t, icon: fallbackCategoryImage(t.name) },
     );
 
-    return res.json({ business_types: withEmoji });
+    return res.json({ business_types: withImages });
   } catch (err) {
     console.error('GET /business-types error:', err);
     return res.status(500).json({ error: 'Failed to load business types', details: err.message });
@@ -748,8 +748,8 @@ app.post('/business-types', requireAuth, async (req, res) => {
     // Derive a slug from the label
     const id = label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
 
-    // New category → AI picks its picture icon once; reused forever after
-    const resolvedIcon = isEmojiIcon(icon) ? icon : await pickCategoryEmoji(label);
+    // New category → AI picks its photo once; reused forever after
+    const resolvedIcon = isImageIcon(icon) ? icon : await pickCategoryImage(label);
 
     // Upsert so concurrent submissions of the same type are idempotent
     const { data, error } = await supabase

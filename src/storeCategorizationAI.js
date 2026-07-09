@@ -35,7 +35,7 @@ const CATEGORIZATION_SCHEMA = {
     },
     new_type_icon: {
       type: ['string', 'null'],
-      description: 'A single emoji that visually represents the new category, e.g. "🐾" for Pet Shop, "📚" for Bookstore, "💐" for Florist',
+      description: 'Always null — the category photo is assigned automatically after creation',
     },
   },
   required: ['match_type', 'business_type_id', 'new_type_name', 'new_type_icon'],
@@ -88,64 +88,97 @@ export async function categorizeStoreWithAI({ storeName, description, businessTy
   return JSON.parse(textBlock.text);
 }
 
-// ── Category emoji picking ─────────────────────────────────────
-// Categories display as picture-style emoji icons in the customer app.
-// Claude picks the emoji once per category; the result is cached in the
-// business_types.icon column so it is never fetched twice.
+// ── Category photo picking ─────────────────────────────────────
+// Categories display as small photos in the customer app. Each category
+// resolves to a photo from a curated library (same Unsplash CDN the app
+// already uses); Claude matches brand-new merchant-invented categories
+// to the best library photo. The chosen URL is cached in the
+// business_types.icon column so it is only ever resolved once.
 
-export function isEmojiIcon(value) {
-  return typeof value === 'string' && /\p{Extended_Pictographic}/u.test(value);
-}
+const IMG = (id) => `https://images.unsplash.com/${id}?w=200&h=200&fit=crop&q=80`;
 
-const EMOJI_FALLBACKS = [
-  ['bak', '🥐'], ['bread', '🍞'], ['pastr', '🥐'],
-  ['grocer', '🛒'], ['retail', '🛒'], ['supermarket', '🛒'],
-  ['pharma', '💊'], ['health', '💊'], ['clinic', '🩺'],
-  ['restaurant', '🍽️'], ['food', '🍽️'], ['fast', '🍔'], ['burger', '🍔'],
-  ['pizza', '🍕'], ['chicken', '🍗'], ['coffee', '☕'], ['cafe', '☕'],
-  ['liquor', '🍾'], ['bottle', '🍾'], ['bar', '🍺'], ['wine', '🍷'],
-  ['butcher', '🥩'], ['meat', '🥩'], ['fish', '🐟'],
-  ['fruit', '🥦'], ['veg', '🥦'], ['farm', '🌽'],
-  ['hardware', '🔧'], ['tool', '🔧'], ['build', '🧱'],
-  ['florist', '💐'], ['flower', '💐'], ['gift', '🎁'],
-  ['beauty', '💄'], ['salon', '💇'], ['barber', '💈'],
-  ['electronic', '📱'], ['phone', '📱'], ['computer', '💻'],
-  ['cloth', '👕'], ['fashion', '👗'], ['shoe', '👟'],
-  ['book', '📚'], ['stationer', '✏️'], ['pet', '🐾'],
-  ['ice cream', '🍦'], ['creamy', '🍦'], ['dessert', '🍰'], ['cake', '🍰'],
-  ['sushi', '🍣'], ['asian', '🍜'], ['dairy', '🥛'], ['snack', '🍿'],
+export const CATEGORY_IMAGE_LIBRARY = {
+  bakery: IMG('photo-1509440159596-0249088772ff'),
+  groceries: IMG('photo-1542838132-92c53300491e'),
+  pharmacy: IMG('photo-1471864190281-a93a3070b6de'),
+  restaurant: IMG('photo-1546069901-ba9599a7e63c'),
+  fast_food: IMG('photo-1550547660-d9450f859349'),
+  pizza: IMG('photo-1513104890138-7c749659a591'),
+  coffee: IMG('photo-1509042239860-f550ce710b93'),
+  liquor: IMG('photo-1510812431401-41d2bd2722f3'),
+  butchery: IMG('photo-1558030006-450675393462'),
+  fruits_veg: IMG('photo-1512621776951-a57141f2eefd'),
+  hardware: IMG('photo-1504148455328-c376907d081c'),
+  flowers: IMG('photo-1490750967868-88aa4486c946'),
+  gifts: IMG('photo-1549465220-1a8b9238cd48'),
+  electronics: IMG('photo-1511707171634-5f897ff02aa9'),
+  fashion: IMG('photo-1445205170230-053b83016050'),
+  shoes: IMG('photo-1542291026-7eec264c27ff'),
+  books: IMG('photo-1512820790803-83ca734da794'),
+  pets: IMG('photo-1450778869180-41d0601e046e'),
+  desserts: IMG('photo-1563805042-7684c019e1cb'),
+  cakes: IMG('photo-1578985545062-69928b1d9587'),
+  sushi: IMG('photo-1579871494447-9811cf80d66c'),
+  beauty: IMG('photo-1560066984-138dadb4c035'),
+  general_store: IMG('photo-1441986300917-64674bd600d8'),
+};
+
+const IMAGE_KEYWORDS = [
+  ['bak', 'bakery'], ['bread', 'bakery'], ['pastr', 'bakery'],
+  ['grocer', 'groceries'], ['retail', 'groceries'], ['supermarket', 'groceries'],
+  ['pharma', 'pharmacy'], ['health', 'pharmacy'], ['clinic', 'pharmacy'],
+  ['pizza', 'pizza'], ['fast', 'fast_food'], ['burger', 'fast_food'], ['chicken', 'fast_food'],
+  ['restaurant', 'restaurant'], ['food', 'restaurant'],
+  ['coffee', 'coffee'], ['cafe', 'coffee'],
+  ['liquor', 'liquor'], ['bottle', 'liquor'], ['bar', 'liquor'], ['wine', 'liquor'],
+  ['butcher', 'butchery'], ['meat', 'butchery'], ['fish', 'butchery'],
+  ['fruit', 'fruits_veg'], ['veg', 'fruits_veg'], ['farm', 'fruits_veg'],
+  ['hardware', 'hardware'], ['tool', 'hardware'], ['build', 'hardware'],
+  ['florist', 'flowers'], ['flower', 'flowers'], ['gift', 'gifts'],
+  ['beauty', 'beauty'], ['salon', 'beauty'], ['barber', 'beauty'],
+  ['electronic', 'electronics'], ['phone', 'electronics'], ['computer', 'electronics'],
+  ['cloth', 'fashion'], ['fashion', 'fashion'], ['shoe', 'shoes'],
+  ['book', 'books'], ['stationer', 'books'], ['pet', 'pets'],
+  ['ice cream', 'desserts'], ['creamy', 'desserts'], ['dessert', 'desserts'], ['cake', 'cakes'],
+  ['sushi', 'sushi'], ['asian', 'sushi'],
 ];
 
-export function fallbackCategoryEmoji(name) {
+export function isImageIcon(value) {
+  return typeof value === 'string' && /^https?:\/\//.test(value);
+}
+
+export function fallbackCategoryImage(name) {
   const lower = String(name || '').toLowerCase();
-  for (const [keyword, emoji] of EMOJI_FALLBACKS) {
-    if (lower.includes(keyword)) return emoji;
+  for (const [keyword, key] of IMAGE_KEYWORDS) {
+    if (lower.includes(keyword)) return CATEGORY_IMAGE_LIBRARY[key];
   }
-  return '🛍️';
+  return CATEGORY_IMAGE_LIBRARY.general_store;
 }
 
 /**
- * One emoji for a category name. Uses Claude when configured (handles
- * anything merchants invent), keyword fallbacks otherwise. Never throws.
+ * Photo URL for a category name. Claude matches new/unusual categories
+ * to the closest library photo when configured; keyword fallbacks
+ * otherwise. Never throws.
  */
-export async function pickCategoryEmoji(name) {
+export async function pickCategoryImage(name) {
   const client = getAnthropicClient();
-  if (!client) return fallbackCategoryEmoji(name);
+  if (!client) return fallbackCategoryImage(name);
   try {
+    const keys = Object.keys(CATEGORY_IMAGE_LIBRARY);
     const response = await client.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 20,
       system:
-        'You pick one emoji to visually represent a store category in a delivery app. ' +
-        'Respond with ONLY the single most fitting emoji — no words, no punctuation.',
+        'You match a store category to the best photo key from a fixed list for a delivery app. ' +
+        `Available keys: ${keys.join(', ')}. ` +
+        'Respond with ONLY one key from the list, nothing else.',
       messages: [{ role: 'user', content: `Category: ${name}` }],
     });
-    const text = response.content.find((b) => b.type === 'text')?.text?.trim() || '';
-    // Take the first emoji grapheme only
-    const match = text.match(/\p{Extended_Pictographic}(️)?/u);
-    return match ? match[0] : fallbackCategoryEmoji(name);
+    const text = response.content.find((b) => b.type === 'text')?.text?.trim().toLowerCase() || '';
+    const key = keys.find((k) => text === k || text.includes(k));
+    return key ? CATEGORY_IMAGE_LIBRARY[key] : fallbackCategoryImage(name);
   } catch (err) {
-    console.warn('[CategoryEmoji] AI pick failed for', name, '-', err?.message);
-    return fallbackCategoryEmoji(name);
+    console.warn('[CategoryImage] AI pick failed for', name, '-', err?.message);
+    return fallbackCategoryImage(name);
   }
 }
