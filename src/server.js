@@ -69,7 +69,13 @@ import {
   computeCourierDeliveryPayoutUsd,
   getOtdPlatformServiceChargeUsd,
 } from './orderPaymentSplit.js';
-import { categorizeStoreWithAI, isAiCategorizationConfigured } from './storeCategorizationAI.js';
+import {
+  categorizeStoreWithAI,
+  isAiCategorizationConfigured,
+  pickCategoryEmoji,
+  fallbackCategoryEmoji,
+  isEmojiIcon,
+} from './storeCategorizationAI.js';
 import crypto from 'crypto';
 import axios from 'axios';
 
@@ -685,6 +691,28 @@ app.get('/debug/pesepay', (req, res) => {
 // ─── Business Types ─────────────────────────────────────────────────────────
 
 // GET /business-types — public list of all business categories
+// Backfill emoji icons for categories created before picture icons
+// existed. Runs at most once at a time, in the background; results are
+// cached in the icon column so each category is only ever resolved once.
+let emojiBackfillRunning = false;
+async function backfillCategoryEmojis(rows) {
+  if (emojiBackfillRunning) return;
+  const missing = (rows || []).filter((r) => !isEmojiIcon(r.icon)).slice(0, 10);
+  if (missing.length === 0) return;
+  emojiBackfillRunning = true;
+  try {
+    for (const row of missing) {
+      const emoji = await pickCategoryEmoji(row.name);
+      await supabase.from('business_types').update({ icon: emoji }).eq('id', row.id);
+      console.log(`[CategoryEmoji] ${row.name} → ${emoji}`);
+    }
+  } catch (err) {
+    console.warn('[CategoryEmoji] backfill error:', err?.message);
+  } finally {
+    emojiBackfillRunning = false;
+  }
+}
+
 app.get('/business-types', async (req, res) => {
   try {
     if (!supabaseAdmin) throw new Error('Server not configured');
@@ -693,7 +721,15 @@ app.get('/business-types', async (req, res) => {
       .select('id, name, icon')
       .order('name', { ascending: true });
     if (error) throw new Error(error.message);
-    return res.json({ business_types: data || [] });
+
+    // Serve immediately; emoji-fill legacy rows in the background and
+    // patch this response with fallbacks so the UI never shows blanks
+    backfillCategoryEmojis(data);
+    const withEmoji = (data || []).map((t) =>
+      isEmojiIcon(t.icon) ? t : { ...t, icon: fallbackCategoryEmoji(t.name) },
+    );
+
+    return res.json({ business_types: withEmoji });
   } catch (err) {
     console.error('GET /business-types error:', err);
     return res.status(500).json({ error: 'Failed to load business types', details: err.message });
@@ -712,10 +748,13 @@ app.post('/business-types', requireAuth, async (req, res) => {
     // Derive a slug from the label
     const id = label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
 
+    // New category → AI picks its picture icon once; reused forever after
+    const resolvedIcon = isEmojiIcon(icon) ? icon : await pickCategoryEmoji(label);
+
     // Upsert so concurrent submissions of the same type are idempotent
     const { data, error } = await supabase
       .from('business_types')
-      .upsert({ id, name: label, icon: icon || 'shopping-bag', is_default: false }, { onConflict: 'id' })
+      .upsert({ id, name: label, icon: resolvedIcon, is_default: false }, { onConflict: 'id' })
       .select('id, name, icon, is_default')
       .single();
 
