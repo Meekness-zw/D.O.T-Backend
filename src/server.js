@@ -397,14 +397,47 @@ app.post('/auth/firebase-verify', async (req, res) => {
   }
 });
 
+// ── International phone handling ───────────────────────────────
+// OTP SMS must work for any country, not just Zimbabwe. Normalize to
+// strict E.164 (+ and 7–15 digits) so the same key is used when the
+// code is sent and when it is verified, regardless of how the number
+// was typed.
+function normalizeE164(phone) {
+  const cleaned = String(phone || '').replace(/[\s\-().]/g, '');
+  if (!/^\+[1-9]\d{6,14}$/.test(cleaned)) return null;
+  return cleaned;
+}
+
+// Translate raw Dexatel errors into something a user can act on.
+function friendlySmsError(smsErr) {
+  const detail = JSON.stringify(smsErr?.response?.data ?? smsErr?.message ?? '');
+  if (/invalid recipient/i.test(detail)) {
+    return 'This phone number cannot receive our SMS. Double-check the number and country code.';
+  }
+  if (/sender/i.test(detail)) {
+    return 'SMS delivery is not yet enabled for this country. Please contact support.';
+  }
+  if (/balance|credit/i.test(detail)) {
+    return 'SMS delivery is temporarily unavailable. Please try again later.';
+  }
+  return 'We could not send the SMS. Please check the number and try again.';
+}
+
 // In-memory OTP store: phone -> { code, expiresAt, name, role, password }
 const otpStore = new Map();
 
 // POST /auth/send-otp { phone, name, role, password }
 app.post('/auth/send-otp', async (req, res) => {
   try {
-    const { phone, name, role, password } = req.body;
+    const { name, role, password } = req.body;
+    const phone = normalizeE164(req.body?.phone);
     if (!phone || !role || !password) {
+      if (req.body?.phone && !phone) {
+        return res.status(400).json({
+          error: 'Invalid phone number',
+          details: 'Enter the number with its country code, e.g. +263 77 123 4567 or +44 7911 123456.',
+        });
+      }
       const missing = ['phone', 'role', 'password'].filter(f => !req.body[f]);
       return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
     }
@@ -438,8 +471,11 @@ app.post('/auth/send-otp', async (req, res) => {
     } catch (smsErr) {
       const status = smsErr.response?.status;
       const detail = JSON.stringify(smsErr.response?.data ?? smsErr.message);
-      console.error(`Dexatel error [${status}]:`, detail);
-      return res.status(502).json({ error: 'Failed to send verification code', details: detail });
+      console.error(`Dexatel error [${status}] to ${phone}:`, detail);
+      return res.status(502).json({
+        error: 'Failed to send verification code',
+        details: friendlySmsError(smsErr),
+      });
     }
 
     return res.status(200).json({ success: true });
@@ -452,7 +488,9 @@ app.post('/auth/send-otp', async (req, res) => {
 // POST /auth/verify-otp { phone, code, isSignUp }
 app.post('/auth/verify-otp', async (req, res) => {
   try {
-    const { phone, code, isSignUp } = req.body;
+    const { code, isSignUp } = req.body;
+    // Same normalization as send-otp so the store key always matches
+    const phone = normalizeE164(req.body?.phone) || req.body?.phone;
     if (!phone || !code) {
       return res.status(400).json({ error: 'phone and code are required' });
     }
@@ -540,7 +578,7 @@ app.post('/auth/forgot-password', async (req, res) => {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone number is required' });
 
-    const normalised = phone.replace(/[\s\-().]/g, '');
+    const normalised = normalizeE164(phone) || phone.replace(/[\s\-().]/g, '');
 
     // Only send a code if the account actually exists
     const existing = await checkPhoneRegistered(normalised);
@@ -567,7 +605,7 @@ app.post('/auth/forgot-password', async (req, res) => {
     } catch (smsErr) {
       const detail = JSON.stringify(smsErr.response?.data ?? smsErr.message);
       console.error('forgot-password SMS error:', detail);
-      return res.status(502).json({ error: 'Failed to send reset code', details: detail });
+      return res.status(502).json({ error: 'Failed to send reset code', details: friendlySmsError(smsErr) });
     }
 
     return res.status(200).json({ success: true });
@@ -588,7 +626,7 @@ app.post('/auth/reset-password', async (req, res) => {
       return res.status(400).json({ error: 'Password must be at least 6 characters' });
     }
 
-    const normalised = phone.replace(/[\s\-().]/g, '');
+    const normalised = normalizeE164(phone) || phone.replace(/[\s\-().]/g, '');
 
     const entry = resetOtpStore.get(normalised);
     if (!entry) {
