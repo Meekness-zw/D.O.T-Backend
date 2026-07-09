@@ -74,7 +74,7 @@ import {
   isAiCategorizationConfigured,
   pickCategoryImage,
   fallbackCategoryImage,
-  isImageIcon,
+  isCartoonIcon,
 } from './storeCategorizationAI.js';
 import crypto from 'crypto';
 import axios from 'axios';
@@ -691,13 +691,13 @@ app.get('/debug/pesepay', (req, res) => {
 // ─── Business Types ─────────────────────────────────────────────────────────
 
 // GET /business-types — public list of all business categories
-// Backfill photo icons for categories created before picture icons
+// Backfill sticker icons for categories created before picture icons
 // existed. Runs at most once at a time, in the background; results are
 // cached in the icon column so each category is only ever resolved once.
 let imageBackfillRunning = false;
 async function backfillCategoryImages(rows) {
   if (imageBackfillRunning) return;
-  const missing = (rows || []).filter((r) => !isImageIcon(r.icon)).slice(0, 10);
+  const missing = (rows || []).filter((r) => !isCartoonIcon(r.icon)).slice(0, 10);
   if (missing.length === 0) return;
   imageBackfillRunning = true;
   try {
@@ -722,11 +722,11 @@ app.get('/business-types', async (req, res) => {
       .order('name', { ascending: true });
     if (error) throw new Error(error.message);
 
-    // Serve immediately; photo-fill legacy rows in the background and
+    // Serve immediately; sticker-fill legacy rows in the background and
     // patch this response with fallbacks so the UI never shows blanks
     backfillCategoryImages(data);
     const withImages = (data || []).map((t) =>
-      isImageIcon(t.icon) ? t : { ...t, icon: fallbackCategoryImage(t.name) },
+      isCartoonIcon(t.icon) ? t : { ...t, icon: fallbackCategoryImage(t.name) },
     );
 
     return res.json({ business_types: withImages });
@@ -748,8 +748,8 @@ app.post('/business-types', requireAuth, async (req, res) => {
     // Derive a slug from the label
     const id = label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
 
-    // New category → AI picks its photo once; reused forever after
-    const resolvedIcon = isImageIcon(icon) ? icon : await pickCategoryImage(label);
+    // New category → AI picks its sticker once; reused forever after
+    const resolvedIcon = isCartoonIcon(icon) ? icon : await pickCategoryImage(label);
 
     // Upsert so concurrent submissions of the same type are idempotent
     const { data, error } = await supabase

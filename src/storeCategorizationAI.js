@@ -88,49 +88,55 @@ export async function categorizeStoreWithAI({ storeName, description, businessTy
   return JSON.parse(textBlock.text);
 }
 
-// ── Category photo picking ─────────────────────────────────────
-// Categories display as small photos in the customer app. Each category
-// resolves to a photo from a curated library (same Unsplash CDN the app
-// already uses); Claude matches brand-new merchant-invented categories
-// to the best library photo. The chosen URL is cached in the
-// business_types.icon column so it is only ever resolved once.
+// ── Category sticker picking ───────────────────────────────────
+// Categories display as 3D cartoon stickers in the customer app. Each
+// category resolves to a sticker from a curated library; Claude matches
+// brand-new merchant-invented categories to the best one. The chosen
+// URL is cached in business_types.icon so it is only resolved once.
 
-const IMG = (id) => `https://images.unsplash.com/${id}?w=200&h=200&fit=crop&q=80`;
+const CDN = 'https://cdn.jsdelivr.net/gh/microsoft/fluentui-emoji@main/assets';
+const IMG = (path) => `${CDN}/${path.split('/').map(encodeURIComponent).join('/')}`;
 
+// 3D cartoon stickers (transparent background) — Microsoft Fluent emoji,
+// MIT licensed. Every URL verified live.
 export const CATEGORY_IMAGE_LIBRARY = {
-  bakery: IMG('photo-1509440159596-0249088772ff'),
-  groceries: IMG('photo-1542838132-92c53300491e'),
-  pharmacy: IMG('photo-1471864190281-a93a3070b6de'),
-  restaurant: IMG('photo-1546069901-ba9599a7e63c'),
-  fast_food: IMG('photo-1550547660-d9450f859349'),
-  pizza: IMG('photo-1513104890138-7c749659a591'),
-  coffee: IMG('photo-1509042239860-f550ce710b93'),
-  liquor: IMG('photo-1510812431401-41d2bd2722f3'),
-  butchery: IMG('photo-1558030006-450675393462'),
-  fruits_veg: IMG('photo-1512621776951-a57141f2eefd'),
-  hardware: IMG('photo-1504148455328-c376907d081c'),
-  flowers: IMG('photo-1490750967868-88aa4486c946'),
-  gifts: IMG('photo-1549465220-1a8b9238cd48'),
-  electronics: IMG('photo-1511707171634-5f897ff02aa9'),
-  fashion: IMG('photo-1445205170230-053b83016050'),
-  shoes: IMG('photo-1542291026-7eec264c27ff'),
-  books: IMG('photo-1512820790803-83ca734da794'),
-  pets: IMG('photo-1450778869180-41d0601e046e'),
-  desserts: IMG('photo-1563805042-7684c019e1cb'),
-  cakes: IMG('photo-1578985545062-69928b1d9587'),
-  sushi: IMG('photo-1579871494447-9811cf80d66c'),
-  beauty: IMG('photo-1560066984-138dadb4c035'),
-  general_store: IMG('photo-1441986300917-64674bd600d8'),
+  bakery: IMG('Croissant/3D/croissant_3d.png'),
+  bread: IMG('Bread/3D/bread_3d.png'),
+  groceries: IMG('Shopping cart/3D/shopping_cart_3d.png'),
+  pharmacy: IMG('Pill/3D/pill_3d.png'),
+  restaurant: IMG('Fork and knife with plate/3D/fork_and_knife_with_plate_3d.png'),
+  fast_food: IMG('Hamburger/3D/hamburger_3d.png'),
+  pizza: IMG('Pizza/3D/pizza_3d.png'),
+  chicken: IMG('Poultry leg/3D/poultry_leg_3d.png'),
+  coffee: IMG('Hot beverage/3D/hot_beverage_3d.png'),
+  liquor: IMG('Bottle with popping cork/3D/bottle_with_popping_cork_3d.png'),
+  wine: IMG('Wine glass/3D/wine_glass_3d.png'),
+  butchery: IMG('Cut of meat/3D/cut_of_meat_3d.png'),
+  fruits_veg: IMG('Broccoli/3D/broccoli_3d.png'),
+  hardware: IMG('Hammer and wrench/3D/hammer_and_wrench_3d.png'),
+  flowers: IMG('Bouquet/3D/bouquet_3d.png'),
+  gifts: IMG('Wrapped gift/3D/wrapped_gift_3d.png'),
+  electronics: IMG('Mobile phone/3D/mobile_phone_3d.png'),
+  fashion: IMG('T-shirt/3D/t-shirt_3d.png'),
+  shoes: IMG('Running shoe/3D/running_shoe_3d.png'),
+  books: IMG('Books/3D/books_3d.png'),
+  pets: IMG('Paw prints/3D/paw_prints_3d.png'),
+  desserts: IMG('Soft ice cream/3D/soft_ice_cream_3d.png'),
+  cakes: IMG('Shortcake/3D/shortcake_3d.png'),
+  sushi: IMG('Sushi/3D/sushi_3d.png'),
+  asian: IMG('Steaming bowl/3D/steaming_bowl_3d.png'),
+  beauty: IMG('Lipstick/3D/lipstick_3d.png'),
+  general_store: IMG('Shopping bags/3D/shopping_bags_3d.png'),
 };
 
 const IMAGE_KEYWORDS = [
-  ['bak', 'bakery'], ['bread', 'bakery'], ['pastr', 'bakery'],
+  ['bak', 'bakery'], ['bread', 'bread'], ['pastr', 'bakery'],
   ['grocer', 'groceries'], ['retail', 'groceries'], ['supermarket', 'groceries'],
   ['pharma', 'pharmacy'], ['health', 'pharmacy'], ['clinic', 'pharmacy'],
-  ['pizza', 'pizza'], ['fast', 'fast_food'], ['burger', 'fast_food'], ['chicken', 'fast_food'],
+  ['pizza', 'pizza'], ['fast', 'fast_food'], ['burger', 'fast_food'], ['chicken', 'chicken'],
   ['restaurant', 'restaurant'], ['food', 'restaurant'],
   ['coffee', 'coffee'], ['cafe', 'coffee'],
-  ['liquor', 'liquor'], ['bottle', 'liquor'], ['bar', 'liquor'], ['wine', 'liquor'],
+  ['liquor', 'liquor'], ['bottle', 'liquor'], ['bar', 'wine'], ['wine', 'wine'],
   ['butcher', 'butchery'], ['meat', 'butchery'], ['fish', 'butchery'],
   ['fruit', 'fruits_veg'], ['veg', 'fruits_veg'], ['farm', 'fruits_veg'],
   ['hardware', 'hardware'], ['tool', 'hardware'], ['build', 'hardware'],
@@ -140,11 +146,16 @@ const IMAGE_KEYWORDS = [
   ['cloth', 'fashion'], ['fashion', 'fashion'], ['shoe', 'shoes'],
   ['book', 'books'], ['stationer', 'books'], ['pet', 'pets'],
   ['ice cream', 'desserts'], ['creamy', 'desserts'], ['dessert', 'desserts'], ['cake', 'cakes'],
-  ['sushi', 'sushi'], ['asian', 'sushi'],
+  ['sushi', 'sushi'], ['asian', 'asian'],
 ];
 
 export function isImageIcon(value) {
   return typeof value === 'string' && /^https?:\/\//.test(value);
+}
+
+/** Resolved = points at the cartoon sticker CDN (old photo URLs re-pick). */
+export function isCartoonIcon(value) {
+  return typeof value === 'string' && value.startsWith(CDN);
 }
 
 export function fallbackCategoryImage(name) {
@@ -156,9 +167,9 @@ export function fallbackCategoryImage(name) {
 }
 
 /**
- * Photo URL for a category name. Claude matches new/unusual categories
- * to the closest library photo when configured; keyword fallbacks
- * otherwise. Never throws.
+ * Sticker URL for a category name. Claude matches new/unusual
+ * categories to the closest library sticker when configured; keyword
+ * fallbacks otherwise. Never throws.
  */
 export async function pickCategoryImage(name) {
   const client = getAnthropicClient();
@@ -169,7 +180,7 @@ export async function pickCategoryImage(name) {
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 20,
       system:
-        'You match a store category to the best photo key from a fixed list for a delivery app. ' +
+        'You match a store category to the best cartoon icon key from a fixed list for a delivery app. ' +
         `Available keys: ${keys.join(', ')}. ` +
         'Respond with ONLY one key from the list, nothing else.',
       messages: [{ role: 'user', content: `Category: ${name}` }],
