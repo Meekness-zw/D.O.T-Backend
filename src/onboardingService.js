@@ -1,5 +1,6 @@
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { getSuggestedProductCategoryNames } from './storeCategorySuggestions.js';
+import { verifyStoreCategory } from './storeCategorizationAI.js';
 
 const supabase = supabaseAdmin;
 
@@ -472,6 +473,25 @@ export async function upsertMerchantOnboarding({
       .single();
     if (storeInsertError) throw new Error(storeInsertError.message || 'Failed to create store');
     storeId = inserted.id;
+  }
+
+  // Double-check the merchant's self-picked business type against what the
+  // store's name/description actually say it sells, so a wrong pick never
+  // surfaces as a customer-facing category mistake (never blocks onboarding).
+  try {
+    const { data: types } = await supabase.from('business_types').select('name');
+    const categoryNames = (types || []).map((t) => t.name);
+    const verified = await verifyStoreCategory({
+      storeName: String(storeName).trim(),
+      description: description ? String(description).trim() : '',
+      declaredType: String(businessType).trim(),
+      categoryNames,
+    });
+    if (verified) {
+      await supabase.from('stores').update({ category_override: verified }).eq('id', storeId);
+    }
+  } catch (err) {
+    console.warn('[CategoryVerify] onboarding verification skipped:', err?.message);
   }
 
   if (storeLogoBase64) {

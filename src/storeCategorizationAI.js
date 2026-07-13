@@ -88,106 +88,134 @@ export async function categorizeStoreWithAI({ storeName, description, businessTy
   return JSON.parse(textBlock.text);
 }
 
-// ── Category sticker picking ───────────────────────────────────
-// Categories display as 3D cartoon stickers in the customer app. Each
-// category resolves to a sticker from a curated library; Claude matches
-// brand-new merchant-invented categories to the best one. The chosen
-// URL is cached in business_types.icon so it is only resolved once.
+/**
+ * Double-checks a merchant's self-declared category against what the store
+ * actually is, using its name + description. Merchants sometimes pick the
+ * wrong category by mistake (e.g. a butcher selecting "Grocery / Retail");
+ * this catches that so it never surfaces as a customer-facing mistake.
+ *
+ * @param {Object} params
+ * @param {string} params.storeName
+ * @param {string} [params.description]
+ * @param {string} [params.declaredType] - the merchant-selected category name
+ * @param {string[]} params.categoryNames - all valid business_types.name values
+ * @returns {Promise<string|null>} the best-fit category name, or null if
+ *   verification couldn't run (caller should keep the declared type as-is)
+ */
+export async function verifyStoreCategory({ storeName, description, declaredType, categoryNames }) {
+  const client = getAnthropicClient();
+  const names = (categoryNames || []).filter(Boolean);
+  if (!client || names.length === 0) return null;
+  try {
+    const response = await client.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 30,
+      system:
+        'You double-check store categorization for a delivery marketplace. Merchants sometimes pick the wrong ' +
+        'category by mistake, and that mistake must never be shown to customers. ' +
+        `Given a store's name, description, and the category the merchant selected, pick the single best-fit ` +
+        `category from this exact list: ${names.join(', ')}. ` +
+        'Trust what the store name and description say it actually sells over the merchant-selected category ' +
+        'when they clearly conflict (e.g. a store named "City Butchery" selling meat, selected as "Grocery / Retail", ' +
+        'should be corrected to "Butchery" if that option exists). ' +
+        'If the merchant-selected category is already reasonable, respond with it unchanged. ' +
+        'Respond with ONLY the exact category name from the list, nothing else.',
+      messages: [
+        {
+          role: 'user',
+          content:
+            `Store name: ${storeName}\n` +
+            `Description: ${description || '(none provided)'}\n` +
+            `Merchant-selected category: ${declaredType || '(none)'}`,
+        },
+      ],
+    });
+    const text = response.content.find((b) => b.type === 'text')?.text?.trim() || '';
+    return names.find((n) => n.toLowerCase() === text.toLowerCase()) || null;
+  } catch (err) {
+    console.warn('[CategoryVerify] failed for', storeName, '-', err?.message);
+    return null;
+  }
+}
 
-const CDN = 'https://cdn.jsdelivr.net/gh/microsoft/fluentui-emoji@main/assets';
-const IMG = (path) => `${CDN}/${path.split('/').map(encodeURIComponent).join('/')}`;
+// ── Category image picking ─────────────────────────────────────
+// Categories display as the brand's bundled 3D images in the app. The
+// backend stores a compact "dot:<key>" reference per business type;
+// Claude matches brand-new merchant-invented categories to the best
+// key once, cached in business_types.icon forever after.
 
-// 3D cartoon stickers (transparent background) — Microsoft Fluent emoji,
-// MIT licensed. Every URL verified live.
-export const CATEGORY_IMAGE_LIBRARY = {
-  bakery: IMG('Croissant/3D/croissant_3d.png'),
-  bread: IMG('Bread/3D/bread_3d.png'),
-  groceries: IMG('Shopping cart/3D/shopping_cart_3d.png'),
-  pharmacy: IMG('Pill/3D/pill_3d.png'),
-  restaurant: IMG('Fork and knife with plate/3D/fork_and_knife_with_plate_3d.png'),
-  fast_food: IMG('Hamburger/3D/hamburger_3d.png'),
-  pizza: IMG('Pizza/3D/pizza_3d.png'),
-  chicken: IMG('Poultry leg/3D/poultry_leg_3d.png'),
-  coffee: IMG('Hot beverage/3D/hot_beverage_3d.png'),
-  liquor: IMG('Bottle with popping cork/3D/bottle_with_popping_cork_3d.png'),
-  wine: IMG('Wine glass/3D/wine_glass_3d.png'),
-  butchery: IMG('Cut of meat/3D/cut_of_meat_3d.png'),
-  fruits_veg: IMG('Broccoli/3D/broccoli_3d.png'),
-  hardware: IMG('Hammer and wrench/3D/hammer_and_wrench_3d.png'),
-  flowers: IMG('Bouquet/3D/bouquet_3d.png'),
-  gifts: IMG('Wrapped gift/3D/wrapped_gift_3d.png'),
-  electronics: IMG('Mobile phone/3D/mobile_phone_3d.png'),
-  fashion: IMG('T-shirt/3D/t-shirt_3d.png'),
-  shoes: IMG('Running shoe/3D/running_shoe_3d.png'),
-  books: IMG('Books/3D/books_3d.png'),
-  pets: IMG('Paw prints/3D/paw_prints_3d.png'),
-  desserts: IMG('Soft ice cream/3D/soft_ice_cream_3d.png'),
-  cakes: IMG('Shortcake/3D/shortcake_3d.png'),
-  sushi: IMG('Sushi/3D/sushi_3d.png'),
-  asian: IMG('Steaming bowl/3D/steaming_bowl_3d.png'),
-  beauty: IMG('Lipstick/3D/lipstick_3d.png'),
-  general_store: IMG('Shopping bags/3D/shopping_bags_3d.png'),
-};
+export const CATEGORY_ICON_KEYS = [
+  'bakery', 'groceries', 'pharmacy', 'fast_food', 'pizza', 'chicken',
+  'butchery', 'liquor', 'wine', 'flowers', 'hardware', 'fruits_veg',
+  'snacks', 'desserts', 'sushi', 'asian', 'mexican', 'tobacco', 'beauty',
+  'all',
+];
 
 const IMAGE_KEYWORDS = [
-  ['bak', 'bakery'], ['bread', 'bread'], ['pastr', 'bakery'],
-  ['grocer', 'groceries'], ['retail', 'groceries'], ['supermarket', 'groceries'],
-  ['pharma', 'pharmacy'], ['health', 'pharmacy'], ['clinic', 'pharmacy'],
-  ['pizza', 'pizza'], ['fast', 'fast_food'], ['burger', 'fast_food'], ['chicken', 'chicken'],
-  ['restaurant', 'restaurant'], ['food', 'restaurant'],
-  ['coffee', 'coffee'], ['cafe', 'coffee'],
-  ['liquor', 'liquor'], ['bottle', 'liquor'], ['bar', 'wine'], ['wine', 'wine'],
+  // Specific first — generic terms like grocery/retail/food match last
   ['butcher', 'butchery'], ['meat', 'butchery'], ['fish', 'butchery'],
+  ['bak', 'bakery'], ['bread', 'bakery'], ['pastr', 'bakery'],
+  ['pharma', 'pharmacy'], ['clinic', 'pharmacy'],
+  ['pizza', 'pizza'], ['burger', 'fast_food'], ['chicken', 'chicken'],
+  ['coffee', 'bakery'], ['cafe', 'bakery'],
+  ['liquor', 'liquor'], ['bottle', 'liquor'], ['wine', 'wine'], ['bar', 'wine'],
   ['fruit', 'fruits_veg'], ['veg', 'fruits_veg'], ['farm', 'fruits_veg'],
   ['hardware', 'hardware'], ['tool', 'hardware'], ['build', 'hardware'],
-  ['florist', 'flowers'], ['flower', 'flowers'], ['gift', 'gifts'],
-  ['beauty', 'beauty'], ['salon', 'beauty'], ['barber', 'beauty'],
-  ['electronic', 'electronics'], ['phone', 'electronics'], ['computer', 'electronics'],
-  ['cloth', 'fashion'], ['fashion', 'fashion'], ['shoe', 'shoes'],
-  ['book', 'books'], ['stationer', 'books'], ['pet', 'pets'],
-  ['ice cream', 'desserts'], ['creamy', 'desserts'], ['dessert', 'desserts'], ['cake', 'cakes'],
-  ['sushi', 'sushi'], ['asian', 'asian'],
+  ['florist', 'flowers'], ['flower', 'flowers'], ['gift', 'flowers'],
+  ['beauty', 'beauty'], ['salon', 'beauty'], ['toiletr', 'beauty'], ['cosmetic', 'beauty'],
+  ['snack', 'snacks'], ['chips', 'snacks'],
+  ['ice cream', 'desserts'], ['creamy', 'desserts'], ['dessert', 'desserts'], ['cake', 'desserts'],
+  ['sushi', 'sushi'], ['asian', 'asian'], ['noodle', 'asian'],
+  ['mexican', 'mexican'], ['taco', 'mexican'],
+  ['tobacco', 'tobacco'], ['smoke', 'tobacco'], ['vape', 'tobacco'], ['hookah', 'tobacco'],
+  ['health', 'pharmacy'],
+  ['grocer', 'groceries'], ['retail', 'groceries'], ['supermarket', 'groceries'],
+  ['fast', 'fast_food'], ['restaurant', 'fast_food'], ['food', 'fast_food'],
 ];
 
 export function isImageIcon(value) {
   return typeof value === 'string' && /^https?:\/\//.test(value);
 }
 
-/** Resolved = points at the cartoon sticker CDN (old photo URLs re-pick). */
+/** Resolved = a valid "dot:<key>" reference (URLs and legacy re-pick). */
 export function isCartoonIcon(value) {
-  return typeof value === 'string' && value.startsWith(CDN);
+  return (
+    typeof value === 'string' &&
+    value.startsWith('dot:') &&
+    CATEGORY_ICON_KEYS.includes(value.slice(4))
+  );
 }
 
 export function fallbackCategoryImage(name) {
   const lower = String(name || '').toLowerCase();
   for (const [keyword, key] of IMAGE_KEYWORDS) {
-    if (lower.includes(keyword)) return CATEGORY_IMAGE_LIBRARY[key];
+    if (lower.includes(keyword)) return 'dot:' + key;
   }
-  return CATEGORY_IMAGE_LIBRARY.general_store;
+  return 'dot:all';
 }
 
 /**
- * Sticker URL for a category name. Claude matches new/unusual
- * categories to the closest library sticker when configured; keyword
+ * "dot:<key>" reference for a category name. Claude matches new or
+ * unusual categories to the closest key when configured; keyword
  * fallbacks otherwise. Never throws.
  */
 export async function pickCategoryImage(name) {
   const client = getAnthropicClient();
   if (!client) return fallbackCategoryImage(name);
   try {
-    const keys = Object.keys(CATEGORY_IMAGE_LIBRARY);
+    const keys = CATEGORY_ICON_KEYS.filter((k) => k !== 'all');
     const response = await client.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 20,
       system:
-        'You match a store category to the best cartoon icon key from a fixed list for a delivery app. ' +
+        'You match a store category to the best icon key from a fixed list for a delivery app. ' +
         `Available keys: ${keys.join(', ')}. ` +
-        'Respond with ONLY one key from the list, nothing else.',
+        "Respond with ONLY one key from the list, or 'all' if nothing fits.",
       messages: [{ role: 'user', content: `Category: ${name}` }],
     });
     const text = response.content.find((b) => b.type === 'text')?.text?.trim().toLowerCase() || '';
-    const key = keys.find((k) => text === k || text.includes(k));
-    return key ? CATEGORY_IMAGE_LIBRARY[key] : fallbackCategoryImage(name);
+    const key = CATEGORY_ICON_KEYS.find((k) => text === k || text.includes(k));
+    return key ? 'dot:' + key : fallbackCategoryImage(name);
   } catch (err) {
     console.warn('[CategoryImage] AI pick failed for', name, '-', err?.message);
     return fallbackCategoryImage(name);

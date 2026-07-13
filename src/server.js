@@ -68,6 +68,8 @@ import {
   recordCourierDeliveryEarnings,
   computeCourierDeliveryPayoutUsd,
   getOtdPlatformServiceChargeUsd,
+  applyPlatformMarkup,
+  getWeeklyCommissionRate,
 } from './orderPaymentSplit.js';
 import {
   categorizeStoreWithAI,
@@ -75,6 +77,7 @@ import {
   pickCategoryImage,
   fallbackCategoryImage,
   isCartoonIcon,
+  verifyStoreCategory,
 } from './storeCategorizationAI.js';
 import crypto from 'crypto';
 import axios from 'axios';
@@ -178,12 +181,19 @@ function isRushHour(date = new Date()) {
   return weekday && ((localHour >= 7 && localHour < 9) || (localHour >= 17 && localHour < 19));
 }
 
+/**
+ * Delivery fee: $4.99 for any job within 5 km of the pickup, then
+ * $0.50 for every kilometer (started) beyond that.
+ * The $4.99 base splits $4.00 to the courier and $0.99 to DOT — the
+ * platform's ~20% cut on delivery (see computeCourierDeliveryPayoutUsd).
+ */
 function calculateDeliveryFee(distanceKm) {
-  const BASE = 5.00;
-  const BASE_KM = 10;
-  if (distanceKm <= BASE_KM) return BASE;
-  const rate = isRushHour() ? 0.55 : 0.50;
-  return Math.round((BASE + (distanceKm - BASE_KM) * rate) * 100) / 100;
+  const BASE = 4.99;
+  const BASE_KM = 5;
+  const d = Number(distanceKm) || 0;
+  if (d <= BASE_KM) return BASE;
+  const extraKm = Math.ceil(d - BASE_KM);
+  return Math.round((BASE + extraKm * 0.5) * 100) / 100;
 }
 
 // ─── Product variants (option groups + options) ────────────────────────────
@@ -859,6 +869,38 @@ app.post('/business-types/suggest', requireAuth, async (req, res) => {
   }
 });
 
+// Backfill AI category verification for stores that predate the check, or
+// haven't been resolved yet. Runs at most once at a time, in the background;
+// result is cached in category_override forever once resolved (same pattern
+// as the business_types icon backfill above).
+let storeCategoryBackfillRunning = false;
+async function backfillStoreCategories(rows) {
+  if (storeCategoryBackfillRunning) return;
+  const missing = (rows || []).filter((r) => !r.category_override).slice(0, 10);
+  if (missing.length === 0) return;
+  storeCategoryBackfillRunning = true;
+  try {
+    const { data: types } = await supabase.from('business_types').select('name');
+    const categoryNames = (types || []).map((t) => t.name);
+    for (const row of missing) {
+      const verified = await verifyStoreCategory({
+        storeName: row.store_name,
+        description: row.description || '',
+        declaredType: row.merchants?.business_type || '',
+        categoryNames,
+      });
+      if (verified) {
+        await supabase.from('stores').update({ category_override: verified }).eq('id', row.id);
+        console.log(`[CategoryVerify] ${row.store_name} → ${verified}`);
+      }
+    }
+  } catch (err) {
+    console.warn('[CategoryVerify] backfill error:', err?.message);
+  } finally {
+    storeCategoryBackfillRunning = false;
+  }
+}
+
 // ─── Public Stores ───────────────────────────────────────────────────────────
 
 // Public stores listing & search (no auth required; uses public RLS policies)
@@ -898,6 +940,7 @@ app.get('/stores', async (req, res) => {
           is_open,
           is_active,
           operating_hours,
+          category_override,
           merchants ( business_type )
         `,
       )
@@ -953,13 +996,19 @@ app.get('/stores', async (req, res) => {
       });
     }
 
-    // Flatten merchants.business_type → top-level business_type, remove nested object
-    stores = stores.map(({ merchants, ...rest }) => ({
+    // Flatten merchants.business_type → top-level business_type, preferring the
+    // AI-verified category_override (catches a merchant's wrong self-pick) so
+    // customers never see a miscategorized store; remove the nested object.
+    stores = stores.map(({ merchants, category_override, ...rest }) => ({
       ...rest,
-      business_type: merchants?.business_type || null,
+      business_type: category_override || merchants?.business_type || null,
     }));
 
     stores = stores.map((s) => enrichStoreForCustomerListing(s));
+
+    // Serve immediately; verify any not-yet-checked stores in the background
+    // so a wrong merchant-picked category self-heals without a redeploy.
+    backfillStoreCategories(data);
 
     return res.json({ stores });
   } catch (error) {
@@ -1378,6 +1427,33 @@ app.patch('/merchant/profile', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'Merchant not found' });
     }
 
+    // Business type changed — re-verify against the store's name/description
+    // so a merchant's manual re-pick can't reintroduce a wrong category.
+    if (update.business_type !== undefined) {
+      try {
+        const { data: stores } = await supabase
+          .from('stores')
+          .select('id, store_name, description')
+          .eq('merchant_id', req.userId);
+        const { data: types } = await supabase.from('business_types').select('name');
+        const categoryNames = (types || []).map((t) => t.name);
+        for (const store of stores || []) {
+          const verified = await verifyStoreCategory({
+            storeName: store.store_name,
+            description: store.description || '',
+            declaredType: merchantRow.business_type,
+            categoryNames,
+          });
+          await supabase
+            .from('stores')
+            .update({ category_override: verified || null })
+            .eq('id', store.id);
+        }
+      } catch (err) {
+        console.warn('[CategoryVerify] profile update verification skipped:', err?.message);
+      }
+    }
+
     return res.json(merchantRow);
   } catch (error) {
     console.error('patch /merchant/profile error:', error);
@@ -1521,7 +1597,10 @@ app.get('/stores/:storeId/menu', async (req, res) => {
         store_id: p.store_id,
         name: p.name,
         description: p.description,
-        price: p.price,
+        // Customer-facing price = merchant base price + platform markup.
+        // The markup stays with DOT on every transaction; the merchant is
+        // credited their base price when the order is paid.
+        price: applyPlatformMarkup(p.price),
         unit: p.unit,
         is_available: p.is_available,
         is_featured: p.is_featured,
@@ -1529,7 +1608,9 @@ app.get('/stores/:storeId/menu', async (req, res) => {
         category: categoryName,
         option_groups: (menuGroupsMap[p.id] || []).map((g) => ({
           ...g,
-          options: g.options.filter((o) => o.is_available !== false),
+          options: g.options
+            .filter((o) => o.is_available !== false)
+            .map((o) => ({ ...o, price_adjustment: applyPlatformMarkup(o.price_adjustment) })),
         })),
       };
     });
@@ -1985,11 +2066,18 @@ app.get('/merchant/help', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden', details: 'Merchant profile required' });
     }
     const { quickActions, faqs } = getMerchantHelpPayload();
+    // Merchant & courier support line — placeholders in env are ignored
+    const envPhone = process.env.SUPPORT_PHONE;
+    const envEmail = process.env.SUPPORT_EMAIL;
+    const phone =
+      envPhone && envPhone !== '+263771234567' ? envPhone : '+263788014717';
+    const email =
+      envEmail && !envEmail.includes('example.com') ? envEmail : 'Contact@deliveryontime.co.zw';
     return res.json({
       contact: {
-        phone: process.env.SUPPORT_PHONE || null,
-        email: process.env.SUPPORT_EMAIL || null,
-        whatsappUrl: process.env.SUPPORT_WHATSAPP_URL || null,
+        phone,
+        email,
+        whatsappUrl: process.env.SUPPORT_WHATSAPP_URL || 'https://wa.me/263788014717',
         hours: process.env.SUPPORT_HOURS || 'Mon–Fri 8:00–18:00',
       },
       quickActions,
@@ -7185,18 +7273,25 @@ app.get('/admin/payout-details', requireAdmin, async (req, res) => {
       .in('merchant_id', userIds);
     const storeByMerchant = new Map((storeRows || []).map((s) => [s.merchant_id, s.store_name]));
 
+    const weeklyRate = getWeeklyCommissionRate();
     const recipients = userIds.map((id) => {
       const bal = balances.get(id);
       const pm = payoutByUser.get(id);
       const profile = profileById.get(id);
       const role = bal?.role || pm?.role || 'merchant';
+      const balance = bal ? bal.balance : 0;
+      // Weekly platform commission deducted from merchant payouts
+      const weeklyCommission =
+        role === 'merchant' ? Math.round(balance * weeklyRate * 100) / 100 : 0;
       return {
         user_id: id,
         role,
         name: profile?.full_name || null,
         phone: profile?.phone || null,
         store_name: role === 'merchant' ? storeByMerchant.get(id) || null : null,
-        balance: bal ? bal.balance : 0,
+        balance,
+        weekly_commission: weeklyCommission,
+        payable: Math.round((balance - weeklyCommission) * 100) / 100,
         needs_payout_setup: !pm,
         payout: pm
           ? {
