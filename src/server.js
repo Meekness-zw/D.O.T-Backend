@@ -910,6 +910,7 @@ app.get('/stores', async (req, res) => {
     if (!supabasePublic) throw new Error('Server not configured');
 
     const {
+      id,
       search,
       category,
       city,
@@ -946,6 +947,10 @@ app.get('/stores', async (req, res) => {
       )
       .eq('is_active', true)
       .range(offset, offset + limit - 1);
+
+    if (id) {
+      query = query.eq('id', id);
+    }
 
     if (city) {
       query = query.ilike('city', city);
