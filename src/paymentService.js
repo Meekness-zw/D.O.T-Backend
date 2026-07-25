@@ -4,7 +4,7 @@ import CryptoJS from 'crypto-js';
 import { getPesepayConfig } from './pesepayConfig.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { computeSubtotalSplit, recordMerchantEarningsForOrderPayment } from './orderPaymentSplit.js';
-import { notifyCustomerPaymentReceived, insertUserNotification } from './orderNotifications.js';
+import { insertUserNotification } from './orderNotifications.js';
 
 const supabase = supabaseAdmin;
 
@@ -680,18 +680,9 @@ async function finalizeOrderPaymentFromPesepay({ payment, paymentStatus, transac
       throw new Error(orderUpdateError.message || 'Failed to update order');
     }
 
-    const { data: storeForNotify } = await supabase
-      .from('stores')
-      .select('store_name')
-      .eq('id', order.store_id)
-      .maybeSingle();
-
-    await notifyCustomerPaymentReceived(supabase, {
-      customerId: order.customer_id,
-      orderId: updatedOrder.id,
-      orderNumber: updatedOrder.order_number,
-      storeName: storeForNotify?.store_name,
-    });
+    // Customer already got "Order placed" (or "Complete payment" while pending);
+    // payment confirming silently is intentional — only 3 lifecycle pushes reach
+    // them: Order Placed, On the Way, Arrived. See orderNotifications.js.
 
     let merchantTx = null;
     if (store?.merchant_id && merchantEarnings > 0) {

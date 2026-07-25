@@ -388,6 +388,7 @@ export async function upsertMerchantOnboarding({
   description,
   operating_hours,
   is_open,
+  delivery_radius_km,
   business_registration_number,
   tax_id,
   storeLogoBase64,
@@ -460,6 +461,12 @@ export async function upsertMerchantOnboarding({
     is_open: is_open !== false,
     is_active: true,
   };
+  if (delivery_radius_km !== undefined && delivery_radius_km !== null && delivery_radius_km !== '') {
+    const radius = Number(delivery_radius_km);
+    if (Number.isFinite(radius) && radius > 0) {
+      storePayload.delivery_radius_km = Math.min(radius, 100);
+    }
+  }
 
   let storeId = existingStore?.id || null;
   if (storeId) {

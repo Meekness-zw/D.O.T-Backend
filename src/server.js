@@ -11,7 +11,7 @@ import {
   uploadProfilePhoto,
   recordCourierProfilePhotoDocument,
 } from './userService.js';
-import { getOrdersForUser, getWalletTransactionsForUser, getPaymentsForUser, getFullUserMe, getMerchantDashboardStats } from './historyService.js';
+import { getOrdersForUser, getWalletTransactionsForUser, getPaymentsForUser, getFullUserMe, getMerchantDashboardStats, resolveCourierProfilePhotoUrl } from './historyService.js';
 import {
   createPesepayTransaction,
   makeDirectPesepayPayment,
@@ -107,7 +107,10 @@ async function findAuthUserByPhone(phone) {
   }
 }
 
-// Send push notification to all verified, non-busy couriers about a new ready order
+// Send push notification to all verified, non-busy couriers as soon as a merchant
+// accepts an order, so they can start heading toward the store while it's prepared.
+// The job itself still only becomes claimable in /courier/jobs/open once the merchant
+// marks it 'ready' — this is an early heads-up, not an assignment.
 async function notifyAvailableCouriers(orderId, orderNumber, storeName) {
   if (!supabase) return;
   try {
@@ -133,7 +136,7 @@ async function notifyAvailableCouriers(orderId, orderNumber, storeName) {
       if (busyIds.has(courier.id)) continue;
       const token = courier.user_profiles?.push_token;
       if (!token || !token.startsWith('ExponentPushToken')) continue;
-      pushMessages.push({ to: token, title: 'New delivery available', body: `${numLabel} from ${store} is ready for pickup.`, data: { type: 'new_job', orderId }, sound: 'default' });
+      pushMessages.push({ to: token, title: 'Order accepted — head that way', body: `${numLabel} from ${store} was just accepted and is being prepared. Get moving so you're there when it's ready.`, data: { type: 'new_job', orderId }, sound: 'default' });
     }
     if (!pushMessages.length) return;
     await axios.post('https://exp.host/--/api/v2/push/send', pushMessages, {
@@ -1355,6 +1358,7 @@ app.post('/merchants/onboarding', requireAuth, async (req, res) => {
       description,
       operating_hours,
       is_open,
+      delivery_radius_km,
       business_registration_number,
       tax_id,
       storeLogoBase64,
@@ -1383,6 +1387,7 @@ app.post('/merchants/onboarding', requireAuth, async (req, res) => {
       description,
       operating_hours,
       is_open,
+      delivery_radius_km,
       business_registration_number,
       tax_id,
       storeLogoBase64,
@@ -1797,7 +1802,7 @@ app.get('/merchant/stores', requireAuth, async (req, res) => {
     if (!supabase) throw new Error('Server not configured');
     let data, error;
     const fullSelect =
-      'id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country, latitude, longitude, is_open, is_active, operating_hours';
+      'id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country, latitude, longitude, is_open, is_active, operating_hours, delivery_radius_km';
     const minimalSelect = 'id, store_name, logo, merchant_id, created_at';
     let result = await supabase
       .from('stores')
@@ -1878,6 +1883,7 @@ app.patch('/merchant/stores/:id', requireAuth, async (req, res) => {
       is_open,
       is_active,
       operating_hours,
+      delivery_radius_km,
     } = req.body || {};
     const update = {};
     if (store_name !== undefined && String(store_name).trim()) update.store_name = String(store_name).trim();
@@ -1899,6 +1905,16 @@ app.patch('/merchant/stores/:id', requireAuth, async (req, res) => {
     if (operating_hours !== undefined) {
       if (operating_hours === null) update.operating_hours = null;
       else if (typeof operating_hours === 'object') update.operating_hours = operating_hours;
+    }
+    if (delivery_radius_km !== undefined && delivery_radius_km !== null && delivery_radius_km !== '') {
+      const radius = Number(delivery_radius_km);
+      if (!Number.isFinite(radius) || radius <= 0) {
+        return res.status(400).json({
+          error: 'Invalid delivery_radius_km',
+          details: 'delivery_radius_km must be a positive number (km)',
+        });
+      }
+      update.delivery_radius_km = Math.min(radius, 100);
     }
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ error: 'No fields to update', details: 'Provide at least one updatable field' });
@@ -3591,7 +3607,10 @@ app.patch('/orders/:id', requireAuth, async (req, res) => {
       storeName: storeRow?.store_name,
     });
 
-    if (status === 'ready') {
+    // Ping couriers as soon as the merchant accepts (→ preparing) rather than waiting
+    // until the food is actually ready, so a courier is already en route to the store
+    // instead of the merchant sitting on finished food waiting for pickup.
+    if (status === 'preparing') {
       notifyAvailableCouriers(updated.id, updated.order_number, storeRow?.store_name).catch(() => {});
     }
 
@@ -3829,7 +3848,12 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
         .maybeSingle();
       courier_full_name = cp?.full_name || null;
       courier_phone = cp?.phone || null;
-      courier_profile_photo_url = cp?.profile_photo || null;
+      // Prefer the courier's dedicated onboarding photo over the generic
+      // account photo (which is shared with any customer/merchant role the
+      // same account also has) — otherwise the tracking screen can show a
+      // photo that reads as "the customer", not "the biker".
+      courier_profile_photo_url =
+        (await resolveCourierProfilePhotoUrl(order.courier_id)) || cp?.profile_photo || null;
     }
 
     let courier_vehicle_type = null;
@@ -5008,24 +5032,21 @@ app.post('/courier/orders/:id/complete', requireAuth, async (req, res) => {
       console.error('order_status_history insert (delivery_confirmation_pending) error:', historyError);
     }
 
-    // Notify customer to confirm delivery
+    // Notify customer to confirm delivery — third and last of the 3 lifecycle
+    // pushes (Order Placed, On the Way, Arrived). Goes through the normal
+    // in-app notification path (not a raw push) so it shows in the Notification
+    // Center and carries the same deep-link data shape as the others.
     try {
-      const { data: customerProfile } = await supabase
-        .from('user_profiles')
-        .select('push_token')
-        .eq('id', order.customer_id)
-        .maybeSingle();
-      const customerToken = customerProfile?.push_token;
-      if (customerToken && customerToken.startsWith('ExponentPushToken')) {
-        const orderLabel = order.order_number ? `#${order.order_number}` : 'Your order';
-        await axios.post('https://exp.host/--/api/v2/push/send', [{
-          to: customerToken,
-          title: 'Your order has arrived!',
-          body: `${orderLabel} has been delivered. Please confirm you received it.`,
-          data: { type: 'delivery_confirmation', orderId: id },
-          sound: 'default',
-        }], { headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 10000 });
-      }
+      const orderLabel = order.order_number ? `#${order.order_number}` : 'Your order';
+      await insertUserNotification(supabase, {
+        userId: order.customer_id,
+        title: 'Arrived',
+        message: `${orderLabel} has arrived. Please confirm you received it.`,
+        type: 'delivery',
+        referenceId: id,
+        audience: 'customer',
+        data: { orderId: id, orderNumber: order.order_number, deliveryConfirmation: true },
+      });
     } catch (pushErr) {
       console.warn('[Push] Failed to notify customer of delivery confirmation request:', pushErr?.message);
     }

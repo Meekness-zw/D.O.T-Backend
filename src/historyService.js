@@ -227,6 +227,59 @@ export async function getPaymentsForUser(userId, options = {}) {
 }
 
 /**
+ * Resolve a courier's dedicated profile photo, uploaded during courier
+ * onboarding/verification (courier_documents, document_type='profile_photo').
+ * This is distinct from — and preferred over — user_profiles.profile_photo,
+ * which is the generic account photo shared across whatever roles a user has
+ * (e.g. a courier who is also a customer on the same account). Falls back to
+ * null (never throws) so callers can fall back to the generic profile photo.
+ */
+export async function resolveCourierProfilePhotoUrl(courierId) {
+  if (!courierId || !supabase) return null;
+  const { data: courierDocs } = await supabase
+    .from('courier_documents')
+    .select('document_type, document_url, created_at')
+    .eq('courier_id', courierId)
+    .eq('document_type', 'profile_photo')
+    .order('created_at', { ascending: false })
+    .limit(1);
+  const courierProfileDoc =
+    Array.isArray(courierDocs) && courierDocs.length > 0 ? courierDocs[0] : null;
+  if (!courierProfileDoc?.document_url) return null;
+
+  try {
+    const rawUrl = courierProfileDoc.document_url;
+    const u = new URL(rawUrl);
+    const parts = u.pathname.split('/').filter(Boolean);
+    const objectIdx = parts.findIndex((p) => p === 'object');
+    if (objectIdx === -1) return rawUrl;
+
+    const afterObject = parts.slice(objectIdx + 1);
+    // getPublicUrl() always produces /object/public/{bucket}/… even for private buckets.
+    // We must always attempt a signed URL — a private bucket URL is inaccessible without one.
+    const knownAccessTypes = ['public', 'sign', 'authenticated'];
+    const hasAccessType = knownAccessTypes.includes(afterObject[0]);
+    const bucket = hasAccessType ? afterObject[1] : afterObject[0];
+    const pathParts = hasAccessType ? afterObject.slice(2) : afterObject.slice(1);
+    const path = decodeURIComponent(pathParts.join('/'));
+    if (!bucket || !path) return rawUrl;
+
+    // 7-day expiry — long enough to survive app restarts; refreshed on every fetch
+    const { data: signed, error: signErr } = await supabase.storage
+      .from(bucket)
+      .createSignedUrl(path, 604800);
+    if (signed?.signedUrl) return signed.signedUrl;
+
+    // Fallback: if bucket is genuinely public the raw URL works; private buckets will be blank
+    console.warn('[resolveCourierProfilePhotoUrl] createSignedUrl failed:', signErr?.message, '— bucket:', bucket, 'path:', path);
+    return rawUrl;
+  } catch (e) {
+    console.warn('[resolveCourierProfilePhotoUrl] URL parse error:', e?.message);
+    return courierProfileDoc.document_url;
+  }
+}
+
+/**
  * Get full "me" payload: profile + roles list + role-specific rows for every role the user has.
  * Multi-role: one user can have customer, merchant, courier; all data returned so app can switch without re-fetching.
  */
@@ -257,7 +310,7 @@ export async function getFullUserMe(userId) {
     const { data: store } = await supabase
       .from('stores')
       .select(
-        'id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country, latitude, longitude, is_open, is_active, operating_hours',
+        'id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country, latitude, longitude, is_open, is_active, operating_hours, delivery_radius_km',
       )
       .eq('merchant_id', userId)
       .order('created_at', { ascending: false })
@@ -268,55 +321,7 @@ export async function getFullUserMe(userId) {
   if (result.roles.includes('courier')) {
     const { data: courierRow } = await supabase.from('couriers').select('*').eq('id', userId).single();
     result.courier = courierRow || null;
-
-    // Prefer courier-specific profile photo stored in courier_documents (courier storage folder)
-    const { data: courierDocs } = await supabase
-      .from('courier_documents')
-      .select('document_type, document_url, created_at')
-      .eq('courier_id', userId)
-      .eq('document_type', 'profile_photo')
-      .order('created_at', { ascending: false })
-      .limit(1);
-    const courierProfileDoc =
-      Array.isArray(courierDocs) && courierDocs.length > 0 ? courierDocs[0] : null;
-    if (courierProfileDoc?.document_url) {
-      try {
-        const rawUrl = courierProfileDoc.document_url;
-        const u = new URL(rawUrl);
-        const parts = u.pathname.split('/').filter(Boolean);
-        const objectIdx = parts.findIndex((p) => p === 'object');
-        if (objectIdx !== -1) {
-          const afterObject = parts.slice(objectIdx + 1);
-          // getPublicUrl() always produces /object/public/{bucket}/… even for private buckets.
-          // We must always attempt a signed URL — a private bucket URL is inaccessible without one.
-          const knownAccessTypes = ['public', 'sign', 'authenticated'];
-          const hasAccessType = knownAccessTypes.includes(afterObject[0]);
-          const bucket = hasAccessType ? afterObject[1] : afterObject[0];
-          const pathParts = hasAccessType ? afterObject.slice(2) : afterObject.slice(1);
-          const path = decodeURIComponent(pathParts.join('/'));
-          if (bucket && path) {
-            // 7-day expiry — long enough to survive app restarts; refreshed on every focus
-            const { data: signed, error: signErr } = await supabase.storage
-              .from(bucket)
-              .createSignedUrl(path, 604800);
-            if (signed?.signedUrl) {
-              result.courier_profile_photo_url = signed.signedUrl;
-            } else {
-              // Fallback: if bucket is genuinely public the raw URL works; private buckets will be blank
-              console.warn('[historyService] createSignedUrl failed:', signErr?.message, '— bucket:', bucket, 'path:', path);
-              result.courier_profile_photo_url = rawUrl;
-            }
-          } else {
-            result.courier_profile_photo_url = rawUrl;
-          }
-        } else {
-          result.courier_profile_photo_url = rawUrl;
-        }
-      } catch (e) {
-        console.warn('[historyService] courier photo URL parse error:', e?.message);
-        result.courier_profile_photo_url = courierProfileDoc.document_url;
-      }
-    }
+    result.courier_profile_photo_url = await resolveCourierProfilePhotoUrl(userId);
   }
 
   return result;

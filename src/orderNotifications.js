@@ -64,6 +64,11 @@ export async function insertUserNotification(
   }
 }
 
+// Merchant-side status pings (confirmed/preparing/ready) are intentionally NOT
+// pushed to the customer — only 3 lifecycle notifications reach them: Order
+// Placed, On the Way (notifyCustomerCourierAssigned), and Arrived (see the
+// delivery_confirmation_pending push in server.js). Cancellation is the one
+// exception kept here since it's not a routine progress update.
 export async function notifyCustomerMerchantOrderStatus(supabase, {
   customerId,
   orderId,
@@ -72,22 +77,9 @@ export async function notifyCustomerMerchantOrderStatus(supabase, {
   storeName,
 }) {
   if (!customerId || !status) return;
-  const store = storeName || 'The restaurant';
   const numLabel = orderNumber ? `#${orderNumber}` : 'your order';
 
   const map = {
-    confirmed: {
-      title: 'Order confirmed',
-      message: `${store} confirmed ${numLabel}.`,
-    },
-    preparing: {
-      title: 'Preparing your order',
-      message: `${store} is preparing ${numLabel}.`,
-    },
-    ready: {
-      title: 'Order ready',
-      message: `${numLabel} is ready for pickup. A driver will be assigned soon.`,
-    },
     cancelled: {
       title: 'Order cancelled',
       message: `${numLabel} was cancelled by the store.`,
@@ -104,6 +96,7 @@ export async function notifyCustomerMerchantOrderStatus(supabase, {
     type: 'order',
     referenceId: orderId,
     audience: 'customer',
+    data: { orderId, orderNumber, storeName },
   });
 }
 
@@ -118,11 +111,12 @@ export async function notifyCustomerCourierAssigned(supabase, {
   const who = courierName ? courierName : 'A driver';
   await insertUserNotification(supabase, {
     userId: customerId,
-    title: 'Driver assigned',
-    message: `${who} is on the way for ${numLabel}. You can track the delivery live.`,
+    title: 'On the Way',
+    message: `${who} is on the way for ${numLabel}. Tap to track the delivery live.`,
     type: 'delivery',
     referenceId: orderId,
     audience: 'customer',
+    data: { orderId, orderNumber },
   });
 }
 
@@ -167,25 +161,6 @@ export async function notifyCustomerOrderPlaced(supabase, {
     referenceId: orderId,
     audience: 'customer',
     data: { orderId, orderNumber, storeName: store },
-  });
-}
-
-export async function notifyCustomerPaymentReceived(supabase, {
-  customerId,
-  orderId,
-  orderNumber,
-  storeName,
-}) {
-  if (!customerId) return;
-  const store = storeName || 'The store';
-  const numLabel = orderNumber ? `#${orderNumber}` : 'your order';
-  await insertUserNotification(supabase, {
-    userId: customerId,
-    title: 'Payment received',
-    message: `${numLabel} is paid. ${store} will confirm your order soon.`,
-    type: 'payment',
-    referenceId: orderId,
-    audience: 'customer',
   });
 }
 
