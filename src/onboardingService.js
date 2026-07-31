@@ -128,12 +128,12 @@ export async function upsertCourierProfile({
     });
     uploads.profile_photo_url = url;
 
-    await supabase.from('courier_documents').insert({
+    await supabase.from('courier_documents').upsert({
       courier_id: userId,
       document_type: 'profile_photo',
       document_url: url,
       status: 'pending',
-    });
+    }, { onConflict: 'courier_id,document_type' });
   }
 
   if (nationalIdPhotoBase64) {
@@ -145,13 +145,12 @@ export async function upsertCourierProfile({
     });
     uploads.national_id_url = url;
 
-    // Stored under the closest existing enum type.
-    await supabase.from('courier_documents').insert({
+    await supabase.from('courier_documents').upsert({
       courier_id: userId,
-      document_type: 'id_drivers_license',
+      document_type: 'national_id',
       document_url: url,
       status: 'pending',
-    });
+    }, { onConflict: 'courier_id,document_type' });
   }
 
   return { success: true, uploads };
@@ -228,12 +227,12 @@ export async function saveCourierVehicle({
       .update({ registration_certificate_url: url })
       .eq('id', vehicle.id);
 
-    await supabase.from('courier_documents').insert({
+    await supabase.from('courier_documents').upsert({
       courier_id: userId,
       document_type: 'vehicle_registration',
       document_url: url,
       status: 'pending',
-    });
+    }, { onConflict: 'courier_id,document_type' });
   }
 
   return { success: true, vehicleId: vehicle.id, uploads };
@@ -270,12 +269,6 @@ export async function saveCourierDriverLicense({
     dataUrl: frontBase64,
   });
   uploads.front = frontUrl;
-  await supabase.from('courier_documents').insert({
-    courier_id: userId,
-    document_type: 'id_drivers_license',
-    document_url: frontUrl,
-    status: 'pending',
-  });
 
   const backUrl = await uploadToBucket({
     bucket: COURIER_BUCKET,
@@ -283,12 +276,16 @@ export async function saveCourierDriverLicense({
     dataUrl: backBase64,
   });
   uploads.back = backUrl;
-  await supabase.from('courier_documents').insert({
+
+  // Front and back are one document (the license), not two — both photos are
+  // kept in storage, but courier_documents gets a single row so the Documents
+  // screen shows one "Driver's License" entry, not a duplicate per side.
+  await supabase.from('courier_documents').upsert({
     courier_id: userId,
     document_type: 'id_drivers_license',
-    document_url: backUrl,
+    document_url: frontUrl,
     status: 'pending',
-  });
+  }, { onConflict: 'courier_id,document_type' });
 
   return { success: true, uploads };
 }

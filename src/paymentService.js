@@ -694,7 +694,10 @@ async function finalizeOrderPaymentFromPesepay({ payment, paymentStatus, transac
       });
     }
 
-    // Notify merchant: payment confirmed — order is now ready to prepare
+    // Notify merchant: payment confirmed — order is now ready to prepare.
+    // insertUserNotification already sends both the in-app row and the push
+    // in one call — a second raw push here used to fire right after it for
+    // the same event, so merchants got two banners for one payment. Removed.
     if (store?.merchant_id) {
       const numLabel = order.order_number ? `#${order.order_number}` : 'New order';
       try {
@@ -704,34 +707,11 @@ async function finalizeOrderPaymentFromPesepay({ payment, paymentStatus, transac
           message: `${numLabel} payment received ($${Number(order.total_amount || 0).toFixed(2)}). The order is waiting for your confirmation.`,
           type: 'order',
           referenceId: updatedOrder.id,
+          audience: 'merchant',
           data: { orderId: updatedOrder.id, orderNumber: order.order_number },
         });
       } catch (notifyErr) {
         console.warn('[Pesepay] merchant in-app notification failed (non-fatal):', notifyErr?.message);
-      }
-
-      try {
-        const { data: merchantProfile } = await supabase
-          .from('user_profiles')
-          .select('push_token')
-          .eq('id', store.merchant_id)
-          .maybeSingle();
-        const token = merchantProfile?.push_token;
-        if (token?.startsWith('ExponentPushToken')) {
-          await axios.post(
-            'https://exp.host/push/send',
-            {
-              to: token,
-              title: 'Payment confirmed — new order',
-              body: `${numLabel} is paid ($${Number(order.total_amount || 0).toFixed(2)}). Start preparing now.`,
-              data: { type: 'new_order', orderId: updatedOrder.id },
-              sound: 'default',
-            },
-            { headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 10000 },
-          );
-        }
-      } catch (pushErr) {
-        console.warn('[Pesepay] merchant push notification failed (non-fatal):', pushErr?.message);
       }
     }
 

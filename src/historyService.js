@@ -174,11 +174,21 @@ export async function getOrdersForUser(userId, options = {}) {
 export async function getWalletTransactionsForUser(userId, options = {}) {
   if (!userId || !supabase) throw new Error('userId required and server must be configured');
 
-  const { limit = 50, offset = 0 } = options;
-  const { data, error } = await supabase
+  const { limit = 50, offset = 0, userType = null } = options;
+  let query = supabase
     .from('wallet_transactions')
     .select('id, user_type, transaction_type, amount, balance_after, description, reference_id, status, created_at')
-    .eq('user_id', userId)
+    .eq('user_id', userId);
+
+  // A single account can hold multiple roles (e.g. merchant + courier); without
+  // this, a courier's delivery payout row would also show up on that same
+  // person's Merchant Wallet screen (and vice versa) since both share one
+  // user_id. Callers pass their own role so each wallet only shows its own money.
+  if (userType) {
+    query = query.eq('user_type', userType);
+  }
+
+  const { data, error } = await query
     .order('created_at', { ascending: false })
     .range(offset, offset + limit - 1);
 

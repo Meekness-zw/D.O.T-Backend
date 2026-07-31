@@ -3887,6 +3887,129 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
   }
 });
 
+// In-app texting between the courier and customer for one order. Both sides
+// can send; authorization is "are you this order's customer or courier",
+// same pattern used throughout this file rather than relying on RLS.
+async function loadMessageThreadOrder(id) {
+  const { data: order, error } = await supabase
+    .from('orders')
+    .select('id, customer_id, courier_id, order_number, status')
+    .eq('id', id)
+    .maybeSingle();
+  if (error) throw new Error(error.message || 'Failed to load order');
+  return order;
+}
+
+// GET /orders/:id/messages — the message thread for an order
+app.get('/orders/:id/messages', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+
+    const order = await loadMessageThreadOrder(id);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    const isCustomer = order.customer_id === req.userId;
+    const isCourier = order.courier_id === req.userId;
+    if (!isCustomer && !isCourier) {
+      return res.status(403).json({ error: 'Forbidden', details: 'You are not part of this order' });
+    }
+
+    const { data: messages, error: messagesError } = await supabase
+      .from('order_messages')
+      .select('id, sender_id, sender_role, message, is_read, created_at')
+      .eq('order_id', id)
+      .order('created_at', { ascending: true });
+    if (messagesError) throw new Error(messagesError.message || 'Failed to load messages');
+
+    // Mark the other party's messages read now that this user has fetched the thread.
+    const myRole = isCustomer ? 'customer' : 'courier';
+    const theirRole = isCustomer ? 'courier' : 'customer';
+    const hasUnread = (messages || []).some((m) => m.sender_role === theirRole && !m.is_read);
+    if (hasUnread) {
+      await supabase
+        .from('order_messages')
+        .update({ is_read: true })
+        .eq('order_id', id)
+        .eq('sender_role', theirRole)
+        .eq('is_read', false);
+    }
+
+    return res.json({ messages: messages || [], myRole });
+  } catch (error) {
+    console.error('get /orders/:id/messages error:', error);
+    return res.status(500).json({
+      error: 'Failed to load messages',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /orders/:id/messages — send a message to the other party on this order
+app.post('/orders/:id/messages', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const message = String(req.body?.message || '').trim();
+    if (!message) {
+      return res.status(400).json({ error: 'message is required' });
+    }
+    if (message.length > 1000) {
+      return res.status(400).json({ error: 'Message too long', details: 'Keep it under 1000 characters' });
+    }
+
+    const order = await loadMessageThreadOrder(id);
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    const isCustomer = order.customer_id === req.userId;
+    const isCourier = order.courier_id === req.userId;
+    if (!isCustomer && !isCourier) {
+      return res.status(403).json({ error: 'Forbidden', details: 'You are not part of this order' });
+    }
+    if (!order.courier_id) {
+      return res.status(400).json({ error: 'No courier assigned yet', details: 'Messaging opens once a courier is assigned to this order' });
+    }
+
+    const senderRole = isCustomer ? 'customer' : 'courier';
+    const recipientId = isCustomer ? order.courier_id : order.customer_id;
+
+    const { data: inserted, error: insertError } = await supabase
+      .from('order_messages')
+      .insert({
+        order_id: id,
+        sender_id: req.userId,
+        sender_role: senderRole,
+        message,
+      })
+      .select('id, sender_id, sender_role, message, is_read, created_at')
+      .single();
+    if (insertError) throw new Error(insertError.message || 'Failed to send message');
+
+    const numLabel = order.order_number ? `#${order.order_number}` : 'your order';
+    try {
+      await insertUserNotification(supabase, {
+        userId: recipientId,
+        title: senderRole === 'customer' ? 'New message from customer' : 'New message from your rider',
+        message: message.length > 120 ? `${message.slice(0, 117)}...` : message,
+        type: 'message',
+        referenceId: id,
+        audience: senderRole === 'customer' ? 'courier' : 'customer',
+        data: { orderId: id, orderNumber: order.order_number },
+      });
+    } catch (notifyErr) {
+      console.warn('order message notification failed (non-fatal):', notifyErr?.message);
+    }
+
+    return res.status(201).json({ message: inserted });
+  } catch (error) {
+    console.error('post /orders/:id/messages error:', error);
+    return res.status(500).json({
+      error: 'Failed to send message',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // POST /courier/orders/:id/arrived — courier signals they are physically at the pickup location
 app.post('/courier/orders/:id/arrived', requireAuth, async (req, res) => {
   try {
@@ -5066,7 +5189,19 @@ app.get('/users/me/wallet-transactions', requireAuth, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
     const offset = parseInt(req.query.offset, 10) || 0;
-    const transactions = await getWalletTransactionsForUser(req.userId, { limit, offset });
+    const requestedRole = req.query.role ? String(req.query.role).toLowerCase() : null;
+    const validRoles = ['customer', 'merchant', 'courier'];
+    if (requestedRole && !validRoles.includes(requestedRole)) {
+      return res.status(400).json({
+        error: 'Invalid role',
+        details: `Role must be one of: ${validRoles.join(', ')}`,
+      });
+    }
+    const transactions = await getWalletTransactionsForUser(req.userId, {
+      limit,
+      offset,
+      userType: requestedRole,
+    });
     return res.json({ transactions });
   } catch (error) {
     console.error('get wallet-transactions error:', error);
