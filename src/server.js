@@ -109,8 +109,9 @@ async function findAuthUserByPhone(phone) {
 
 // Send push notification to all verified, non-busy couriers as soon as a merchant
 // accepts an order, so they can start heading toward the store while it's prepared.
-// The job itself still only becomes claimable in /courier/jobs/open once the merchant
-// marks it 'ready' — this is an early heads-up, not an assignment.
+// The job also becomes claimable in /courier/jobs/open at this same moment (status
+// 'preparing') rather than waiting for 'ready' — couriers can be en route before
+// the order is actually finished being prepared.
 async function notifyAvailableCouriers(orderId, orderNumber, storeName) {
   if (!supabase) return;
   try {
@@ -197,6 +198,63 @@ function calculateDeliveryFee(distanceKm) {
   if (d <= BASE_KM) return BASE;
   const extraKm = Math.ceil(d - BASE_KM);
   return Math.round((BASE + extraKm * 0.5) * 100) / 100;
+}
+
+// ─── Discount codes ─────────────────────────────────────────────────────────
+// Admin-issued codes the customer types in at checkout (distinct from the
+// automatic store promotions system in promoEngine.js, which needs no code).
+// Shared by the standalone preview endpoint (checkout, before placing the
+// order) and the actual redemption at order-creation time (re-validated
+// there so a code can't be double-spent between preview and submit).
+async function validateDiscountCode({ code, customerId, subtotal }) {
+  const trimmed = String(code || '').trim();
+  if (!trimmed) return { valid: false, error: 'Enter a code' };
+
+  const { data: codeRow, error } = await supabase
+    .from('discount_codes')
+    .select('*')
+    .ilike('code', trimmed)
+    .maybeSingle();
+  if (error) throw new Error(error.message || 'Failed to look up discount code');
+  if (!codeRow) return { valid: false, error: 'Invalid discount code' };
+  if (!codeRow.is_active) return { valid: false, error: 'This code is no longer active' };
+  if (codeRow.expires_at && new Date(codeRow.expires_at).getTime() < Date.now()) {
+    return { valid: false, error: 'This code has expired' };
+  }
+
+  if (codeRow.max_redemptions != null) {
+    const { count: totalUses, error: totalErr } = await supabase
+      .from('discount_code_redemptions')
+      .select('id', { count: 'exact', head: true })
+      .eq('code_id', codeRow.id);
+    if (totalErr) throw new Error(totalErr.message || 'Failed to check code usage');
+    if ((totalUses || 0) >= codeRow.max_redemptions) {
+      return { valid: false, error: 'This code has reached its usage limit' };
+    }
+  }
+
+  const { count: customerUses, error: customerErr } = await supabase
+    .from('discount_code_redemptions')
+    .select('id', { count: 'exact', head: true })
+    .eq('code_id', codeRow.id)
+    .eq('customer_id', customerId);
+  if (customerErr) throw new Error(customerErr.message || 'Failed to check your code usage');
+  if ((customerUses || 0) >= codeRow.per_customer_limit) {
+    return { valid: false, error: "You've already used this code" };
+  }
+
+  const sub = Number(subtotal) || 0;
+  const rawDiscount =
+    codeRow.discount_type === 'percent' ? sub * (Number(codeRow.value) / 100) : Number(codeRow.value);
+  const discountAmount = Math.max(0, Math.min(Math.round(rawDiscount * 100) / 100, sub));
+
+  return {
+    valid: true,
+    codeRow,
+    discountAmount,
+    discountType: codeRow.discount_type,
+    value: Number(codeRow.value),
+  };
 }
 
 // ─── Product variants (option groups + options) ────────────────────────────
@@ -4137,28 +4195,9 @@ app.post('/merchant/orders/:id/confirm-dispatch', requireAuth, async (req, res) 
       console.error('order_status_history insert (merchant_confirmed) error:', historyError);
     }
 
-    // Notify courier that merchant has confirmed — they can now start delivery
-    if (updated?.courier_id) {
-      try {
-        const { data: courierProfile } = await supabase
-          .from('user_profiles')
-          .select('push_token')
-          .eq('id', updated.courier_id)
-          .maybeSingle();
-        const token = courierProfile?.push_token;
-        if (token?.startsWith('ExponentPushToken')) {
-          await axios.post('https://exp.host/--/api/v2/push/send', {
-            to: token,
-            title: 'Pickup confirmed',
-            body: `The merchant has confirmed order #${updated.order_number}. You can now start delivery.`,
-            data: { type: 'merchant_confirmed', orderId: id },
-            sound: 'default',
-          }, { headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 10000 });
-        }
-      } catch (notifyErr) {
-        console.warn('[Push] Failed to notify courier of merchant confirmation:', notifyErr?.message);
-      }
-    }
+    // Client's call: couriers should only be pushed "there's a job" — no
+    // mid-flow status pings. The courier's own app already polls order status
+    // and reflects merchant_confirmed once they check the screen.
 
     return res.json({ order: updated });
   } catch (error) {
@@ -4249,27 +4288,9 @@ app.post('/customer/orders/:id/confirm-delivery', requireAuth, async (req, res) 
       // Merchant + courier earnings accrue to their in-app wallet for manual
       // cashout. (Pesepay is collections-only — there is no auto-disbursement.)
 
-      // Notify courier that customer confirmed delivery
-      try {
-        const { data: courierProfile } = await supabase
-          .from('user_profiles')
-          .select('push_token')
-          .eq('id', order.courier_id)
-          .maybeSingle();
-        const courierToken = courierProfile?.push_token;
-        if (courierToken && courierToken.startsWith('ExponentPushToken')) {
-          const orderLabel = order.order_number ? `#${order.order_number}` : 'Your delivery';
-          await axios.post('https://exp.host/--/api/v2/push/send', [{
-            to: courierToken,
-            title: 'Delivery confirmed!',
-            body: `${orderLabel} has been confirmed by the customer. Great work!`,
-            data: { type: 'delivery_completed', orderId: id },
-            sound: 'default',
-          }], { headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 10000 });
-        }
-      } catch (pushErr) {
-        console.warn('[Push] Failed to notify courier of delivery confirmation:', pushErr?.message);
-      }
+      // Client's call: couriers only get pushed "there's a job" — no
+      // "delivery confirmed" congratulation ping. The payout still lands in
+      // their wallet (above); they'll see it next time they open the app.
     }
 
     return res.json({ order: updated });
@@ -4567,7 +4588,9 @@ app.get('/courier/orders/active', requireAuth, async (req, res) => {
   }
 });
 
-// GET /courier/jobs/open — list ready orders with no courier assigned
+// GET /courier/jobs/open — list unassigned orders the merchant has accepted
+// (status 'preparing' or 'ready') — visible from the moment of acceptance,
+// not just once marked ready, so couriers can start heading over early.
 app.get('/courier/jobs/open', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
@@ -4632,7 +4655,7 @@ app.get('/courier/jobs/open', requireAuth, async (req, res) => {
         )
       `,
       )
-      .eq('status', 'ready')
+      .in('status', ['preparing', 'ready'])
       .is('courier_id', null)
       .order('created_at', { ascending: true });
 
@@ -4727,12 +4750,13 @@ app.post('/courier/jobs/:id/accept', requireAuth, async (req, res) => {
       });
     }
 
-    // Single atomic update: only wins if still ready and unassigned (avoids races with other couriers).
+    // Single atomic update: only wins if still accepted-and-unassigned (preparing
+    // or ready), avoids races with other couriers grabbing the same job.
     const { data: updated, error: updateError } = await supabase
       .from('orders')
       .update({ courier_id: req.userId, status: 'assigned' })
       .eq('id', id)
-      .eq('status', 'ready')
+      .in('status', ['preparing', 'ready'])
       .is('courier_id', null)
       .select('id, order_number, status, courier_id, customer_id')
       .maybeSingle();
@@ -4745,7 +4769,7 @@ app.post('/courier/jobs/:id/accept', requireAuth, async (req, res) => {
       return res.status(400).json({
         error: 'Job not available',
         details:
-          'Order is no longer ready (another courier may have taken it, or the store changed the order status).',
+          'Order is no longer available (another courier may have taken it, or the store changed the order status).',
       });
     }
 
@@ -5223,11 +5247,42 @@ app.get('/users/me/payments', requireAuth, async (req, res) => {
 
 // POST /orders — create a new customer order for a single store
 // Body: { items: [{ product_id, product_name, product_price, quantity, unit, weight_kg, subtotal }], store_id, payment_method: 'pesepay', delivery_notes? }
+// POST /discount-codes/apply — preview a code's discount before placing the
+// order (checkout screen). Does NOT redeem it yet — actual redemption
+// happens at order creation, re-validated there to prevent double-spending
+// a code across multiple submits from one preview.
+app.post('/discount-codes/apply', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { code, subtotal } = req.body || {};
+    if (!code || !String(code).trim()) {
+      return res.status(400).json({ error: 'code is required' });
+    }
+    const result = await validateDiscountCode({ code, customerId: req.userId, subtotal });
+    if (!result.valid) {
+      return res.status(400).json({ error: result.error });
+    }
+    return res.json({
+      valid: true,
+      code: result.codeRow.code,
+      discountType: result.discountType,
+      value: result.value,
+      discountAmount: result.discountAmount,
+    });
+  } catch (error) {
+    console.error('post /discount-codes/apply error:', error);
+    return res.status(500).json({
+      error: 'Failed to validate discount code',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 app.post('/orders', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
 
-    const { items, store_id, payment_method, delivery_notes } = req.body || {};
+    const { items, store_id, payment_method, delivery_notes, discount_code } = req.body || {};
 
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({
@@ -5353,7 +5408,23 @@ app.post('/orders', requireAuth, async (req, res) => {
     );
     const deliveryFee = calculateDeliveryFee(distanceKm);
     const tax = 0;
-    const totalAmount = subtotal + deliveryFee + tax;
+
+    // Discount code — re-validated here (not just trusted from an earlier
+    // /discount-codes/apply preview call) so it can't be redeemed twice by
+    // previewing once and submitting multiple orders.
+    let discountResult = null;
+    if (discount_code && String(discount_code).trim()) {
+      discountResult = await validateDiscountCode({
+        code: discount_code,
+        customerId: req.userId,
+        subtotal,
+      });
+      if (!discountResult.valid) {
+        return res.status(400).json({ error: discountResult.error });
+      }
+    }
+    const discountAmount = discountResult?.discountAmount || 0;
+    const totalAmount = subtotal + deliveryFee + tax - discountAmount;
 
     if (!Number.isFinite(totalAmount) || totalAmount <= 0) {
       return res.status(400).json({
@@ -5391,6 +5462,8 @@ app.post('/orders', requireAuth, async (req, res) => {
         delivery_latitude: defAddr.latitude,
         delivery_longitude: defAddr.longitude,
         delivery_notes,
+        discount_code: discountResult?.codeRow?.code || null,
+        discount_amount: discountAmount,
       })
       .select('*')
       .single();
@@ -5398,6 +5471,18 @@ app.post('/orders', requireAuth, async (req, res) => {
     if (orderError) {
       console.error('create order insert order error:', orderError);
       throw new Error(orderError.message || 'Failed to create order');
+    }
+
+    if (discountResult?.valid) {
+      const { error: redemptionError } = await supabase.from('discount_code_redemptions').insert({
+        code_id: discountResult.codeRow.id,
+        customer_id: req.userId,
+        order_id: order.id,
+        discount_amount: discountAmount,
+      });
+      if (redemptionError) {
+        console.error('discount code redemption insert error:', redemptionError);
+      }
     }
 
     const orderItemsPayload = items.map((item) => {
@@ -7364,6 +7449,228 @@ app.get('/admin/couriers', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('admin/couriers error:', error);
     return res.status(500).json({ error: 'Failed to load couriers', details: error.message || 'Try again later' });
+  }
+});
+
+// POST /admin/broadcast — send an announcement (e.g. "new app version
+// available", a feature announcement) to every user, or just one role.
+// Body: { title, message, audience? } — audience: 'all' | 'customer' |
+// 'merchant' | 'courier' (default 'all').
+app.post('/admin/broadcast', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { title, message, audience = 'all' } = req.body || {};
+    if (!title || !String(title).trim()) {
+      return res.status(400).json({ error: 'title is required' });
+    }
+    if (!message || !String(message).trim()) {
+      return res.status(400).json({ error: 'message is required' });
+    }
+    const validAudiences = ['all', 'customer', 'merchant', 'courier'];
+    if (!validAudiences.includes(audience)) {
+      return res.status(400).json({
+        error: 'Invalid audience',
+        details: `audience must be one of: ${validAudiences.join(', ')}`,
+      });
+    }
+
+    let targetIds = [];
+    if (audience === 'all') {
+      const { data, error } = await supabase.from('user_profiles').select('id');
+      if (error) throw new Error(error.message || 'Failed to load users');
+      targetIds = (data || []).map((r) => r.id);
+    } else {
+      const table = audience === 'customer' ? 'customers' : audience === 'merchant' ? 'merchants' : 'couriers';
+      const { data, error } = await supabase.from(table).select('id');
+      if (error) throw new Error(error.message || `Failed to load ${audience}s`);
+      targetIds = (data || []).map((r) => r.id);
+    }
+
+    if (targetIds.length === 0) {
+      return res.json({ sent: 0, details: 'No users matched that audience.' });
+    }
+
+    const titleTrimmed = String(title).trim().slice(0, 200);
+    const messageTrimmed = String(message).trim().slice(0, 2000);
+
+    // Bulk-insert one notification row per user (visible in every audience's
+    // Notification Center regardless of which role they're currently using —
+    // an announcement isn't role-scoped the way order/delivery pings are).
+    const rows = targetIds.map((userId) => ({
+      user_id: userId,
+      title: titleTrimmed,
+      message: messageTrimmed,
+      type: 'announcement',
+      data: { audience: 'all' },
+    }));
+    // Chunk inserts to stay well under any single-request payload limit.
+    for (let i = 0; i < rows.length; i += 500) {
+      const { error: insertError } = await supabase.from('notifications').insert(rows.slice(i, i + 500));
+      if (insertError) console.error('[broadcast] notification insert error:', insertError.message);
+    }
+
+    // Push to everyone with a registered device token, batched (Expo accepts
+    // up to 100 messages per request).
+    const { data: profiles, error: profilesError } = await supabase
+      .from('user_profiles')
+      .select('push_token')
+      .in('id', targetIds)
+      .not('push_token', 'is', null);
+    if (profilesError) console.error('[broadcast] push token lookup error:', profilesError.message);
+
+    const pushMessages = (profiles || [])
+      .filter((p) => p.push_token && p.push_token.startsWith('ExponentPushToken'))
+      .map((p) => ({
+        to: p.push_token,
+        title: titleTrimmed,
+        body: messageTrimmed,
+        sound: 'default',
+        data: { type: 'announcement' },
+      }));
+
+    let pushed = 0;
+    for (let i = 0; i < pushMessages.length; i += 100) {
+      const batch = pushMessages.slice(i, i + 100);
+      try {
+        await axios.post('https://exp.host/--/api/v2/push/send', batch, {
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          timeout: 10000,
+        });
+        pushed += batch.length;
+      } catch (pushErr) {
+        console.warn('[broadcast] push batch failed:', pushErr?.message);
+      }
+    }
+
+    return res.json({ sent: targetIds.length, pushed, audience });
+  } catch (error) {
+    console.error('post /admin/broadcast error:', error);
+    return res.status(500).json({
+      error: 'Failed to send broadcast',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /admin/discount-codes — create a code.
+// Body: { code, discount_type: 'percent'|'fixed', value, max_redemptions?, per_customer_limit?, expires_at? }
+app.post('/admin/discount-codes', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const {
+      code,
+      discount_type,
+      value,
+      max_redemptions = null,
+      per_customer_limit = 1,
+      expires_at = null,
+    } = req.body || {};
+
+    const codeTrimmed = String(code || '').trim().toUpperCase();
+    if (!codeTrimmed) return res.status(400).json({ error: 'code is required' });
+    if (!['percent', 'fixed'].includes(discount_type)) {
+      return res.status(400).json({ error: "discount_type must be 'percent' or 'fixed'" });
+    }
+    const numValue = Number(value);
+    if (!Number.isFinite(numValue) || numValue <= 0) {
+      return res.status(400).json({ error: 'value must be a positive number' });
+    }
+    if (discount_type === 'percent' && numValue > 100) {
+      return res.status(400).json({ error: 'A percent code cannot exceed 100' });
+    }
+
+    const { data, error } = await supabase
+      .from('discount_codes')
+      .insert({
+        code: codeTrimmed,
+        discount_type,
+        value: numValue,
+        max_redemptions: max_redemptions != null ? Number(max_redemptions) : null,
+        per_customer_limit: Math.max(1, parseInt(per_customer_limit, 10) || 1),
+        expires_at: expires_at || null,
+      })
+      .select('*')
+      .single();
+
+    if (error) {
+      if (error.code === '23505') {
+        return res.status(409).json({ error: 'That code already exists' });
+      }
+      throw new Error(error.message || 'Failed to create discount code');
+    }
+    return res.status(201).json({ discountCode: data });
+  } catch (error) {
+    console.error('post /admin/discount-codes error:', error);
+    return res.status(500).json({
+      error: 'Failed to create discount code',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// GET /admin/discount-codes — list all codes with their redemption counts.
+app.get('/admin/discount-codes', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { data: codes, error } = await supabase
+      .from('discount_codes')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) throw new Error(error.message || 'Failed to load discount codes');
+
+    const { data: redemptions, error: redemptionsError } = await supabase
+      .from('discount_code_redemptions')
+      .select('code_id');
+    if (redemptionsError) throw new Error(redemptionsError.message || 'Failed to load redemptions');
+
+    const countByCode = {};
+    for (const r of redemptions || []) {
+      countByCode[r.code_id] = (countByCode[r.code_id] || 0) + 1;
+    }
+
+    const withCounts = (codes || []).map((c) => ({ ...c, times_redeemed: countByCode[c.id] || 0 }));
+    return res.json({ discountCodes: withCounts });
+  } catch (error) {
+    console.error('get /admin/discount-codes error:', error);
+    return res.status(500).json({
+      error: 'Failed to load discount codes',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// PATCH /admin/discount-codes/:id — update or deactivate a code.
+app.patch('/admin/discount-codes/:id', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { is_active, max_redemptions, per_customer_limit, expires_at } = req.body || {};
+
+    const update = {};
+    if (is_active !== undefined) update.is_active = !!is_active;
+    if (max_redemptions !== undefined) update.max_redemptions = max_redemptions != null ? Number(max_redemptions) : null;
+    if (per_customer_limit !== undefined) update.per_customer_limit = Math.max(1, parseInt(per_customer_limit, 10) || 1);
+    if (expires_at !== undefined) update.expires_at = expires_at || null;
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    const { data, error } = await supabase
+      .from('discount_codes')
+      .update(update)
+      .eq('id', id)
+      .select('*')
+      .maybeSingle();
+    if (error) throw new Error(error.message || 'Failed to update discount code');
+    if (!data) return res.status(404).json({ error: 'Discount code not found' });
+    return res.json({ discountCode: data });
+  } catch (error) {
+    console.error('patch /admin/discount-codes/:id error:', error);
+    return res.status(500).json({
+      error: 'Failed to update discount code',
+      details: error.message || 'Please try again later',
+    });
   }
 });
 

@@ -65,10 +65,11 @@ export async function insertUserNotification(
 }
 
 // Merchant-side status pings (confirmed/preparing/ready) are intentionally NOT
-// pushed to the customer — only 3 lifecycle notifications reach them: Order
-// Placed, On the Way (notifyCustomerCourierAssigned), and Arrived (see the
-// delivery_confirmation_pending push in server.js). Cancellation is the one
-// exception kept here since it's not a routine progress update.
+// pushed to the customer — client wants push notifications cut to only the
+// truly essential ones: "Complete payment" (action required), Arrived (the
+// delivery_confirmation_pending push in server.js), and Cancelled (exception —
+// money/refund involved, not a routine progress update). Order placed and
+// "driver on the way" are no longer pushed; they were flagged as noise.
 export async function notifyCustomerMerchantOrderStatus(supabase, {
   customerId,
   orderId,
@@ -100,24 +101,13 @@ export async function notifyCustomerMerchantOrderStatus(supabase, {
   });
 }
 
-export async function notifyCustomerCourierAssigned(supabase, {
-  customerId,
-  orderId,
-  orderNumber,
-  courierName,
-}) {
-  if (!customerId) return;
-  const numLabel = orderNumber ? `#${orderNumber}` : 'your order';
-  const who = courierName ? courierName : 'A driver';
-  await insertUserNotification(supabase, {
-    userId: customerId,
-    title: 'On the Way',
-    message: `${who} is on the way for ${numLabel}. Tap to track the delivery live.`,
-    type: 'delivery',
-    referenceId: orderId,
-    audience: 'customer',
-    data: { orderId, orderNumber },
-  });
+// Client's call: "when a biker picked up my order" is redundant noise — the
+// courier-assigned push is intentionally disabled. The customer still finds
+// out via the live tracking screen whenever they check it; only "Arrived"
+// (delivery_confirmation_pending, below) and "Complete payment" now push.
+// eslint-disable-next-line no-unused-vars
+export async function notifyCustomerCourierAssigned(supabase, { customerId, orderId, orderNumber, courierName }) {
+  return;
 }
 
 export async function notifyCustomerOrderPlaced(supabase, {
@@ -153,15 +143,9 @@ export async function notifyCustomerOrderPlaced(supabase, {
     return;
   }
 
-  await insertUserNotification(supabase, {
-    userId: customerId,
-    title: 'Order placed',
-    message: `${numLabel} was sent to ${store}. You'll get updates as it progresses.`,
-    type: 'order',
-    referenceId: orderId,
-    audience: 'customer',
-    data: { orderId, orderNumber, storeName: store },
-  });
+  // Client's call: "order made shouldn't even be a notification" — placing an
+  // order successfully is self-evident in the app (checkout just happened,
+  // OrderConfirmedScreen shows it), so no push/in-app notification fires here.
 }
 
 export async function notifyCustomerOrderSelfCancelled(supabase, {
