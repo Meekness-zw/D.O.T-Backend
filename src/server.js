@@ -3661,21 +3661,15 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
       });
     }
 
-    if (order.payment_status === 'paid' && order.payment_method === 'pesepay') {
-      return res.status(400).json({
-        error: 'Cannot cancel in the app',
-        details:
-          'This order was paid online. Please contact support if you need to cancel or refund.',
-      });
-    }
-
+    // Refund to the customer's in-app wallet regardless of original payment
+    // method. Pesepay (card/mobile money) has no refund/reversal API — the
+    // only automated way to get money back to the customer is wallet credit,
+    // same mechanism already used for wallet-paid orders. Cash never reaches
+    // 'paid' before the merchant accepts, so this only ever fires for
+    // wallet/pesepay orders that were actually charged upfront.
     const totalAmount = Number(order.total_amount);
-    if (
-      order.payment_status === 'paid' &&
-      order.payment_method === 'wallet' &&
-      Number.isFinite(totalAmount) &&
-      totalAmount > 0
-    ) {
+    const wasPaid = order.payment_status === 'paid' && Number.isFinite(totalAmount) && totalAmount > 0;
+    if (wasPaid) {
       const { data: lastTx } = await supabase
         .from('wallet_transactions')
         .select('balance_after')
@@ -3686,6 +3680,7 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
 
       const prevBalance = Number(lastTx?.balance_after) || 0;
       const newBalance = prevBalance + totalAmount;
+      const methodLabel = order.payment_method === 'pesepay' ? ' (paid via Pesepay)' : '';
 
       const { error: refundError } = await supabase.from('wallet_transactions').insert({
         user_id: order.customer_id,
@@ -3693,7 +3688,7 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
         transaction_type: 'refund',
         amount: totalAmount,
         balance_after: newBalance,
-        description: `Refund: cancelled order ${order.order_number}`,
+        description: `Refund: cancelled order ${order.order_number}${methodLabel}`,
         reference_id: order.id,
         status: 'completed',
       });
@@ -3710,10 +3705,7 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
         .eq('customer_id', order.customer_id);
     }
 
-    const nextPaymentStatus =
-      order.payment_status === 'paid' && order.payment_method === 'wallet'
-        ? 'refunded'
-        : order.payment_status;
+    const nextPaymentStatus = wasPaid ? 'refunded' : order.payment_status;
 
     const { data: updated, error: updateError } = await supabase
       .from('orders')
@@ -3744,6 +3736,7 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
       customerId: order.customer_id,
       orderId: updated.id,
       orderNumber: updated.order_number,
+      refunded: wasPaid,
     });
 
     return res.json({ order: updated });

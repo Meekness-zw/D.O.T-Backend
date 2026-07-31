@@ -168,13 +168,16 @@ export async function notifyCustomerOrderSelfCancelled(supabase, {
   customerId,
   orderId,
   orderNumber,
+  refunded = false,
 }) {
   if (!customerId) return;
   const numLabel = orderNumber ? `#${orderNumber}` : 'Your order';
   await insertUserNotification(supabase, {
     userId: customerId,
     title: 'Order cancelled',
-    message: `${numLabel} was cancelled. If you paid by wallet, your balance was refunded.`,
+    message: refunded
+      ? `${numLabel} was cancelled and the amount you paid has been refunded to your wallet.`
+      : `${numLabel} was cancelled.`,
     type: 'order',
     referenceId: orderId,
     audience: 'customer',
