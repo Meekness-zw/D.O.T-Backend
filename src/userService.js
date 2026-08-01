@@ -1,5 +1,5 @@
 import { supabaseAdmin } from './supabaseAdminClient.js';
-import crypto from 'crypto';
+import { hashPassword } from './passwordHash.js';
 
 export async function getProfile(userId) {
   const { data, error } = await supabaseAdmin
@@ -99,7 +99,7 @@ export async function ensureUserProfile({
   };
 
   if (password) {
-    profileData.password_hash = crypto.createHash('sha256').update(password).digest('hex');
+    profileData.password_hash = hashPassword(password);
   }
 
   // 1) Upsert into user_profiles (using admin client for permissions)
@@ -117,11 +117,19 @@ export async function ensureUserProfile({
       { onConflict: 'id' }
     );
   } else if (role === 'merchant') {
+    // Only seed business_name on first creation — re-running this (e.g. a
+    // retried /users/me/add-role call for an already-onboarded merchant)
+    // must never clobber a real, already-set business name back to the
+    // signup full_name or the "New Merchant" placeholder.
+    const { data: existingMerchant } = await supabaseAdmin
+      .from('merchants')
+      .select('id')
+      .eq('id', userId)
+      .maybeSingle();
     await supabaseAdmin.from('merchants').upsert(
-      {
-        id: userId,
-        business_name: fullName || 'New Merchant'
-      },
+      existingMerchant
+        ? { id: userId }
+        : { id: userId, business_name: fullName || 'New Merchant' },
       { onConflict: 'id' }
     );
   } else if (role === 'courier') {

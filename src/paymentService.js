@@ -485,8 +485,8 @@ async function createWalletTransactionForPayment({ userId, amount, currencyCode,
     .limit(1)
     .maybeSingle();
 
-  const prevBalance = lastTx?.balance_after || 0;
-  const newBalance = prevBalance + amount;
+  const prevBalance = Number(lastTx?.balance_after) || 0;
+  const newBalance = Math.round((prevBalance + Number(amount)) * 100) / 100;
 
   const { data, error } = await supabase
     .from('wallet_transactions')

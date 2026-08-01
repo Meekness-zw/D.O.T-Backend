@@ -12,6 +12,7 @@
     "@anthropic-ai/sdk": "^0.110.0",
     "@supabase/supabase-js": "^2.48.0",
     "axios": "^1.7.0",
+    "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",
     "crypto-js": "^4.2.0",
     "dotenv": "^16.4.5",

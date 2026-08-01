@@ -1,8 +1,8 @@
 import 'dotenv/config.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
-import crypto from 'crypto';
 import { randomUUID } from 'crypto';
 import { createSupabaseAccessToken } from './sessionToken.js';
+import { verifyPassword, hashPassword } from './passwordHash.js';
 
 function toPhoneDigits(value) {
   return String(value || '').replace(/\D/g, '');
@@ -62,10 +62,20 @@ export async function loginWithPassword({ phone, password }) {
     throw new Error('Your account has been suspended. Please contact support.');
   }
 
-  const inputHash = crypto.createHash('sha256').update(password).digest('hex');
-
-  if (profile.password_hash !== inputHash) {
+  const { valid, needsRehash } = verifyPassword(password, profile.password_hash);
+  if (!valid) {
     throw new Error('Incorrect phone or password');
+  }
+  if (needsRehash) {
+    // Transparent upgrade from the legacy unsalted SHA-256 hash to bcrypt —
+    // no user-visible change, just hardens the stored hash on next login.
+    supabaseAdmin
+      .from('user_profiles')
+      .update({ password_hash: hashPassword(password) })
+      .eq('id', profile.id)
+      .then(({ error }) => {
+        if (error) console.error('password rehash-on-login failed (non-fatal):', error);
+      });
   }
 
   const accessTokenTtlSeconds = 60 * 60 * 24 * 3650; // 10 years

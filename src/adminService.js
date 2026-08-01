@@ -18,7 +18,7 @@ async function sendExpoPush(userId, { title, body, data = {} }) {
     const token = profile?.push_token;
     if (!token || !token.startsWith('ExponentPushToken')) return;
     await axios.post(
-      'https://exp.host/push/send',
+      'https://exp.host/--/api/v2/push/send',
       { to: token, title, body, data, sound: 'default' },
       { headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 10000 },
     );
@@ -633,21 +633,31 @@ export async function rejectMerchant(merchantId, reason) {
   return merchant;
 }
 
-// Reject a courier — notify then delete all courier data so they can re-apply
+// Reject a courier — mirrors rejectMerchant: persist the rejection + reason
+// (documents/vehicle/payout data are kept, not wiped) so the courier sees
+// exactly why they were declined and can fix and resubmit instead of the
+// app silently showing onboarding as "not started" with everything gone.
 export async function rejectCourier(courierId, reason) {
   if (!supabase) throw new Error('Server not configured');
 
-  // Fetch courier info for notification before deleting
-  const { data: courier, error: fetchError } = await supabase
+  const { data: courier, error } = await supabase
     .from('couriers')
-    .select('id, user_profiles ( full_name, email, phone )')
+    .update({ verification_status: 'rejected', rejected_reason: reason || null, is_verified: false })
     .eq('id', courierId)
+    .select('id, verification_status, rejected_reason, user_profiles ( full_name, email, phone )')
     .maybeSingle();
 
-  if (fetchError) throw new Error(fetchError.message || 'Failed to find courier');
+  if (error) throw new Error(error.message || 'Failed to reject courier');
   if (!courier) throw new Error('Courier not found');
 
-  // Notify the user before wiping data
+  // Mark their pending documents as rejected so the re-upload UI knows which
+  // ones need fixing, instead of them staying stuck at 'pending' forever.
+  await supabase
+    .from('courier_documents')
+    .update({ status: 'rejected' })
+    .eq('courier_id', courierId)
+    .eq('status', 'pending');
+
   await sendExpoPush(courierId, {
     title: 'Application Declined',
     body: reason
@@ -656,20 +666,7 @@ export async function rejectCourier(courierId, reason) {
     data: { type: 'courier_rejected', reason: reason || null },
   });
 
-  // Delete related data (cascade may not cover all tables)
-  await supabase.from('courier_documents').delete().eq('courier_id', courierId);
-  await supabase.from('courier_vehicles').delete().eq('courier_id', courierId);
-  await supabase.from('courier_payout_methods').delete().eq('courier_id', courierId);
-
-  // Delete the courier record — user_profiles row stays so they can log in and re-apply
-  const { error: deleteError } = await supabase
-    .from('couriers')
-    .delete()
-    .eq('id', courierId);
-
-  if (deleteError) throw new Error(deleteError.message || 'Failed to remove courier record');
-
-  return { id: courierId, deleted: true };
+  return courier;
 }
 
 // Detailed view for a specific courier (for admin "Approve Users" modal)

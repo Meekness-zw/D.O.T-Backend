@@ -206,7 +206,19 @@ export async function getPaymentsForUser(userId, options = {}) {
   const profile = await getProfile(userId);
   if (!profile) return [];
 
-  if (profile.role !== 'customer') return [];
+  // Payments are always keyed by customer_id — a multi-role account (e.g.
+  // primary role 'merchant' who has also placed customer orders) still has
+  // real rows here even though profile.role isn't 'customer'. Matches the
+  // resolveEffectiveRole() capability check used by getOrdersForUser above,
+  // instead of hard-gating on the account's primary role.
+  if (profile.role !== 'customer') {
+    const { data: customerRow } = await supabase
+      .from('customers')
+      .select('id')
+      .eq('id', userId)
+      .maybeSingle();
+    if (!customerRow) return [];
+  }
 
   const { limit = 50, offset = 0 } = options;
   const { data, error } = await supabase

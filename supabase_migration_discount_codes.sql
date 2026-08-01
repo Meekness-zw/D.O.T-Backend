@@ -47,3 +47,57 @@ CREATE POLICY "Service role full access on discount_codes"
 DROP POLICY IF EXISTS "Service role full access on discount_code_redemptions" ON discount_code_redemptions;
 CREATE POLICY "Service role full access on discount_code_redemptions"
   ON discount_code_redemptions FOR ALL USING (true) WITH CHECK (true);
+
+-- Atomic redemption: the app calls this via supabase.rpc(...) instead of a
+-- plain INSERT so that concurrent checkouts using the same code (near
+-- max_redemptions, or the same customer submitting two orders at once) can't
+-- both pass a check-then-act race and exceed the code's limits. The
+-- `FOR UPDATE` row lock on discount_codes serializes concurrent callers for
+-- the same code — the second caller re-reads the redemption counts fresh
+-- after the first one commits, instead of both reading stale counts.
+CREATE OR REPLACE FUNCTION redeem_discount_code(
+  p_code_id UUID,
+  p_customer_id UUID,
+  p_order_id UUID,
+  p_discount_amount NUMERIC
+) RETURNS discount_code_redemptions
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_code discount_codes%ROWTYPE;
+  v_total_uses INTEGER;
+  v_customer_uses INTEGER;
+  v_result discount_code_redemptions%ROWTYPE;
+BEGIN
+  SELECT * INTO v_code FROM discount_codes WHERE id = p_code_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'discount code not found';
+  END IF;
+  IF NOT v_code.is_active THEN
+    RAISE EXCEPTION 'code inactive';
+  END IF;
+  IF v_code.expires_at IS NOT NULL AND v_code.expires_at < NOW() THEN
+    RAISE EXCEPTION 'code expired';
+  END IF;
+
+  IF v_code.max_redemptions IS NOT NULL THEN
+    SELECT COUNT(*) INTO v_total_uses FROM discount_code_redemptions WHERE code_id = p_code_id;
+    IF v_total_uses >= v_code.max_redemptions THEN
+      RAISE EXCEPTION 'max redemptions reached';
+    END IF;
+  END IF;
+
+  SELECT COUNT(*) INTO v_customer_uses
+    FROM discount_code_redemptions
+    WHERE code_id = p_code_id AND customer_id = p_customer_id;
+  IF v_customer_uses >= COALESCE(v_code.per_customer_limit, 1) THEN
+    RAISE EXCEPTION 'per customer limit reached';
+  END IF;
+
+  INSERT INTO discount_code_redemptions (code_id, customer_id, order_id, discount_amount)
+  VALUES (p_code_id, p_customer_id, p_order_id, p_discount_amount)
+  RETURNING * INTO v_result;
+
+  RETURN v_result;
+END;
+$$;

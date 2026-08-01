@@ -81,6 +81,7 @@ import {
 } from './storeCategorizationAI.js';
 import crypto from 'crypto';
 import axios from 'axios';
+import { hashPassword } from './passwordHash.js';
 
 const app = express();
 const supabase = supabaseAdmin;
@@ -191,6 +192,8 @@ function isRushHour(date = new Date()) {
  * The $4.99 base splits $4.00 to the courier and $0.99 to DOT — the
  * platform's ~20% cut on delivery (see computeCourierDeliveryPayoutUsd).
  */
+const ALLOWED_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/webp']);
+
 function calculateDeliveryFee(distanceKm) {
   const BASE = 4.99;
   const BASE_KM = 5;
@@ -239,7 +242,7 @@ async function validateDiscountCode({ code, customerId, subtotal }) {
     .eq('code_id', codeRow.id)
     .eq('customer_id', customerId);
   if (customerErr) throw new Error(customerErr.message || 'Failed to check your code usage');
-  if ((customerUses || 0) >= codeRow.per_customer_limit) {
+  if ((customerUses || 0) >= (codeRow.per_customer_limit ?? 1)) {
     return { valid: false, error: "You've already used this code" };
   }
 
@@ -725,7 +728,7 @@ app.post('/auth/reset-password', async (req, res) => {
     }
 
     // Update the password hash in user_profiles
-    const newHash = crypto.createHash('sha256').update(newPassword).digest('hex');
+    const newHash = hashPassword(newPassword);
     await supabaseAdmin
       .from('user_profiles')
       .update({ password_hash: newHash })
@@ -2444,6 +2447,12 @@ app.post('/merchant/stores/:id/upload-logo', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'Invalid image payload', details: 'Expected base64 data URL' });
     }
     const mime = match[1];
+    if (!ALLOWED_IMAGE_MIME_TYPES.has(mime.toLowerCase())) {
+      return res.status(400).json({
+        error: 'Unsupported image type',
+        details: 'Only PNG, JPEG, and WebP images are accepted.',
+      });
+    }
     const base64 = match[2];
     const buffer = Buffer.from(base64, 'base64');
     const ext = mime.includes('png') ? 'png' : mime.includes('jpeg') || mime.includes('jpg') ? 'jpg' : 'bin';
@@ -2522,6 +2531,12 @@ app.post('/merchant/stores/:id/upload-banner', requireAuth, async (req, res) => 
       return res.status(400).json({ error: 'Invalid image payload', details: 'Expected base64 data URL' });
     }
     const mime = match[1];
+    if (!ALLOWED_IMAGE_MIME_TYPES.has(mime.toLowerCase())) {
+      return res.status(400).json({
+        error: 'Unsupported image type',
+        details: 'Only PNG, JPEG, and WebP images are accepted.',
+      });
+    }
     const base64 = match[2];
     let buffer;
     try {
@@ -2774,6 +2789,12 @@ app.post('/merchant/products/upload-image', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'Invalid image payload', details: 'Expected base64 data URL' });
     }
     const mime = match[1];
+    if (!ALLOWED_IMAGE_MIME_TYPES.has(mime.toLowerCase())) {
+      return res.status(400).json({
+        error: 'Unsupported image type',
+        details: 'Only PNG, JPEG, and WebP images are accepted.',
+      });
+    }
     const base64 = match[2];
     const buffer = Buffer.from(base64, 'base64');
     const ext = mime.includes('png') ? 'png' : mime.includes('jpeg') || mime.includes('jpg') ? 'jpg' : 'bin';
@@ -2840,6 +2861,12 @@ app.post('/merchant/promotions/upload-image', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'Invalid image payload', details: 'Expected base64 data URL' });
     }
     const mime = match[1];
+    if (!ALLOWED_IMAGE_MIME_TYPES.has(mime.toLowerCase())) {
+      return res.status(400).json({
+        error: 'Unsupported image type',
+        details: 'Only PNG, JPEG, and WebP images are accepted.',
+      });
+    }
     const base64 = match[2];
     const buffer = Buffer.from(base64, 'base64');
     const ext = mime.includes('png') ? 'png' : mime.includes('jpeg') || mime.includes('jpg') ? 'jpg' : 'bin';
@@ -3569,7 +3596,7 @@ app.patch('/orders/:id', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
     const { id } = req.params;
-    const { status } = req.body || {};
+    const { status, prep_time_minutes } = req.body || {};
     const allowed = ['confirmed', 'preparing', 'ready', 'cancelled'];
     if (!status || !allowed.includes(status)) {
       return res.status(400).json({
@@ -3632,19 +3659,58 @@ app.patch('/orders/:id', requireAuth, async (req, res) => {
       });
     }
 
+    // Forward-only state machine: a merchant can only move an order through
+    // this endpoint along its normal accept -> preparing -> ready path (or
+    // cancel it before it's ready). Once a courier is assigned, the order
+    // lifecycle continues at /merchant/orders/:id/confirm-dispatch and the
+    // courier endpoints — this route can no longer touch it. Without this
+    // guard, re-submitting an older PATCH (a slow retry, a stale UI, or a
+    // merchant tapping "Accept" twice) could regress an already-assigned
+    // order back to 'preparing', which makes it vanish from both the
+    // assigned courier's active list and the open job board.
+    const ORDER_PATCH_TRANSITIONS = {
+      pending: ['confirmed', 'preparing', 'cancelled'],
+      confirmed: ['preparing', 'cancelled'],
+      preparing: ['ready', 'cancelled'],
+      ready: ['cancelled'],
+    };
+    const legalNextStatuses = ORDER_PATCH_TRANSITIONS[order.status] || [];
+    if (!legalNextStatuses.includes(status)) {
+      return res.status(409).json({
+        error: 'Cannot update this order',
+        details: `Order is currently '${order.status}' and can no longer be moved to '${status}'.`,
+      });
+    }
+
     const { data: updated, error: updateError } = await supabase
       .from('orders')
       .update({ status })
       .eq('id', id)
+      .eq('status', order.status)
       .select('id, order_number, status')
-      .single();
+      .maybeSingle();
     if (updateError) throw new Error(updateError.message || 'Failed to update order');
+    if (!updated) {
+      return res.status(409).json({
+        error: 'Cannot update this order',
+        details: 'This order was already updated by another request — refresh and try again.',
+      });
+    }
 
-    // Record status change in history table
+    // Record status change in history table. prep_time_minutes (merchant's
+    // estimate, picked when accepting into 'preparing') isn't a dedicated
+    // order column — it's just recorded here so it's visible on the order's
+    // timeline without needing a schema change for what's an informational
+    // estimate, not something anything else in the flow depends on.
+    const prepMinutes = Number(prep_time_minutes);
+    const notes =
+      status === 'preparing' && Number.isFinite(prepMinutes) && prepMinutes > 0
+        ? `Estimated prep time: ${Math.round(prepMinutes)} min`
+        : null;
     const { error: historyError } = await supabase.from('order_status_history').insert({
       order_id: updated.id,
       status,
-      notes: null,
+      notes,
       changed_by: req.userId,
     });
     if (historyError) {
@@ -3719,14 +3785,44 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
       });
     }
 
+    const totalAmount = Number(order.total_amount);
+    const wasPaid = order.payment_status === 'paid' && Number.isFinite(totalAmount) && totalAmount > 0;
+    const nextPaymentStatus = wasPaid ? 'refunded' : order.payment_status;
+
+    // Atomic, status-guarded claim: only a request whose WHERE clause still
+    // matches 'awaiting_payment'/'pending' at commit time gets a row back.
+    // This is what makes the whole handler safe under a double-tap or a
+    // client retry — a second concurrent request loses the race here and
+    // never reaches the refund-insert below, so the wallet can't be
+    // credited twice for one cancelled order.
+    const { data: updated, error: updateError } = await supabase
+      .from('orders')
+      .update({
+        status: 'cancelled',
+        payment_status: nextPaymentStatus,
+      })
+      .eq('id', id)
+      .in('status', ['awaiting_payment', 'pending'])
+      .select('id, order_number, status, payment_status')
+      .maybeSingle();
+
+    if (updateError) {
+      console.error('customer cancel order update error:', updateError);
+      throw new Error(updateError.message || 'Failed to cancel order');
+    }
+    if (!updated) {
+      return res.status(409).json({
+        error: 'Cannot cancel this order',
+        details: 'This order was already handled — refresh and check its current status.',
+      });
+    }
+
     // Refund to the customer's in-app wallet regardless of original payment
     // method. Pesepay (card/mobile money) has no refund/reversal API — the
     // only automated way to get money back to the customer is wallet credit,
     // same mechanism already used for wallet-paid orders. Cash never reaches
     // 'paid' before the merchant accepts, so this only ever fires for
     // wallet/pesepay orders that were actually charged upfront.
-    const totalAmount = Number(order.total_amount);
-    const wasPaid = order.payment_status === 'paid' && Number.isFinite(totalAmount) && totalAmount > 0;
     if (wasPaid) {
       const { data: lastTx } = await supabase
         .from('wallet_transactions')
@@ -3737,7 +3833,7 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
         .maybeSingle();
 
       const prevBalance = Number(lastTx?.balance_after) || 0;
-      const newBalance = prevBalance + totalAmount;
+      const newBalance = Math.round((prevBalance + totalAmount) * 100) / 100;
       const methodLabel = order.payment_method === 'pesepay' ? ' (paid via Pesepay)' : '';
 
       const { error: refundError } = await supabase.from('wallet_transactions').insert({
@@ -3761,23 +3857,6 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
         .update({ status: 'refunded' })
         .eq('order_id', order.id)
         .eq('customer_id', order.customer_id);
-    }
-
-    const nextPaymentStatus = wasPaid ? 'refunded' : order.payment_status;
-
-    const { data: updated, error: updateError } = await supabase
-      .from('orders')
-      .update({
-        status: 'cancelled',
-        payment_status: nextPaymentStatus,
-      })
-      .eq('id', id)
-      .select('id, order_number, status, payment_status')
-      .single();
-
-    if (updateError) {
-      console.error('customer cancel order update error:', updateError);
-      throw new Error(updateError.message || 'Failed to cancel order');
     }
 
     const { error: historyError } = await supabase.from('order_status_history').insert({
@@ -4089,10 +4168,17 @@ app.post('/courier/orders/:id/arrived', requireAuth, async (req, res) => {
       .from('orders')
       .update({ status: 'courier_arrived' })
       .eq('id', id)
+      .eq('status', 'assigned')
       .select('id, order_number, status')
-      .single();
+      .maybeSingle();
 
     if (updateError) throw new Error(updateError.message || 'Failed to update order');
+    if (!updated) {
+      return res.status(409).json({
+        error: 'Cannot mark arrived',
+        details: 'This order was already updated — refresh and try again.',
+      });
+    }
 
     await supabase.from('order_status_history').insert({
       order_id: id,
@@ -4177,12 +4263,19 @@ app.post('/merchant/orders/:id/confirm-dispatch', requireAuth, async (req, res) 
       .from('orders')
       .update({ status: 'merchant_confirmed' })
       .eq('id', id)
+      .in('status', ['assigned', 'courier_arrived'])
       .select('id, order_number, status, courier_id')
-      .single();
+      .maybeSingle();
 
     if (updateError) {
       console.error('merchant confirm dispatch update error:', updateError);
       throw new Error(updateError.message || 'Failed to confirm dispatch');
+    }
+    if (!updated) {
+      return res.status(409).json({
+        error: 'Cannot confirm dispatch',
+        details: 'This order was already updated — refresh and try again.',
+      });
     }
 
     const { error: historyError } = await supabase.from('order_status_history').insert({
@@ -4258,12 +4351,21 @@ app.post('/customer/orders/:id/confirm-delivery', requireAuth, async (req, res) 
         actual_delivery_time: new Date().toISOString(),
       })
       .eq('id', id)
+      .eq('status', 'delivery_confirmation_pending')
       .select('id, order_number, status, delivery_fee, actual_delivery_time')
-      .single();
+      .maybeSingle();
 
     if (updateError) {
       console.error('customer confirm delivery update error:', updateError);
       throw new Error(updateError.message || 'Failed to update order');
+    }
+    if (!updated) {
+      const { data: deliveredRow } = await supabase
+        .from('orders')
+        .select('id, order_number, status, delivery_fee, actual_delivery_time')
+        .eq('id', id)
+        .single();
+      return res.json({ order: deliveredRow });
     }
 
     const { error: historyError } = await supabase.from('order_status_history').insert({
@@ -5397,11 +5499,114 @@ app.post('/orders', requireAuth, async (req, res) => {
 
     const deliveryAddress = `${defAddr.address_line1}, ${defAddr.city}`;
 
-    // Compute amounts
-    const subtotal = items.reduce(
-      (sum, item) => sum + Number(item.subtotal || 0),
-      0,
-    );
+    // --- Authoritative server-side pricing ---------------------------------
+    // Prices/subtotals in the request body are NEVER trusted for money math —
+    // only product_id/quantity/unit/selected_options (i.e. *what* was
+    // ordered) are taken from the client. Every price is re-derived here
+    // from the current products/product_options rows, the exact same way
+    // GET /stores/:id/menu computed what the customer was actually shown.
+    if (items.some((it) => !it || !it.product_id)) {
+      return res.status(400).json({
+        error: 'Invalid items',
+        details: 'Every item must reference a product_id',
+      });
+    }
+    const productIds = [...new Set(items.map((it) => it.product_id))];
+    const { data: orderProducts, error: orderProductsError } = await supabase
+      .from('products')
+      .select('id, store_id, name, price, unit, is_available, stock_quantity')
+      .in('id', productIds);
+    if (orderProductsError) {
+      console.error('create order products lookup error:', orderProductsError);
+      throw new Error(orderProductsError.message || 'Failed to load products');
+    }
+    const productById = new Map((orderProducts || []).map((p) => [p.id, p]));
+    const optionGroupsByProduct = await fetchOptionGroupsForProducts(productIds);
+
+    let subtotal = 0;
+    const qtyByProduct = new Map();
+    const pricedItems = [];
+    for (const item of items) {
+      const product = productById.get(item.product_id);
+      if (!product || product.store_id !== store_id) {
+        return res.status(400).json({
+          error: 'Invalid item',
+          details: 'One or more items are not available from this store. Please refresh your cart.',
+        });
+      }
+      if (product.is_available === false) {
+        return res.status(400).json({
+          error: 'Item unavailable',
+          details: `"${product.name}" is no longer available.`,
+        });
+      }
+
+      const isKg = item.unit === 'kg';
+      const rawQty = Number(item.quantity);
+      const qty = isKg ? rawQty : Math.max(1, Math.floor(rawQty || 1));
+      if (!Number.isFinite(rawQty) || rawQty <= 0) {
+        return res.status(400).json({
+          error: 'Invalid quantity',
+          details: `Invalid quantity for "${product.name}".`,
+        });
+      }
+
+      const groupsForProduct = optionGroupsByProduct[item.product_id] || [];
+      const selectedOptionsInput = Array.isArray(item.selected_options)
+        ? item.selected_options.filter((s) => s && String(s.group || '').trim() && String(s.option || '').trim())
+        : [];
+      let optionsAdjustment = 0;
+      const selectedOptionsSnapshot = [];
+      for (const sel of selectedOptionsInput) {
+        const groupName = String(sel.group).trim();
+        const optionName = String(sel.option).trim();
+        const group = groupsForProduct.find((g) => g.name === groupName);
+        const option = group?.options.find((o) => o.name === optionName && o.is_available !== false);
+        if (!option) {
+          return res.status(400).json({
+            error: 'Invalid selection',
+            details: `"${optionName}" is no longer available for "${product.name}". Please refresh your cart.`,
+          });
+        }
+        const adj = applyPlatformMarkup(option.price_adjustment);
+        optionsAdjustment += adj;
+        selectedOptionsSnapshot.push({ group: groupName, option: optionName, price_adjustment: adj });
+      }
+
+      const unitPrice = Math.round((applyPlatformMarkup(product.price) + optionsAdjustment) * 100) / 100;
+      const lineTotal = Math.round(unitPrice * qty * 100) / 100;
+      subtotal = Math.round((subtotal + lineTotal) * 100) / 100;
+
+      if (!isKg) {
+        qtyByProduct.set(item.product_id, (qtyByProduct.get(item.product_id) || 0) + qty);
+      }
+
+      pricedItems.push({
+        product_id: item.product_id,
+        product_name: product.name,
+        product_price: unitPrice,
+        quantity: isKg ? 1 : qty,
+        unit: isKg ? 'kg' : 'item',
+        weight_kg: isKg ? qty : null,
+        subtotal: lineTotal,
+        selected_options: selectedOptionsSnapshot.length > 0 ? selectedOptionsSnapshot : null,
+      });
+    }
+
+    // Stock is checked against combined quantity across all cart lines for
+    // the same product (e.g. two lines of the same item with different
+    // option picks), not per-line — matches how stock is decremented below.
+    for (const [productId, totalQty] of qtyByProduct.entries()) {
+      const product = productById.get(productId);
+      if (product?.stock_quantity != null && totalQty > product.stock_quantity) {
+        return res.status(400).json({
+          error: 'Insufficient stock',
+          details: `Only ${product.stock_quantity} of "${product.name}" left in stock.`,
+        });
+      }
+    }
+    // -------------------------------------------------------------------------
+
     const distanceKm = haversineKm(
       store.latitude, store.longitude,
       defAddr.latitude, defAddr.longitude,
@@ -5431,6 +5636,29 @@ app.post('/orders', requireAuth, async (req, res) => {
         error: 'Invalid total',
         details: 'Order total must be greater than 0',
       });
+    }
+
+    // Atomically claim the redemption slot BEFORE creating the order (order_id
+    // is attached right after) — this is what actually closes the race the
+    // preview-only validateDiscountCode() call above can't: two concurrent
+    // checkouts with the same code near its limit will serialize here, and
+    // whichever loses gets a clean "no longer valid" instead of both getting
+    // the discount applied to their total while only one redemption sticks.
+    let discountRedemptionId = null;
+    if (discountResult?.valid) {
+      const { data: redemption, error: redeemError } = await supabase.rpc('redeem_discount_code', {
+        p_code_id: discountResult.codeRow.id,
+        p_customer_id: req.userId,
+        p_order_id: null,
+        p_discount_amount: discountAmount,
+      });
+      if (redeemError) {
+        console.error('discount code atomic redemption error:', redeemError);
+        return res.status(400).json({
+          error: 'This discount code just became unavailable — remove it and try again.',
+        });
+      }
+      discountRedemptionId = Array.isArray(redemption) ? redemption[0]?.id : redemption?.id;
     }
 
     // Pesepay-only online flow: order is created awaiting payment, then the
@@ -5470,45 +5698,25 @@ app.post('/orders', requireAuth, async (req, res) => {
 
     if (orderError) {
       console.error('create order insert order error:', orderError);
+      if (discountRedemptionId) {
+        // Free the redemption slot we atomically claimed above — the order
+        // never happened, so this customer's use of the code shouldn't count.
+        await supabase.from('discount_code_redemptions').delete().eq('id', discountRedemptionId);
+      }
       throw new Error(orderError.message || 'Failed to create order');
     }
 
-    if (discountResult?.valid) {
-      const { error: redemptionError } = await supabase.from('discount_code_redemptions').insert({
-        code_id: discountResult.codeRow.id,
-        customer_id: req.userId,
-        order_id: order.id,
-        discount_amount: discountAmount,
-      });
-      if (redemptionError) {
-        console.error('discount code redemption insert error:', redemptionError);
+    if (discountRedemptionId) {
+      const { error: redemptionLinkError } = await supabase
+        .from('discount_code_redemptions')
+        .update({ order_id: order.id })
+        .eq('id', discountRedemptionId);
+      if (redemptionLinkError) {
+        console.error('discount code redemption order-link error:', redemptionLinkError);
       }
     }
 
-    const orderItemsPayload = items.map((item) => {
-      // Snapshot of variant picks: [{ group, option, price_adjustment }]
-      const selectedOptions = Array.isArray(item.selected_options)
-        ? item.selected_options
-            .filter((s) => s && String(s.group || '').trim() && String(s.option || '').trim())
-            .map((s) => ({
-              group: String(s.group).trim(),
-              option: String(s.option).trim(),
-              price_adjustment: Number(s.price_adjustment) || 0,
-            }))
-        : null;
-
-      return {
-        order_id: order.id,
-        product_id: item.product_id,
-        product_name: item.product_name,
-        product_price: item.product_price,
-        quantity: item.unit === 'kg' ? 1 : item.quantity,
-        unit: item.unit === 'kg' ? 'kg' : 'item',
-        weight_kg: item.unit === 'kg' ? item.quantity : null,
-        subtotal: item.subtotal,
-        selected_options: selectedOptions && selectedOptions.length > 0 ? selectedOptions : null,
-      };
-    });
+    const orderItemsPayload = pricedItems.map((item) => ({ ...item, order_id: order.id }));
 
     const { error: itemsError } = await supabase
       .from('order_items')
@@ -5553,34 +5761,26 @@ app.post('/orders', requireAuth, async (req, res) => {
 
     // Inventory: decrement stock for tracked products (stock_quantity set).
     // At 0 the product auto-disables; the merchant is alerted at ≤5 and at 0.
+    // Quantities were already checked against stock above — this just applies
+    // the decrement (still clamped to 0 defensively in case a concurrent
+    // order for the same last-in-stock item landed in between).
     try {
       const LOW_STOCK_THRESHOLD = 5;
-      const qtyByProduct = new Map();
-      for (const item of items) {
-        if (!item.product_id) continue;
-        const qty = item.unit === 'kg' ? 1 : Math.max(1, Math.floor(Number(item.quantity) || 1));
-        qtyByProduct.set(item.product_id, (qtyByProduct.get(item.product_id) || 0) + qty);
-      }
-      if (qtyByProduct.size > 0) {
-        const { data: tracked } = await supabase
-          .from('products')
-          .select('id, name, stock_quantity')
-          .in('id', [...qtyByProduct.keys()])
-          .not('stock_quantity', 'is', null);
-        for (const p of tracked || []) {
-          const newQty = Math.max(0, Number(p.stock_quantity) - qtyByProduct.get(p.id));
-          const upd = { stock_quantity: newQty };
-          if (newQty === 0) upd.is_available = false;
-          await supabase.from('products').update(upd).eq('id', p.id);
-          if (store.merchant_id && (newQty === 0 || newQty <= LOW_STOCK_THRESHOLD)) {
-            await notifyMerchantStockLevel(supabase, {
-              merchantId: store.merchant_id,
-              productId: p.id,
-              productName: p.name,
-              stockQuantity: newQty,
-              outOfStock: newQty === 0,
-            });
-          }
+      for (const [productId, qty] of qtyByProduct.entries()) {
+        const product = productById.get(productId);
+        if (product?.stock_quantity == null) continue;
+        const newQty = Math.max(0, Number(product.stock_quantity) - qty);
+        const upd = { stock_quantity: newQty };
+        if (newQty === 0) upd.is_available = false;
+        await supabase.from('products').update(upd).eq('id', productId);
+        if (store.merchant_id && (newQty === 0 || newQty <= LOW_STOCK_THRESHOLD)) {
+          await notifyMerchantStockLevel(supabase, {
+            merchantId: store.merchant_id,
+            productId,
+            productName: product.name,
+            stockQuantity: newQty,
+            outOfStock: newQty === 0,
+          });
         }
       }
     } catch (stockErr) {
@@ -5694,7 +5894,7 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
     const { data: courier, error: courierError } = await supabase
       .from('couriers')
       .select(
-        'id, city, national_id, date_of_birth, drivers_license_number, verification_status',
+        'id, city, national_id, date_of_birth, drivers_license_number, verification_status, rejected_reason',
       )
       .eq('id', req.userId)
       .maybeSingle();
@@ -5749,6 +5949,8 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
     const onboardingComplete =
       hasProfile && hasVehicle && hasDriverLicense && hasPayoutMethod;
     const isApproved = verificationStatus === 'approved';
+    const isRejected = verificationStatus === 'rejected';
+    const rejectedReason = courier?.rejected_reason || null;
 
     return res.json({
       hasProfile,
@@ -5758,108 +5960,13 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
       verificationStatus,
       onboardingComplete,
       isApproved,
+      isRejected,
+      rejectedReason,
     });
   } catch (error) {
     console.error('get /courier/onboarding-status error:', error);
     return res.status(500).json({
       error: 'Failed to load courier onboarding status',
-      details: error.message || 'Please try again later',
-    });
-  }
-});
-
-// GET /business-types — get all business types (for business type selection)
-app.get('/business-types', async (req, res) => {
-  try {
-    if (!supabasePublic) throw new Error('Server not configured');
-
-    const { data, error } = await supabasePublic
-      .from('business_types')
-      .select('id, name, icon, is_custom')
-      .order('is_custom', { ascending: true })
-      .order('name', { ascending: true });
-
-    if (error) throw new Error(error.message || 'Failed to load business types');
-
-    return res.json({ business_types: data || [] });
-  } catch (error) {
-    console.error('get /business-types error:', error);
-    return res.status(500).json({
-      error: 'Failed to load business types',
-      details: error.message || 'Please try again later',
-    });
-  }
-});
-
-// POST /business-types — create a new business type (requires auth)
-app.post('/business-types', requireAuth, async (req, res) => {
-  try {
-    if (!supabase) throw new Error('Server not configured');
-
-    const { name, icon } = req.body || {};
-
-    if (!name || !name.trim()) {
-      return res.status(400).json({
-        error: 'Business type name is required',
-      });
-    }
-
-    // Check if already exists
-    const { data: existing } = await supabase
-      .from('business_types')
-      .select('id, name, icon')
-      .ilike('name', name.trim())
-      .maybeSingle();
-
-    if (existing) {
-      return res.json({ 
-        id: existing.id, 
-        name: existing.name, 
-        icon: existing.icon,
-        is_custom: true 
-      });
-    }
-
-    // Map business type to an icon
-    const iconMap = {
-      'restaurant': 'coffee',
-      'grocery': 'shopping-cart',
-      'pharmacy': 'activity',
-      'hardware': 'settings',
-      'pet': 'heart',
-      'electronics': 'cpu',
-      'clothing': 'shopping-bag',
-      'beauty': 'smile',
-      'furniture': 'home',
-      'books': 'book-open',
-    };
-    
-    const nameLower = name.toLowerCase();
-    let selectedIcon = icon || 'shopping-bag';
-    for (const [key, value] of Object.entries(iconMap)) {
-      if (nameLower.includes(key)) {
-        selectedIcon = value;
-        break;
-      }
-    }
-
-    const { data, error } = await supabase
-      .from('business_types')
-      .insert({
-        name: name.trim(),
-        icon: selectedIcon,
-        is_custom: true,
-      })
-      .select('id, name, icon, is_custom')
-      .single();
-
-    if (error) throw new Error(error.message || 'Failed to create business type');
-
-    return res.json(data);
-  } catch (error) {
-    console.error('post /business-types error:', error);
-    return res.status(500).json({
-      error: 'Failed to create business type',
       details: error.message || 'Please try again later',
     });
   }
@@ -6109,6 +6216,109 @@ app.get('/users/me/wallet-balance-24h', requireAuth, async (req, res) => {
   }
 });
 
+// POST /wallet/withdraw — customer/merchant/courier requests a payout of their
+// in-app wallet balance. The amount is debited immediately (so it can't be
+// spent twice while the request sits pending) and an admin reviews/pays it
+// out manually via the admin API below (no in-app admin UI, same pattern as
+// approvals/broadcasts/discount codes).
+app.post('/wallet/withdraw', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { amount, role } = req.body || {};
+    const validRoles = ['customer', 'merchant', 'courier'];
+    const requestedRole = validRoles.includes(role) ? role : null;
+    if (!requestedRole) {
+      return res.status(400).json({ error: 'Invalid role', details: `role must be one of: ${validRoles.join(', ')}` });
+    }
+    const amt = Math.round(Number(amount) * 100) / 100;
+    if (!Number.isFinite(amt) || amt <= 0) {
+      return res.status(400).json({ error: 'Invalid amount', details: 'amount must be > 0' });
+    }
+
+    const { data: pendingExisting } = await supabase
+      .from('withdrawal_requests')
+      .select('id')
+      .eq('user_id', req.userId)
+      .eq('status', 'pending')
+      .maybeSingle();
+    if (pendingExisting) {
+      return res.status(409).json({
+        error: 'Withdrawal already pending',
+        details: 'You already have a withdrawal request being reviewed.',
+      });
+    }
+
+    const { data: lastTx } = await supabase
+      .from('wallet_transactions')
+      .select('balance_after')
+      .eq('user_id', req.userId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const currentBalance = Number(lastTx?.balance_after) || 0;
+    if (amt > currentBalance) {
+      return res.status(400).json({
+        error: 'Insufficient balance',
+        details: `Your wallet balance is $${currentBalance.toFixed(2)}.`,
+      });
+    }
+
+    const { data: request, error: requestError } = await supabase
+      .from('withdrawal_requests')
+      .insert({ user_id: req.userId, role: requestedRole, amount: amt, status: 'pending' })
+      .select('*')
+      .single();
+    if (requestError) throw new Error(requestError.message || 'Failed to create withdrawal request');
+
+    const newBalance = Math.round((currentBalance - amt) * 100) / 100;
+    const { error: debitError } = await supabase.from('wallet_transactions').insert({
+      user_id: req.userId,
+      user_type: requestedRole,
+      transaction_type: 'withdrawal',
+      amount: -amt,
+      balance_after: newBalance,
+      description: 'Withdrawal requested',
+      reference_id: request.id,
+      status: 'pending',
+    });
+    if (debitError) {
+      // Roll back the request so the user isn't left with a phantom pending
+      // withdrawal that never actually reserved any funds.
+      await supabase.from('withdrawal_requests').delete().eq('id', request.id);
+      throw new Error(debitError.message || 'Failed to debit wallet');
+    }
+
+    return res.status(201).json({ request });
+  } catch (error) {
+    console.error('post /wallet/withdraw error:', error);
+    return res.status(500).json({
+      error: 'Failed to request withdrawal',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// GET /wallet/withdrawals — current user's own withdrawal request history
+app.get('/wallet/withdrawals', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { data, error } = await supabase
+      .from('withdrawal_requests')
+      .select('*')
+      .eq('user_id', req.userId)
+      .order('created_at', { ascending: false })
+      .limit(50);
+    if (error) throw new Error(error.message || 'Failed to load withdrawal requests');
+    return res.json({ requests: data || [] });
+  } catch (error) {
+    console.error('get /wallet/withdrawals error:', error);
+    return res.status(500).json({
+      error: 'Failed to load withdrawal requests',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // GET /users/me/notifications — notifications for current user (filter by ?role=customer|merchant|courier)
 app.get('/users/me/notifications', requireAuth, async (req, res) => {
   try {
@@ -6132,9 +6342,12 @@ app.get('/users/me/notifications', requireAuth, async (req, res) => {
       .eq('user_id', req.userId);
 
     // Audience lives inside the data jsonb (set by insertUserNotification).
-    // Untagged legacy rows are shown to every role.
+    // Untagged legacy rows and admin broadcasts sent to everyone ('all')
+    // are shown regardless of the requested role.
     if (requestedRole) {
-      query = query.or(`data->>audience.is.null,data->>audience.eq.${requestedRole}`);
+      query = query.or(
+        `data->>audience.is.null,data->>audience.eq.${requestedRole},data->>audience.eq.all`,
+      );
     }
 
     const { data, error } = await query
@@ -6569,6 +6782,34 @@ app.post('/payments/pesepay/direct', requireAuth, async (req, res) => {
     const expected = Number(ord.total_amount);
     if (!Number.isFinite(expected) || Math.abs(expected - Number(amount)) > 0.02) {
       return res.status(400).json({ error: 'Amount mismatch', details: 'amount must match the order total' });
+    }
+
+    // Same reconciliation guard as /payments/pesepay/start — without it, a
+    // customer whose webhook is delayed and who backs out and retries could
+    // trigger a second real charge for the same order.
+    const { data: existingPay } = await supabase
+      .from('payments')
+      .select('transaction_id, status')
+      .eq('order_id', orderId)
+      .eq('payment_method', 'pesepay')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (existingPay?.transaction_id) {
+      try {
+        const reconciled = await checkPesepayStatus(existingPay.transaction_id);
+        const reconciledPaymentStatus = String(reconciled?.order?.payment_status || '').toLowerCase();
+        if (['paid', 'completed'].includes(reconciledPaymentStatus)) {
+          return res.status(409).json({
+            error: 'Order already paid',
+            alreadyPaid: true,
+            paymentStatus: reconciledPaymentStatus,
+          });
+        }
+      } catch (reconcileErr) {
+        console.warn('[Pesepay] Pre-direct reconciliation failed (non-fatal):', reconcileErr?.message);
+      }
     }
 
     const apiBase = (process.env.PUBLIC_API_BASE_URL || process.env.API_BASE_URL || '').replace(/\/$/, '');
@@ -7674,6 +7915,120 @@ app.patch('/admin/discount-codes/:id', requireAdmin, async (req, res) => {
   }
 });
 
+// GET /admin/withdrawals — review queue for withdrawal requests (?status=pending|approved|rejected|paid)
+app.get('/admin/withdrawals', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const status = req.query.status ? String(req.query.status) : null;
+    let query = supabase
+      .from('withdrawal_requests')
+      .select('*, user_profiles ( full_name, phone, email )')
+      .order('created_at', { ascending: false })
+      .limit(200);
+    if (status) query = query.eq('status', status);
+    const { data, error } = await query;
+    if (error) throw new Error(error.message || 'Failed to load withdrawal requests');
+    return res.json({ requests: data || [] });
+  } catch (error) {
+    console.error('get /admin/withdrawals error:', error);
+    return res.status(500).json({
+      error: 'Failed to load withdrawal requests',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// PATCH /admin/withdrawals/:id — approve/reject/mark-paid. Rejecting refunds
+// the reserved amount back to the user's wallet; approve/paid just record
+// that the admin sent (or will send) the money outside the app.
+app.patch('/admin/withdrawals/:id', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { status, admin_note } = req.body || {};
+    const validStatuses = ['approved', 'rejected', 'paid'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ error: 'Invalid status', details: `status must be one of: ${validStatuses.join(', ')}` });
+    }
+
+    const { data: reqRow, error: reqError } = await supabase
+      .from('withdrawal_requests')
+      .select('id, user_id, role, amount, status')
+      .eq('id', id)
+      .maybeSingle();
+    if (reqError) throw new Error(reqError.message || 'Failed to load withdrawal request');
+    if (!reqRow) return res.status(404).json({ error: 'Withdrawal request not found' });
+
+    const { data: updated, error: updateError } = await supabase
+      .from('withdrawal_requests')
+      .update({ status, admin_note: admin_note || null, processed_at: new Date().toISOString() })
+      .eq('id', id)
+      .eq('status', 'pending')
+      .select('*')
+      .maybeSingle();
+    if (updateError) throw new Error(updateError.message || 'Failed to update withdrawal request');
+    if (!updated) {
+      return res.status(409).json({ error: 'Already processed', details: 'This request was already reviewed.' });
+    }
+
+    if (status === 'rejected') {
+      const { data: lastTx } = await supabase
+        .from('wallet_transactions')
+        .select('balance_after')
+        .eq('user_id', reqRow.user_id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      const prevBalance = Number(lastTx?.balance_after) || 0;
+      const newBalance = Math.round((prevBalance + Number(reqRow.amount)) * 100) / 100;
+      await supabase.from('wallet_transactions').insert({
+        user_id: reqRow.user_id,
+        user_type: reqRow.role,
+        transaction_type: 'refund',
+        amount: Number(reqRow.amount),
+        balance_after: newBalance,
+        description: 'Withdrawal request declined — funds returned to wallet',
+        reference_id: reqRow.id,
+        status: 'completed',
+      });
+    }
+
+    try {
+      const titleByStatus = {
+        approved: 'Withdrawal approved',
+        rejected: 'Withdrawal declined',
+        paid: 'Withdrawal paid',
+      };
+      const bodyByStatus = {
+        approved: `Your withdrawal of $${Number(reqRow.amount).toFixed(2)} was approved and is being processed.`,
+        rejected: admin_note
+          ? `Your withdrawal of $${Number(reqRow.amount).toFixed(2)} was declined: ${admin_note}. The amount has been returned to your wallet.`
+          : `Your withdrawal of $${Number(reqRow.amount).toFixed(2)} was declined. The amount has been returned to your wallet.`,
+        paid: `Your withdrawal of $${Number(reqRow.amount).toFixed(2)} has been paid out.`,
+      };
+      await insertUserNotification(supabase, {
+        userId: reqRow.user_id,
+        title: titleByStatus[status],
+        message: bodyByStatus[status],
+        type: 'payment',
+        referenceId: reqRow.id,
+        audience: reqRow.role,
+        data: { type: 'withdrawal_status', withdrawalId: reqRow.id, status },
+      });
+    } catch (notifyErr) {
+      console.error('withdrawal status notification failed (non-fatal):', notifyErr);
+    }
+
+    return res.json({ request: updated });
+  } catch (error) {
+    console.error('patch /admin/withdrawals/:id error:', error);
+    return res.status(500).json({
+      error: 'Failed to update withdrawal request',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // GET /admin/payout-details — everything needed to run distributions through
 // Pesepay (or any rail): each merchant/courier with earnings, their current
 // wallet balance, and their saved payout destination.
@@ -8683,7 +9038,18 @@ app.delete('/admin/products/:id', requireAdmin, async (req, res) => {
     if (!product) return res.status(404).json({ error: 'Product not found' });
 
     const { error } = await supabase.from('products').delete().eq('id', id);
-    if (error) throw new Error(error.message || 'Failed to delete product');
+    if (error) {
+      // order_items.product_id has no ON DELETE clause — any product that's
+      // ever been ordered hits a raw FK-violation (23503) here. Give a clean,
+      // actionable error instead of a 500 with a Postgres constraint message.
+      if (error.code === '23503') {
+        return res.status(409).json({
+          error: 'Cannot delete this product',
+          details: 'This product has order history and cannot be deleted. Disable it instead so it stops showing to customers.',
+        });
+      }
+      throw new Error(error.message || 'Failed to delete product');
+    }
     return res.json({ success: true });
   } catch (error) {
     console.error('delete /admin/products/:id error:', error);
@@ -8713,6 +9079,12 @@ app.post('/admin/stores/:storeId/products/upload-image', requireAdmin, async (re
       return res.status(400).json({ error: 'Invalid image payload', details: 'Expected base64 data URL' });
     }
     const mime = match[1];
+    if (!ALLOWED_IMAGE_MIME_TYPES.has(mime.toLowerCase())) {
+      return res.status(400).json({
+        error: 'Unsupported image type',
+        details: 'Only PNG, JPEG, and WebP images are accepted.',
+      });
+    }
     const buffer = Buffer.from(match[2], 'base64');
     const ext = mime.includes('png') ? 'png' : mime.includes('jpeg') || mime.includes('jpg') ? 'jpg' : 'bin';
     const filename = `${storeId}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
