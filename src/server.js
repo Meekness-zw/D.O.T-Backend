@@ -82,10 +82,63 @@ import {
 import crypto from 'crypto';
 import axios from 'axios';
 import { hashPassword } from './passwordHash.js';
+import { assertStrongPassword } from './passwordPolicy.js';
+import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
 
 const app = express();
 const supabase = supabaseAdmin;
 const PORT = process.env.PORT || 4000;
+
+// Rate limiting for auth endpoints (login, signup OTP, password reset).
+// In-memory (express-rate-limit's default store) — resets on every deploy
+// restart and doesn't share state across multiple instances, same caveat
+// the existing in-memory otpStore/resetOtpStore already have. Fine for the
+// current single-instance Render deployment; revisit with a shared store
+// (e.g. a Postgres/Redis-backed one) if this ever scales horizontally.
+// Keyed by IP + phone so one attacker can't lock out a real user by
+// spamming attempts against their number from a different IP, while still
+// capping how many times any single IP can hammer any single number.
+function authRateLimiter({ max, windowMinutes, message }) {
+  return rateLimit({
+    windowMs: windowMinutes * 60 * 1000,
+    max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => {
+      const phone = String(req.body?.phone || '').trim().toLowerCase();
+      return `${ipKeyGenerator(req)}:${phone || 'no-phone'}`;
+    },
+    handler: (req, res) => {
+      res.status(429).json({
+        error: 'Too many attempts',
+        details: message || `Too many attempts. Please try again in ${windowMinutes} minutes.`,
+      });
+    },
+  });
+}
+
+// 5 attempts / 15 min per IP+phone, matching the standard guidance for
+// credential-facing endpoints.
+const otpRequestLimiter = authRateLimiter({
+  max: 5,
+  windowMinutes: 15,
+  message: 'Too many verification code requests for this number. Please try again in 15 minutes.',
+});
+const otpVerifyLimiter = authRateLimiter({
+  max: 5,
+  windowMinutes: 15,
+  message: 'Too many incorrect codes. Please try again in 15 minutes or request a new code.',
+});
+const loginLimiter = authRateLimiter({
+  max: 5,
+  windowMinutes: 15,
+  message: 'Too many login attempts for this number. Please try again in 15 minutes.',
+});
+const passwordResetLimiter = authRateLimiter({
+  max: 5,
+  windowMinutes: 15,
+  message: 'Too many password reset attempts. Please try again in 15 minutes.',
+});
 
 // Find an auth user by phone number using digit-only comparison.
 // Supabase stores phones without the leading '+' (e.g. "263712345678"),
@@ -501,7 +554,7 @@ function friendlySmsError(smsErr) {
 const otpStore = new Map();
 
 // POST /auth/send-otp { phone, name, role, password }
-app.post('/auth/send-otp', async (req, res) => {
+app.post('/auth/send-otp', otpRequestLimiter, async (req, res) => {
   try {
     const { name, role, password } = req.body;
     const phone = normalizeE164(req.body?.phone);
@@ -518,6 +571,11 @@ app.post('/auth/send-otp', async (req, res) => {
     const validRoles = ['customer', 'merchant', 'courier'];
     if (!validRoles.includes(role)) {
       return res.status(400).json({ error: 'Invalid role' });
+    }
+
+    const passwordCheck = await assertStrongPassword(password);
+    if (!passwordCheck.valid) {
+      return res.status(400).json({ error: passwordCheck.error });
     }
 
     // Only allow signup for phones not already in user_profiles
@@ -560,7 +618,7 @@ app.post('/auth/send-otp', async (req, res) => {
 });
 
 // POST /auth/verify-otp { phone, code, isSignUp }
-app.post('/auth/verify-otp', async (req, res) => {
+app.post('/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
   try {
     const { code, isSignUp } = req.body;
     // Same normalization as send-otp so the store key always matches
@@ -647,7 +705,7 @@ app.post('/auth/verify-otp', async (req, res) => {
 const resetOtpStore = new Map();
 
 // POST /auth/forgot-password { phone }
-app.post('/auth/forgot-password', async (req, res) => {
+app.post('/auth/forgot-password', passwordResetLimiter, async (req, res) => {
   try {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone number is required' });
@@ -690,14 +748,15 @@ app.post('/auth/forgot-password', async (req, res) => {
 });
 
 // POST /auth/reset-password { phone, code, newPassword }
-app.post('/auth/reset-password', async (req, res) => {
+app.post('/auth/reset-password', passwordResetLimiter, async (req, res) => {
   try {
     const { phone, code, newPassword } = req.body;
     if (!phone || !code || !newPassword) {
       return res.status(400).json({ error: 'phone, code, and newPassword are required' });
     }
-    if (newPassword.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    const passwordCheck = await assertStrongPassword(newPassword);
+    if (!passwordCheck.valid) {
+      return res.status(400).json({ error: passwordCheck.error });
     }
 
     const normalised = normalizeE164(phone) || phone.replace(/[\s\-().]/g, '');
@@ -782,7 +841,7 @@ app.get('/', (req, res) => {
 });
 
 // GET /debug/pesepay — sanity-check Pesepay configuration (no secrets leaked)
-app.get('/debug/pesepay', (req, res) => {
+app.get('/debug/pesepay', requireAdmin, (req, res) => {
   try {
     const { integrationKey, encryptionKey } = getPesepayConfig();
     const publicApiBase = process.env.PUBLIC_API_BASE_URL || process.env.API_BASE_URL || null;
@@ -2198,8 +2257,9 @@ app.post('/merchant/customers/create', requireAuth, async (req, res) => {
     if (!phone.startsWith('+') || phone.length < 10) {
       return res.status(400).json({ error: 'Invalid phone number format. Use E.164 format e.g. +263712345678' });
     }
-    if (password.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    const passwordCheck = await assertStrongPassword(password);
+    if (!passwordCheck.valid) {
+      return res.status(400).json({ error: passwordCheck.error });
     }
 
     // Reject duplicate phone
@@ -3251,7 +3311,7 @@ app.delete('/merchant/products/:id', requireAuth, async (req, res) => {
 });
 
 // POST /auth/login-password { phone, password }
-app.post('/auth/login-password', async (req, res) => {
+app.post('/auth/login-password', loginLimiter, async (req, res) => {
   try {
     const { phone, password } = req.body || {};
 
@@ -3369,8 +3429,9 @@ app.post('/auth/register', async (req, res) => {
       return res.status(400).json({ error: 'Invalid phone number format. Use E.164 format (e.g. +263712345678)' });
     }
 
-    if (password.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    const passwordCheck = await assertStrongPassword(password);
+    if (!passwordCheck.valid) {
+      return res.status(400).json({ error: passwordCheck.error });
     }
 
     // Reject duplicate phone numbers
@@ -3416,41 +3477,6 @@ app.post('/auth/register', async (req, res) => {
   }
 });
 
-
-// POST /users/ensure-profile { userId, email, phone, fullName, role, password }
-app.post('/users/ensure-profile', async (req, res) => {
-  try {
-    const { userId, email, phone, fullName, role, password } = req.body;
-
-    if (!userId || !role) {
-      return res.status(400).json({
-        error: 'Missing required fields',
-        details: 'userId and role are required'
-      });
-    }
-
-    // Validate role
-    const validRoles = ['customer', 'merchant', 'courier'];
-    if (!validRoles.includes(role)) {
-      return res.status(400).json({
-        error: 'Invalid role',
-        details: `Role must be one of: ${validRoles.join(', ')}`
-      });
-    }
-
-    await ensureUserProfile({ userId, email, phone, fullName, role, password });
-    return res.json({
-      success: true,
-      message: 'User profile created successfully'
-    });
-  } catch (error) {
-    console.error('ensure-profile error:', error);
-    return res.status(500).json({
-      error: 'Failed to create user profile',
-      details: error.message || 'Please try again later'
-    });
-  }
-});
 
 // GET /users/profile — returns current user's profile from DB (auth required)
 app.get('/users/profile', requireAuth, async (req, res) => {
@@ -7606,6 +7632,94 @@ app.get('/admin/orders', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('admin/orders error:', error);
     return res.status(500).json({ error: 'Failed to load orders', details: error.message || 'Try again later' });
+  }
+});
+
+// POST /admin/orders/:id/refund — manual admin-issued refund to the
+// customer's wallet. The normal cancel flow (POST /orders/:id/cancel)
+// already auto-refunds paid orders the customer cancels themselves before
+// the merchant accepts — this is the manual override for everything else:
+// re-issuing a refund that failed, a partial refund for a wrong/missing
+// item, or refunding an order an admin reviewed after seeing it was
+// cancelled some other way. List cancelled orders first via
+// GET /admin/orders?status=cancelled to find what needs a look.
+app.post('/admin/orders/:id/refund', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { amount, reason } = req.body || {};
+
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .select('id, order_number, customer_id, total_amount, payment_status, status')
+      .eq('id', id)
+      .maybeSingle();
+    if (orderError) throw new Error(orderError.message || 'Failed to load order');
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    const orderTotal = Number(order.total_amount) || 0;
+    const refundAmount = amount != null ? Math.round(Number(amount) * 100) / 100 : orderTotal;
+    if (!Number.isFinite(refundAmount) || refundAmount <= 0) {
+      return res.status(400).json({ error: 'Invalid amount', details: 'amount must be > 0' });
+    }
+
+    const { data: lastTx } = await supabase
+      .from('wallet_transactions')
+      .select('balance_after')
+      .eq('user_id', order.customer_id)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const prevBalance = Number(lastTx?.balance_after) || 0;
+    const newBalance = Math.round((prevBalance + refundAmount) * 100) / 100;
+
+    const { data: refundTx, error: refundError } = await supabase
+      .from('wallet_transactions')
+      .insert({
+        user_id: order.customer_id,
+        user_type: 'customer',
+        transaction_type: 'refund',
+        amount: refundAmount,
+        balance_after: newBalance,
+        description: reason
+          ? `Admin refund: order ${order.order_number} — ${reason}`
+          : `Admin refund: order ${order.order_number}`,
+        reference_id: order.id,
+        status: 'completed',
+      })
+      .select('*')
+      .single();
+    if (refundError) throw new Error(refundError.message || 'Failed to issue refund');
+
+    // Only flip payment_status for a full refund — a partial refund (e.g.
+    // one missing item) shouldn't make an otherwise-fulfilled order look
+    // fully reversed.
+    const isFullRefund = refundAmount >= orderTotal - 0.01;
+    if (isFullRefund && order.payment_status !== 'refunded') {
+      await supabase.from('orders').update({ payment_status: 'refunded' }).eq('id', order.id);
+    }
+
+    try {
+      await insertUserNotification(supabase, {
+        userId: order.customer_id,
+        title: 'Refund issued',
+        message: `You've been refunded $${refundAmount.toFixed(2)} for order ${order.order_number}.`,
+        type: 'payment',
+        referenceId: order.id,
+        audience: 'customer',
+        data: { type: 'admin_refund', orderId: order.id, amount: refundAmount },
+      });
+    } catch (notifyErr) {
+      console.error('admin refund notification failed (non-fatal):', notifyErr);
+    }
+
+    return res.json({ refund: refundTx, newBalance, fullRefund: isFullRefund });
+  } catch (error) {
+    console.error('post /admin/orders/:id/refund error:', error);
+    return res.status(500).json({
+      error: 'Failed to issue refund',
+      details: error.message || 'Please try again later',
+    });
   }
 });
 
