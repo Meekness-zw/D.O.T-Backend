@@ -414,9 +414,28 @@ if (missingEnvVars.length > 0) {
 }
 
 // CORS configuration
+//
+// Vercel mints a new hostname for every deployment, so a list of exact origins
+// goes stale on each push and silently breaks auth on the live site. Entries in
+// ALLOWED_ORIGINS may therefore use `*` as a wildcard, e.g.
+//   https://d-o-t-courier-dashboard*.vercel.app
+// The wildcard deliberately does not match `.`, so it stays inside a single
+// hostname segment and cannot be widened into another domain.
 const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
+  ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim()).filter(Boolean)
   : [];
+
+const exactOrigins = new Set(allowedOrigins.filter(origin => !origin.includes('*')));
+const originPatterns = allowedOrigins
+  .filter(origin => origin.includes('*'))
+  .map(origin => new RegExp(
+    `^${origin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '[a-z0-9-]*')}$`,
+    'i',
+  ));
+
+function isOriginAllowed(origin) {
+  return exactOrigins.has(origin) || originPatterns.some(pattern => pattern.test(origin));
+}
 
 app.use(cors({
   origin: (origin, callback) => {
@@ -426,8 +445,13 @@ app.use(cors({
     // If ALLOWED_ORIGINS is not configured, keep permissive behavior for development.
     if (!allowedOrigins.length) return callback(null, true);
 
-    if (allowedOrigins.includes(origin)) return callback(null, true);
-    return callback(new Error(`CORS blocked for origin: ${origin}`));
+    if (isOriginAllowed(origin)) return callback(null, true);
+
+    // Reject without throwing. Passing an Error here escapes into Express error
+    // handling and returns a 500 HTML page with no CORS headers, which browsers
+    // surface as an opaque network failure ("Load failed") rather than as CORS.
+    console.warn(`CORS blocked for origin: ${origin}`);
+    return callback(null, false);
   },
   credentials: true,
 }));
