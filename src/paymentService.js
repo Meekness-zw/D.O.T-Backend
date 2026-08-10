@@ -5,6 +5,7 @@ import { getPesepayConfig } from './pesepayConfig.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { computeSubtotalSplit, recordMerchantEarningsForOrderPayment } from './orderPaymentSplit.js';
 import { insertUserNotification } from './orderNotifications.js';
+import { getWalletBalance } from './walletLedger.js';
 
 const supabase = supabaseAdmin;
 
@@ -476,16 +477,8 @@ export async function checkPesepayStatus(referenceNumber) {
 }
 
 async function createWalletTransactionForPayment({ userId, amount, currencyCode, paymentId }) {
-  // Fetch latest balance
-  const { data: lastTx } = await supabase
-    .from('wallet_transactions')
-    .select('balance_after')
-    .eq('user_id', userId)
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  const prevBalance = Number(lastTx?.balance_after) || 0;
+  // Top-ups are always the customer wallet.
+  const prevBalance = await getWalletBalance(userId, 'customer');
   const newBalance = Math.round((prevBalance + Number(amount)) * 100) / 100;
 
   const { data, error } = await supabase
@@ -630,7 +623,10 @@ export async function handlePesepayCallback(callbackBody) {
 /**
  * After Pesepay confirms a payment linked to an order: mark order paid, apply merchant split.
  */
-async function finalizeOrderPaymentFromPesepay({ payment, paymentStatus, transaction }) {
+// Exported so a synchronous payment method (wallet) can reuse the exact same
+// "mark order paid, split merchant earnings, notify merchant" logic that the
+// Pesepay webhook uses — the only difference is what triggers it.
+export async function finalizeOrderPaymentFromPesepay({ payment, paymentStatus, transaction }) {
   if (!supabase || !payment?.order_id) return null;
 
   const { data: order, error: orderLoadError } = await supabase

@@ -20,6 +20,7 @@ import {
   sandboxFinalizePaymentFromReturn,
   listPesepayActiveCurrencies,
   listPesepayPaymentMethods,
+  finalizeOrderPaymentFromPesepay,
 } from './paymentService.js';
 import { getPesepayConfig } from './pesepayConfig.js';
 import { createSupabaseAccessToken, verifyAccessToken } from './sessionToken.js';
@@ -83,6 +84,7 @@ import crypto from 'crypto';
 import axios from 'axios';
 import { hashPassword } from './passwordHash.js';
 import { assertStrongPassword } from './passwordPolicy.js';
+import { getWalletBalance } from './walletLedger.js';
 import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
 
 const app = express();
@@ -1071,6 +1073,22 @@ app.get('/stores', async (req, res) => {
     const limit = Math.min(parseInt(limitParam, 10) || 50, 100);
     const offset = parseInt(offsetParam, 10) || 0;
 
+    let userLat = null;
+    let userLng = null;
+    if (user_lat != null && user_lat !== '' && user_lng != null && user_lng !== '') {
+      const latNum = Number(user_lat);
+      const lngNum = Number(user_lng);
+      if (Number.isFinite(latNum) && Number.isFinite(lngNum)) {
+        userLat = latNum;
+        userLng = lngNum;
+      }
+    }
+    // A direct id lookup (opening a specific store page) should always
+    // succeed regardless of distance — only the browse/listing case is
+    // distance-gated.
+    const hasLocation = !id && userLat != null && userLng != null;
+    const wantsPromosOnly = hasPromos === 'true';
+
     let query = supabasePublic
       .from('stores')
       .select(
@@ -1089,11 +1107,11 @@ app.get('/stores', async (req, res) => {
           is_active,
           operating_hours,
           category_override,
+          delivery_radius_km,
           merchants ( business_type )
         `,
       )
-      .eq('is_active', true)
-      .range(offset, offset + limit - 1);
+      .eq('is_active', true);
 
     if (id) {
       query = query.eq('id', id);
@@ -1113,39 +1131,92 @@ app.get('/stores', async (req, res) => {
       query = query.or(`store_name.ilike.${term},description.ilike.${term},city.ilike.${term}`);
     }
 
+    // Distance and hasPromos are both filters applied in JS below (each store
+    // has its own delivery_radius_km; "has an active promo" needs a second
+    // table). Paginating at the DB level BEFORE those filters run would
+    // return a page that's mostly/entirely filtered away even though
+    // eligible stores exist further down the unfiltered set. So: when either
+    // filter is in play, fetch a generous bounded batch instead of the exact
+    // requested page, filter, then paginate in JS; otherwise paginate at the
+    // DB level as before.
+    const needsPostFilterPagination = hasLocation || wantsPromosOnly;
+    const DISTANCE_FETCH_CAP = 500;
+    query = needsPostFilterPagination
+      ? query.range(0, DISTANCE_FETCH_CAP - 1)
+      : query.range(offset, offset + limit - 1);
+
     const { data, error } = await query;
     if (error) {
       console.error('public /stores error:', error);
       throw new Error(error.message || 'Failed to load stores');
     }
 
-    // Basic placeholder for promotions flag: if hasPromos=true, keep as is for now (extend when promotions table exists)
     let stores = data || [];
-    if (hasPromos === 'true') {
-      stores = stores.slice(0, 10);
-    }
 
-    // Attach distance + ETA if user lat/lng provided
-    let userLat = null;
-    let userLng = null;
-    if (user_lat != null && user_lat !== '' && user_lng != null && user_lng !== '') {
-      const latNum = Number(user_lat);
-      const lngNum = Number(user_lng);
-      if (Number.isFinite(latNum) && Number.isFinite(lngNum)) {
-        userLat = latNum;
-        userLng = lngNum;
-      }
-    }
-
-    if (userLat != null && userLng != null) {
-      stores = stores.map((s) => {
-        if (s.latitude != null && s.longitude != null) {
+    // Only show stores that can actually deliver to this customer — within
+    // that store's own delivery_radius_km, not every active store in the
+    // database regardless of how far away it is.
+    const DEFAULT_DELIVERY_RADIUS_KM = 10;
+    if (hasLocation) {
+      stores = stores
+        .map((s) => {
+          if (s.latitude == null || s.longitude == null) {
+            return { ...s, distance_km: null, eta_minutes: null };
+          }
           const distance_km = haversineKm(userLat, userLng, s.latitude, s.longitude);
           const eta_minutes = estimateEtaMinutes(distance_km);
           return { ...s, distance_km, eta_minutes };
-        }
-        return { ...s, distance_km: null, eta_minutes: null };
-      });
+        })
+        .filter((s) => {
+          // No coordinates on file → can't confirm it's actually deliverable, exclude rather than guess.
+          if (s.distance_km == null) return false;
+          const radiusKm = Number(s.delivery_radius_km) || DEFAULT_DELIVERY_RADIUS_KM;
+          return s.distance_km <= radiusKm;
+        });
+    }
+
+    // hasPromos: only stores with a currently-live promotion — same
+    // is_active / starts_at / ends_at "live" rule GET /public/promotions
+    // uses (a date-only ends_at is treated as inclusive through end of day).
+    if (wantsPromosOnly) {
+      const { data: promoRows, error: promoError } = await supabasePublic
+        .from('promotions')
+        .select('store_id, is_active, starts_at, ends_at');
+      if (promoError) {
+        console.error('public /stores hasPromos lookup error:', promoError);
+        stores = [];
+      } else {
+        const nowMs = Date.now();
+        const liveStoreIds = new Set(
+          (promoRows || [])
+            .filter((p) => {
+              if (p.is_active !== true) return false;
+              if (p.starts_at) {
+                const startMs = Date.parse(p.starts_at);
+                if (Number.isFinite(startMs) && startMs > nowMs) return false;
+              }
+              if (p.ends_at) {
+                let endMs = Date.parse(p.ends_at);
+                if (Number.isFinite(endMs)) {
+                  const end = new Date(endMs);
+                  if (end.getUTCHours() === 0 && end.getUTCMinutes() === 0 && end.getUTCSeconds() === 0) {
+                    endMs += 24 * 60 * 60 * 1000 - 1000; // date-only end → inclusive end of day
+                  }
+                  if (endMs < nowMs) return false;
+                }
+              }
+              return true;
+            })
+            .map((p) => p.store_id),
+        );
+        stores = stores.filter((s) => liveStoreIds.has(s.id));
+      }
+    }
+
+    // Paginate AFTER the filters above so limit/offset reflect the actually-
+    // eligible set rather than the raw unfiltered fetch.
+    if (needsPostFilterPagination) {
+      stores = stores.slice(offset, offset + limit);
     }
 
     // Flatten merchants.business_type → top-level business_type, preferring the
@@ -1187,6 +1258,13 @@ app.post('/couriers/onboarding/profile', requireAuth, async (req, res) => {
       profilePhotoBase64,
       nationalIdPhotoBase64,
     } = req.body || {};
+
+    if (!profilePhotoBase64) {
+      return res.status(400).json({
+        error: 'Profile photo is required',
+        details: 'Upload a clear front-facing photo before continuing.',
+      });
+    }
 
     const data = await upsertCourierProfile({
       userId: req.userId,
@@ -3874,15 +3952,7 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
     // 'paid' before the merchant accepts, so this only ever fires for
     // wallet/pesepay orders that were actually charged upfront.
     if (wasPaid) {
-      const { data: lastTx } = await supabase
-        .from('wallet_transactions')
-        .select('balance_after')
-        .eq('user_id', order.customer_id)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      const prevBalance = Number(lastTx?.balance_after) || 0;
+      const prevBalance = await getWalletBalance(order.customer_id, 'customer');
       const newBalance = Math.round((prevBalance + totalAmount) * 100) / 100;
       const methodLabel = order.payment_method === 'pesepay' ? ' (paid via Pesepay)' : '';
 
@@ -3948,6 +4018,7 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
         `
         id,
         order_number,
+        delivery_code,
         customer_id,
         store_id,
         courier_id,
@@ -4016,6 +4087,10 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
         details: 'You are not allowed to view this order',
       });
     }
+
+    // The handoff secret belongs only to the customer. Couriers and merchants
+    // can view the order, but must never be able to retrieve the code.
+    if (!isCustomer) delete order.delivery_code;
 
     let courier_full_name = null;
     let courier_phone = null;
@@ -4387,65 +4462,14 @@ app.post('/customer/orders/:id/confirm-delivery', requireAuth, async (req, res) 
       return res.json({ order: deliveredRow });
     }
 
-    if (order.status !== 'delivery_confirmation_pending') {
-      return res.status(400).json({
-        error: 'Cannot confirm delivery',
-        details: 'Delivery confirmation is not pending for this order.',
-      });
-    }
-
-    const { data: updated, error: updateError } = await supabase
-      .from('orders')
-      .update({
-        status: 'delivered',
-        actual_delivery_time: new Date().toISOString(),
-      })
-      .eq('id', id)
-      .eq('status', 'delivery_confirmation_pending')
-      .select('id, order_number, status, delivery_fee, actual_delivery_time')
-      .maybeSingle();
-
-    if (updateError) {
-      console.error('customer confirm delivery update error:', updateError);
-      throw new Error(updateError.message || 'Failed to update order');
-    }
-    if (!updated) {
-      const { data: deliveredRow } = await supabase
-        .from('orders')
-        .select('id, order_number, status, delivery_fee, actual_delivery_time')
-        .eq('id', id)
-        .single();
-      return res.json({ order: deliveredRow });
-    }
-
-    const { error: historyError } = await supabase.from('order_status_history').insert({
-      order_id: id,
-      status: 'delivered',
-      notes: 'Customer confirmed delivery',
-      changed_by: req.userId,
+    // Delivery completion now requires the courier to submit the customer's
+    // handoff code. Do not leave the former customer-confirm endpoint as a
+    // way to bypass that verification.
+    return res.status(409).json({
+      error: 'Delivery code required',
+      details: 'Give your four-digit delivery code to the courier after receiving the order.',
     });
-    if (historyError) {
-      console.error('order_status_history insert (customer confirmed delivery) error:', historyError);
-    }
 
-    if (order.courier_id) {
-      const payoutUsd = computeCourierDeliveryPayoutUsd(Number(order.delivery_fee) || 0);
-      await recordCourierDeliveryEarnings({
-        courierId: order.courier_id,
-        orderId: id,
-        amount: payoutUsd,
-        orderNumber: order.order_number,
-      });
-
-      // Merchant + courier earnings accrue to their in-app wallet for manual
-      // cashout. (Pesepay is collections-only — there is no auto-disbursement.)
-
-      // Client's call: couriers only get pushed "there's a job" — no
-      // "delivery confirmed" congratulation ping. The payout still lands in
-      // their wallet (above); they'll see it next time they open the app.
-    }
-
-    return res.json({ order: updated });
   } catch (error) {
     console.error('post /customer/orders/:id/confirm-delivery error:', error);
     return res.status(500).json({
@@ -5213,6 +5237,35 @@ app.post('/courier/orders/:id/pickup', requireAuth, async (req, res) => {
       console.error('order_status_history insert (in_transit) error:', historyError);
     }
 
+    // This is the useful, actionable lifecycle notification the customer asked
+    // for: it appears in the phone's notification shade and opens live tracking.
+    // Best-effort only; a push failure must never block the courier workflow.
+    try {
+      const { data: deliveryContext } = await supabase
+        .from('orders')
+        .select('customer_id, order_number, stores ( store_name )')
+        .eq('id', id)
+        .maybeSingle();
+      if (deliveryContext?.customer_id) {
+        await insertUserNotification(supabase, {
+          userId: deliveryContext.customer_id,
+          title: 'Your order is on the way',
+          message: `Order #${deliveryContext.order_number || ''} has been picked up. Tap to track your delivery live.`,
+          type: 'delivery',
+          referenceId: id,
+          audience: 'customer',
+          data: {
+            orderId: id,
+            orderNumber: deliveryContext.order_number,
+            storeName: deliveryContext.stores?.store_name || 'Store',
+            status: 'in_transit',
+          },
+        });
+      }
+    } catch (notifyErr) {
+      console.warn('customer in-transit notification failed (non-fatal):', notifyErr?.message || notifyErr);
+    }
+
     return res.json({ order: updated });
   } catch (error) {
     console.error('post /courier/orders/:id/pickup error:', error);
@@ -5223,7 +5276,11 @@ app.post('/courier/orders/:id/pickup', requireAuth, async (req, res) => {
   }
 });
 
-// POST /courier/orders/:id/complete — mark delivered; credit courier delivery_fee to wallet
+// Keep a small in-memory brute-force guard in addition to the four-digit format.
+// A successful attempt clears the record; failed attempts expire after 10 min.
+const deliveryCodeAttempts = new Map();
+
+// POST /courier/orders/:id/complete { delivery_code } — verify handoff and complete
 app.post('/courier/orders/:id/complete', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
@@ -5240,7 +5297,7 @@ app.post('/courier/orders/:id/complete', requireAuth, async (req, res) => {
     const { data: order, error: orderError } = await supabase
       .from('orders')
       .select(
-        'id, courier_id, customer_id, status, order_number, delivery_fee, total_amount, payment_status, payment_method'
+        'id, courier_id, customer_id, status, order_number, delivery_code, delivery_fee, total_amount, payment_status, payment_method'
       )
       .eq('id', id)
       .maybeSingle();
@@ -5276,74 +5333,94 @@ app.post('/courier/orders/:id/complete', requireAuth, async (req, res) => {
       });
     }
 
-    const deliveryFee = Number(order.delivery_fee) || 0;
-
-    // If the courier already requested delivery confirmation, return the pending order state.
-    if (order.status === 'delivery_confirmation_pending') {
-      const { data: pendingOrder, error: pendingError } = await supabase
-        .from('orders')
-        .select('id, order_number, status, delivery_fee')
-        .eq('id', id)
-        .single();
-      if (pendingError) {
-        console.error('courier complete pending order error:', pendingError);
-        throw new Error(pendingError.message || 'Failed to load pending order');
-      }
-      return res.json({ order: pendingOrder });
+    if (order.status === 'delivered') {
+      return res.json({ order: { id: order.id, order_number: order.order_number, status: 'delivered' } });
     }
 
-    const allowedBeforeDelivered = ['picked_up', 'in_transit'];
+    const allowedBeforeDelivered = ['picked_up', 'in_transit', 'delivery_confirmation_pending'];
     if (!allowedBeforeDelivered.includes(order.status)) {
       return res.status(400).json({
         error: 'Cannot complete delivery',
-        details: 'Order must be picked up and on the way before confirmation can be requested',
+        details: 'Order must be picked up and on the way before it can be completed',
       });
     }
 
-    const { data: pending, error: updateError } = await supabase
+    const suppliedCode = String(req.body?.delivery_code || '').trim();
+    if (!/^\d{4}$/.test(suppliedCode)) {
+      return res.status(400).json({
+        error: 'Invalid delivery code',
+        details: 'Enter the four-digit code shown in the customer app.',
+      });
+    }
+
+    const attemptKey = `${req.userId}:${id}`;
+    const now = Date.now();
+    const attempt = deliveryCodeAttempts.get(attemptKey);
+    const recentAttempt = attempt && now - attempt.startedAt < 10 * 60 * 1000 ? attempt : { count: 0, startedAt: now };
+    if (recentAttempt.count >= 5) {
+      return res.status(429).json({
+        error: 'Too many incorrect attempts',
+        details: 'Wait 10 minutes, then ask the customer to confirm the code again.',
+      });
+    }
+    if (!order.delivery_code || suppliedCode !== String(order.delivery_code)) {
+      recentAttempt.count += 1;
+      deliveryCodeAttempts.set(attemptKey, recentAttempt);
+      return res.status(400).json({
+        error: 'Incorrect delivery code',
+        details: 'The code does not match. Ask the customer for the code shown on their order.',
+      });
+    }
+
+    const { data: completed, error: updateError } = await supabase
       .from('orders')
       .update({
-        status: 'delivery_confirmation_pending',
+        status: 'delivered',
+        actual_delivery_time: new Date().toISOString(),
       })
       .eq('id', id)
-      .select('id, order_number, status, delivery_fee')
-      .single();
+      .in('status', allowedBeforeDelivered)
+      .select('id, order_number, status, delivery_fee, actual_delivery_time')
+      .maybeSingle();
 
     if (updateError) {
       console.error('courier complete update error:', updateError);
-      throw new Error(updateError.message || 'Failed to update order');
+      throw new Error(updateError.message || 'Failed to complete order');
     }
+    if (!completed) return res.status(409).json({ error: 'Order status changed', details: 'Refresh the order and try again.' });
+    deliveryCodeAttempts.delete(attemptKey);
 
     const { error: historyError } = await supabase.from('order_status_history').insert({
       order_id: id,
-      status: 'delivery_confirmation_pending',
-      notes: 'Courier requested delivery confirmation from customer',
+      status: 'delivered',
+      notes: 'Courier completed delivery using customer handoff code',
       changed_by: req.userId,
     });
     if (historyError) {
-      console.error('order_status_history insert (delivery_confirmation_pending) error:', historyError);
+      console.error('order_status_history insert (delivery code completion) error:', historyError);
     }
 
-    // Notify customer to confirm delivery — third and last of the 3 lifecycle
-    // pushes (Order Placed, On the Way, Arrived). Goes through the normal
-    // in-app notification path (not a raw push) so it shows in the Notification
-    // Center and carries the same deep-link data shape as the others.
+    const payoutUsd = computeCourierDeliveryPayoutUsd(Number(order.delivery_fee) || 0);
+    await recordCourierDeliveryEarnings({
+      courierId: order.courier_id,
+      orderId: id,
+      amount: payoutUsd,
+      orderNumber: order.order_number,
+    });
+
     try {
-      const orderLabel = order.order_number ? `#${order.order_number}` : 'Your order';
       await insertUserNotification(supabase, {
         userId: order.customer_id,
-        title: 'Arrived',
-        message: `${orderLabel} has arrived. Please confirm you received it.`,
-        type: 'delivery',
-        referenceId: id,
-        audience: 'customer',
-        data: { orderId: id, orderNumber: order.order_number, deliveryConfirmation: true },
+        title: 'Delivery complete',
+        message: `Order #${order.order_number || ''} was delivered successfully.`,
+        type: 'delivery', referenceId: id, audience: 'customer',
+        data: { orderId: id, orderNumber: order.order_number, status: 'delivered' },
       });
-    } catch (pushErr) {
-      console.warn('[Push] Failed to notify customer of delivery confirmation request:', pushErr?.message);
+    } catch (notifyErr) {
+      console.warn('[Push] Failed to notify customer of completed delivery:', notifyErr?.message);
     }
 
-    return res.json({ order: pending });
+    return res.json({ order: completed });
   } catch (error) {
     console.error('post /courier/orders/:id/complete error:', error);
     return res.status(500).json({
@@ -5450,10 +5527,10 @@ app.post('/orders', requireAuth, async (req, res) => {
       });
     }
 
-    if (payment_method !== 'pesepay') {
+    if (payment_method !== 'pesepay' && payment_method !== 'wallet') {
       return res.status(400).json({
         error: 'Invalid payment_method',
-        details: 'payment_method must be pesepay',
+        details: 'payment_method must be pesepay or wallet',
       });
     }
 
@@ -5688,6 +5765,20 @@ app.post('/orders', requireAuth, async (req, res) => {
       });
     }
 
+    // Wallet payment: confirm the balance covers this order BEFORE claiming a
+    // discount code slot or creating anything else — an order that can't be
+    // paid for shouldn't have any side effects. The wallet is spend-only (no
+    // partial/split payment): it either covers the whole order or it doesn't.
+    if (payment_method === 'wallet') {
+      const currentBalance = await getWalletBalance(req.userId, 'customer');
+      if (currentBalance < totalAmount) {
+        return res.status(400).json({
+          error: 'Insufficient wallet balance',
+          details: `Your wallet balance is $${currentBalance.toFixed(2)}, which doesn't cover this $${totalAmount.toFixed(2)} order.`,
+        });
+      }
+    }
+
     // Atomically claim the redemption slot BEFORE creating the order (order_id
     // is attached right after) — this is what actually closes the race the
     // preview-only validateDiscountCode() call above can't: two concurrent
@@ -5718,12 +5809,14 @@ app.post('/orders', requireAuth, async (req, res) => {
 
     // Generate simple order_number
     const orderNumber = `DOT-${Date.now().toString(36).toUpperCase()}`;
+    const deliveryCode = String(crypto.randomInt(0, 10000)).padStart(4, '0');
 
     // Create order + items in a single transaction
     const { data: order, error: orderError } = await supabase
       .from('orders')
       .insert({
         order_number: orderNumber,
+        delivery_code: deliveryCode,
         customer_id: req.userId,
         store_id,
         status: orderStatus,
@@ -5783,7 +5876,9 @@ app.post('/orders', requireAuth, async (req, res) => {
         orderId: order.id,
         orderNumber: order.order_number,
         storeName: store.store_name,
-        awaitingPayment: orderStatus === 'awaiting_payment',
+        // Wallet orders are already paid by the time this fires (finalized
+        // below) — no "complete payment" prompt makes sense for them.
+        awaitingPayment: orderStatus === 'awaiting_payment' && payment_method !== 'wallet',
         paymentMethod: payment_method || null,
         totalAmount: totalAmount || null,
       });
@@ -5838,7 +5933,73 @@ app.post('/orders', requireAuth, async (req, res) => {
       console.warn('stock decrement failed (non-fatal):', stockErr?.message);
     }
 
-    return res.status(201).json({ order });
+    // Wallet payment: debit the balance and finalize the order right here —
+    // this is the LAST step (after items/notifications/stock all succeeded),
+    // not the first, mirroring how a Pesepay charge only finalizes the order
+    // once its own success is confirmed. Reuses the exact same
+    // finalizeOrderPaymentFromPesepay logic the Pesepay webhook uses, so
+    // merchant earnings/commission and the merchant notification are
+    // identical regardless of payment method — the only difference is what
+    // triggers the finalize (a webhook vs. this synchronous debit).
+    let finalOrder = order;
+    if (payment_method === 'wallet') {
+      try {
+        const prevBalance = await getWalletBalance(req.userId, 'customer');
+        if (prevBalance < totalAmount) {
+          // Balance moved between the earlier check and now (e.g. a
+          // concurrent order) — fail cleanly rather than go negative.
+          throw new Error('Insufficient wallet balance');
+        }
+        const newBalance = Math.round((prevBalance - totalAmount) * 100) / 100;
+
+        const { error: debitError } = await supabase.from('wallet_transactions').insert({
+          user_id: req.userId,
+          user_type: 'customer',
+          transaction_type: 'payment',
+          amount: -totalAmount,
+          balance_after: newBalance,
+          description: `Order payment: ${order.order_number}`,
+          reference_id: order.id,
+          status: 'completed',
+        });
+        if (debitError) throw new Error(debitError.message || 'Failed to debit wallet');
+
+        const { data: walletPayment, error: walletPaymentError } = await supabase
+          .from('payments')
+          .insert({
+            order_id: order.id,
+            customer_id: req.userId,
+            amount: totalAmount,
+            currency: 'USD',
+            payment_method: 'wallet',
+            payment_provider: 'DOT Wallet',
+            transaction_id: `WALLET-${order.id}`,
+            status: 'completed',
+          })
+          .select('*')
+          .single();
+        if (walletPaymentError) throw new Error(walletPaymentError.message || 'Failed to record wallet payment');
+
+        const finalizeResult = await finalizeOrderPaymentFromPesepay({
+          payment: walletPayment,
+          paymentStatus: 'completed',
+          transaction: null,
+        });
+        if (finalizeResult?.order) finalOrder = finalizeResult.order;
+      } catch (walletPayErr) {
+        console.error('wallet order payment error:', walletPayErr);
+        // The order row exists but is stuck awaiting_payment/pending —
+        // cancel it outright rather than leave the customer with a phantom
+        // unpaid order, since wallet is meant to be instant and all-or-nothing.
+        await supabase.from('orders').update({ status: 'cancelled', payment_status: 'failed' }).eq('id', order.id);
+        return res.status(400).json({
+          error: 'Wallet payment failed',
+          details: walletPayErr.message || 'Please try again or choose Pesepay.',
+        });
+      }
+    }
+
+    return res.status(201).json({ order: finalOrder });
   } catch (error) {
     console.error('post /orders error:', error);
     return res.status(500).json({
@@ -5933,6 +6094,41 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
       error: 'Failed to load merchant onboarding status',
       details: error.message || 'Please try again later',
     });
+  }
+});
+
+// GET /courier/map — stores with coordinates + active courier positions for the live map
+app.get('/courier/map', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+
+    const [storesResult, couriersResult] = await Promise.all([
+      supabase
+        .from('stores')
+        .select('id, store_name, logo, city, latitude, longitude, is_open, is_active')
+        .eq('is_active', true)
+        .not('latitude', 'is', null)
+        .not('longitude', 'is', null),
+      supabase
+        .from('orders')
+        .select('id, courier_latitude, courier_longitude, courier_location_updated_at')
+        .in('status', COURIER_ACTIVE_STATUSES)
+        .not('courier_latitude', 'is', null)
+        .not('courier_longitude', 'is', null),
+    ]);
+
+    return res.json({
+      stores: storesResult.data || [],
+      couriers: (couriersResult.data || []).map((o) => ({
+        id: o.id,
+        latitude: o.courier_latitude,
+        longitude: o.courier_longitude,
+        updatedAt: o.courier_location_updated_at,
+      })),
+    });
+  } catch (error) {
+    console.error('get /courier/map error:', error);
+    return res.status(500).json({ error: 'Failed to load map data', details: error.message });
   }
 });
 
@@ -6244,11 +6440,20 @@ app.get('/courier/performance', requireAuth, async (req, res) => {
 app.get('/users/me/wallet-balance-24h', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
+    const requestedRole = req.query.role ? String(req.query.role).toLowerCase() : null;
+    const validRoles = ['customer', 'merchant', 'courier'];
+    if (!requestedRole || !validRoles.includes(requestedRole)) {
+      return res.status(400).json({
+        error: 'Invalid role',
+        details: `role is required and must be one of: ${validRoles.join(', ')} — a dual-role account's balances are kept separate.`,
+      });
+    }
     const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const { data, error } = await supabase
       .from('wallet_transactions')
       .select('amount, transaction_type')
       .eq('user_id', req.userId)
+      .eq('user_type', requestedRole)
       .gte('created_at', since);
     if (error) throw new Error(error.message || 'Failed to load wallet ledger');
 
@@ -6275,9 +6480,18 @@ app.post('/wallet/withdraw', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
     const { amount, role } = req.body || {};
-    const validRoles = ['customer', 'merchant', 'courier'];
+    const validRoles = ['merchant', 'courier'];
     const requestedRole = validRoles.includes(role) ? role : null;
     if (!requestedRole) {
+      // Customer wallet balance is spend-only (top-ups and refunds alike) —
+      // it funds orders in the app, never cash. Merchant/courier balances
+      // are real earnings and stay withdrawable.
+      if (role === 'customer') {
+        return res.status(400).json({
+          error: 'Not withdrawable',
+          details: 'Wallet balance can only be spent on orders in the app, not withdrawn as cash.',
+        });
+      }
       return res.status(400).json({ error: 'Invalid role', details: `role must be one of: ${validRoles.join(', ')}` });
     }
     const amt = Math.round(Number(amount) * 100) / 100;
@@ -6298,14 +6512,7 @@ app.post('/wallet/withdraw', requireAuth, async (req, res) => {
       });
     }
 
-    const { data: lastTx } = await supabase
-      .from('wallet_transactions')
-      .select('balance_after')
-      .eq('user_id', req.userId)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    const currentBalance = Number(lastTx?.balance_after) || 0;
+    const currentBalance = await getWalletBalance(req.userId, requestedRole);
     if (amt > currentBalance) {
       return res.status(400).json({
         error: 'Insufficient balance',
@@ -6947,7 +7154,57 @@ app.get('/payments/pesepay/return', async (req, res) => {
 <body><p>Returning to the app…</p></body></html>`;
 
   const orderId = req.query?.orderId;
+  const isTopup = req.query?.topup === '1';
+  const topupUserId = req.query?.userId;
   const isSandbox = String(process.env.PESEPAY_ENV || '').toLowerCase() === 'sandbox';
+
+  // Wallet top-ups have no orderId — look up the most recent pending top-up
+  // payment for this user instead (mirrors the orderId lookup below).
+  if (isTopup && topupUserId && isSandbox) {
+    try {
+      const { data: pay } = await supabase
+        .from('payments')
+        .select('transaction_id')
+        .eq('customer_id', topupUserId)
+        .is('order_id', null)
+        .eq('payment_method', 'pesepay')
+        .eq('status', 'pending')
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (pay?.transaction_id) {
+        const result = await sandboxFinalizePaymentFromReturn(pay.transaction_id);
+        console.log(`[Pesepay] return: sandbox finalized top-up for user ${topupUserId}, status=${result?.payment?.status}`);
+      } else {
+        console.warn(`[Pesepay] return: no pending top-up payment for user ${topupUserId}`);
+      }
+    } catch (err) {
+      console.warn(`[Pesepay] return: sandbox top-up finalization error for user ${topupUserId}:`, err?.message || err);
+    }
+  } else if (isTopup && topupUserId && !isSandbox) {
+    // Production: reconcile in the background, same as the order path below.
+    supabase
+      .from('payments')
+      .select('transaction_id')
+      .eq('customer_id', topupUserId)
+      .is('order_id', null)
+      .eq('payment_method', 'pesepay')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+      .then(({ data: pay }) => {
+        if (!pay?.transaction_id) {
+          console.warn(`[Pesepay] return: no pending top-up payment for user ${topupUserId}`);
+          return;
+        }
+        return checkPesepayStatus(pay.transaction_id);
+      })
+      .catch((err) => {
+        console.warn(`[Pesepay] return: top-up reconcile error for user ${topupUserId}:`, err?.message || err);
+      });
+  }
 
   if (orderId && isSandbox) {
     // Sandbox: await finalization before sending HTML so DB is ready when app polls.
@@ -7127,6 +7384,148 @@ app.get('/payments/pesepay/status', requireAuth, async (req, res) => {
     console.error('get /payments/pesepay/status error:', error);
     return res.status(500).json({
       error: 'Failed to load payment status',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// ─── Wallet top-up ──────────────────────────────────────────────────────────
+// The D.O.T wallet is one-way: Pesepay funds a customer's wallet balance,
+// which can then be spent on orders (see the `payment_method === 'wallet'`
+// branch of POST /orders below), but is never converted back to cash or
+// withdrawn as the funds that were topped up — same model as buying credits.
+// A top-up is just a Pesepay payment with no order_id attached; the existing
+// webhook handler (handlePesepayCallback → "Wallet top-up (no order row)"
+// branch in paymentService.js) already knows how to credit the wallet when
+// one of these completes — this only adds the endpoints to start/poll one.
+
+// POST /payments/wallet/topup/start { amount } — begin a Pesepay top-up
+app.post('/payments/wallet/topup/start', requireAuth, async (req, res) => {
+  try {
+    const { amount } = req.body || {};
+    const amt = Number(amount);
+    if (!Number.isFinite(amt) || amt <= 0) {
+      return res.status(400).json({ error: 'Invalid amount', details: 'amount must be > 0' });
+    }
+    if (amt > 5000) {
+      return res.status(400).json({ error: 'Invalid amount', details: 'Top-ups are capped at $5,000 per request.' });
+    }
+
+    const profile = await getProfile(req.userId);
+
+    const apiBase = (process.env.PUBLIC_API_BASE_URL || process.env.API_BASE_URL || `http://localhost:${process.env.PORT || 4000}`);
+    const callbackBase = apiBase.replace(/\/$/, '');
+    if (/localhost|127\.0\.0\.1|0\.0\.0\.0/i.test(callbackBase)) {
+      return res.status(400).json({
+        error: 'Invalid payment callback URL',
+        details: 'Set PUBLIC_API_BASE_URL (or API_BASE_URL) to the public HTTPS URL of this backend so Pesepay can reach /payments/pesepay/callback.',
+      });
+    }
+    const reference = `DOT-TOPUP-${req.userId.slice(0, 8)}-${Date.now()}`;
+    const resultUrl = `${callbackBase}/payments/pesepay/callback`;
+    // No orderId on the return trip — the app tells top-up and order returns
+    // apart by the presence of `topup=1`.
+    const returnUrl = `${callbackBase}/payments/pesepay/return?topup=1&userId=${encodeURIComponent(req.userId)}`;
+
+    const result = await createPesepayTransaction({
+      userId: req.userId,
+      orderId: null,
+      amount: amt,
+      currencyCode: 'USD',
+      reasonForPayment: 'DOT wallet top-up',
+      merchantReference: reference,
+      resultUrl,
+      returnUrl,
+      customer: {
+        phoneNumber: profile?.phone || '',
+        email: profile?.email || '',
+        name: profile?.full_name || 'GUEST',
+      },
+    });
+
+    return res.json({
+      paymentUrl: result.redirectUrl,
+      pollUrl: result.pollUrl,
+      referenceNumber: result.referenceNumber,
+      reference,
+    });
+  } catch (error) {
+    console.error('wallet topup start error:', error);
+    console.error('wallet topup start error details:', error.response?.data || error.message);
+    return res.status(500).json({
+      error: 'Failed to start top-up',
+      details: error.response?.data?.message || error.response?.data?.error || error.message || 'Please try again later',
+    });
+  }
+});
+
+// In-process tracker mirroring _pesepayReconcileTracker above, keyed by
+// payment reference instead of orderId since a top-up has no order.
+const _topupReconcileTracker = new Map();
+
+// GET /payments/wallet/topup/status?reference=... — top-up confirmation + fresh balance
+app.get('/payments/wallet/topup/status', requireAuth, async (req, res) => {
+  try {
+    const { reference } = req.query || {};
+    if (!reference) {
+      return res.status(400).json({ error: 'Missing reference' });
+    }
+
+    const { data: payment, error: payErr } = await supabase
+      .from('payments')
+      .select('id, customer_id, order_id, amount, status, transaction_id')
+      .eq('transaction_id', reference)
+      .maybeSingle();
+
+    if (payErr || !payment) {
+      return res.status(404).json({ error: 'Payment not found' });
+    }
+    if (payment.customer_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    if (payment.order_id) {
+      return res.status(400).json({ error: 'Not a wallet top-up payment' });
+    }
+
+    let paymentStatus = String(payment.status || '').toLowerCase();
+    const alreadyTerminal = ['completed', 'failed', 'refunded'].includes(paymentStatus);
+    const statusIsSandbox = String(process.env.PESEPAY_ENV || '').toLowerCase() === 'sandbox';
+
+    if (!alreadyTerminal && !statusIsSandbox) {
+      const tracker = _topupReconcileTracker.get(reference) || {};
+      const now = Date.now();
+      const COOLDOWN_MS = 8000;
+
+      if (!tracker.inFlight && (!tracker.lastChecked || now - tracker.lastChecked > COOLDOWN_MS)) {
+        _topupReconcileTracker.set(reference, { inFlight: true, lastChecked: now });
+        try {
+          const reconciled = await Promise.race([
+            checkPesepayStatus(reference),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Pesepay reconcile timeout')), 6000)),
+          ]);
+          const reconciledStatus = String(reconciled?.payment?.status || '').toLowerCase();
+          if (reconciledStatus) paymentStatus = reconciledStatus;
+        } catch (err) {
+          console.warn(`[Pesepay] topup reconcile for ${reference}:`, err?.message || err);
+        } finally {
+          _topupReconcileTracker.set(reference, { inFlight: false, lastChecked: Date.now() });
+        }
+      }
+    }
+
+    // Top-ups only ever affect the customer wallet.
+    const freshBalance = await getWalletBalance(req.userId, 'customer');
+
+    return res.json({
+      status: paymentStatus,
+      confirmed: paymentStatus === 'completed',
+      failed: ['failed', 'cancelled', 'canceled'].includes(paymentStatus),
+      balance: freshBalance,
+    });
+  } catch (error) {
+    console.error('get /payments/wallet/topup/status error:', error);
+    return res.status(500).json({
+      error: 'Failed to load top-up status',
       details: error.message || 'Please try again later',
     });
   }
@@ -7687,14 +8086,7 @@ app.post('/admin/orders/:id/refund', requireAdmin, async (req, res) => {
       return res.status(400).json({ error: 'Invalid amount', details: 'amount must be > 0' });
     }
 
-    const { data: lastTx } = await supabase
-      .from('wallet_transactions')
-      .select('balance_after')
-      .eq('user_id', order.customer_id)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    const prevBalance = Number(lastTx?.balance_after) || 0;
+    const prevBalance = await getWalletBalance(order.customer_id, 'customer');
     const newBalance = Math.round((prevBalance + refundAmount) * 100) / 100;
 
     const { data: refundTx, error: refundError } = await supabase
@@ -8110,14 +8502,7 @@ app.patch('/admin/withdrawals/:id', requireAdmin, async (req, res) => {
     }
 
     if (status === 'rejected') {
-      const { data: lastTx } = await supabase
-        .from('wallet_transactions')
-        .select('balance_after')
-        .eq('user_id', reqRow.user_id)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      const prevBalance = Number(lastTx?.balance_after) || 0;
+      const prevBalance = await getWalletBalance(reqRow.user_id, reqRow.role);
       const newBalance = Math.round((prevBalance + Number(reqRow.amount)) * 100) / 100;
       await supabase.from('wallet_transactions').insert({
         user_id: reqRow.user_id,
@@ -8183,10 +8568,14 @@ app.get('/admin/payout-details', requireAdmin, async (req, res) => {
       .limit(5000);
     if (txError) throw new Error(txError.message || 'Failed to load wallet ledger');
 
-    const balances = new Map(); // user_id -> { balance, role }
+    // Keyed by "userId:role", not just userId — a single account can hold
+    // both a merchant and a courier balance at once, and those are two
+    // separate recipients for a payout run, not one combined figure.
+    const balances = new Map(); // "userId:role" -> balance
     for (const tx of txs || []) {
-      if (!balances.has(tx.user_id)) {
-        balances.set(tx.user_id, { balance: Number(tx.balance_after) || 0, role: tx.user_type });
+      const key = `${tx.user_id}:${tx.user_type}`;
+      if (!balances.has(key)) {
+        balances.set(key, Number(tx.balance_after) || 0);
       }
     }
 
@@ -8202,17 +8591,18 @@ app.get('/admin/payout-details', requireAdmin, async (req, res) => {
         .eq('is_default', true),
     ]);
 
-    const payoutByUser = new Map();
+    const payoutByKey = new Map(); // "userId:role" -> payout method
     for (const m of merchantMethods || []) {
-      payoutByUser.set(m.merchant_id, { ...m, role: 'merchant' });
+      payoutByKey.set(`${m.merchant_id}:merchant`, m);
     }
     for (const c of courierMethods || []) {
-      payoutByUser.set(c.courier_id, { ...c, role: 'courier' });
+      payoutByKey.set(`${c.courier_id}:courier`, c);
     }
 
-    // Everyone with a balance or a payout method on file
-    const userIds = [...new Set([...balances.keys(), ...payoutByUser.keys()])];
-    if (userIds.length === 0) return res.json({ recipients: [] });
+    // Every (user, role) pair with a balance or a payout method on file
+    const recipientKeys = [...new Set([...balances.keys(), ...payoutByKey.keys()])];
+    if (recipientKeys.length === 0) return res.json({ recipients: [] });
+    const userIds = [...new Set(recipientKeys.map((k) => k.slice(0, k.lastIndexOf(':'))))];
 
     const { data: profiles } = await supabase
       .from('user_profiles')
@@ -8228,12 +8618,13 @@ app.get('/admin/payout-details', requireAdmin, async (req, res) => {
     const storeByMerchant = new Map((storeRows || []).map((s) => [s.merchant_id, s.store_name]));
 
     const weeklyRate = getWeeklyCommissionRate();
-    const recipients = userIds.map((id) => {
-      const bal = balances.get(id);
-      const pm = payoutByUser.get(id);
+    const recipients = recipientKeys.map((key) => {
+      const sep = key.lastIndexOf(':');
+      const id = key.slice(0, sep);
+      const role = key.slice(sep + 1);
+      const pm = payoutByKey.get(key);
       const profile = profileById.get(id);
-      const role = bal?.role || pm?.role || 'merchant';
-      const balance = bal ? bal.balance : 0;
+      const balance = balances.get(key) || 0;
       // Weekly platform commission deducted from merchant payouts
       const weeklyCommission =
         role === 'merchant' ? Math.round(balance * weeklyRate * 100) / 100 : 0;

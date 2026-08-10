@@ -5,6 +5,7 @@
 
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { getProfile, getRoles } from './userService.js';
+import { getWalletBalances } from './walletLedger.js';
 
 const supabase = supabaseAdmin;
 
@@ -70,6 +71,7 @@ export async function getOrdersForUser(userId, options = {}) {
       .select(`
         id,
         order_number,
+        delivery_code,
         status,
         payment_status,
         subtotal,
@@ -317,6 +319,13 @@ export async function getFullUserMe(userId) {
   // Use user_profiles.email as canonical email. Merchant onboarding no longer writes to this
   // column, so it reflects the user's own email (or null for phone-only accounts).
   result.auth_email = profile.email ?? null;
+
+  // Wallet balance is kept fully separate per role — a dual-role account
+  // (e.g. merchant + courier) never has those two balances added together.
+  // Returned as { customer, merchant, courier }, one key per role the user
+  // actually holds, so screens read the specific role's balance rather than
+  // a single ambiguous number.
+  result.wallet_balance = await getWalletBalances(userId, result.roles);
 
   if (result.roles.includes('customer')) {
     const { data } = await supabase.from('customers').select('*').eq('id', userId).single();

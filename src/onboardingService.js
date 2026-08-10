@@ -75,6 +75,7 @@ export async function upsertCourierProfile({
   if (!fullName || !String(fullName).trim()) throw new Error('fullName is required');
   if (!nationalId || !String(nationalId).trim()) throw new Error('nationalId is required');
   if (!dateOfBirth || !String(dateOfBirth).trim()) throw new Error('dateOfBirth is required');
+  if (!profilePhotoBase64) throw new Error('A profile photo is required');
 
   // Expect date in DD/MM/YYYY from UI; convert to YYYY-MM-DD if possible
   const dobRaw = String(dateOfBirth).trim();

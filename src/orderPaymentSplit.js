@@ -13,6 +13,7 @@
  */
 
 import { supabaseAdmin } from './supabaseAdminClient.js';
+import { getWalletBalance } from './walletLedger.js';
 
 const supabase = supabaseAdmin;
 
@@ -102,15 +103,7 @@ export async function recordMerchantEarningsForOrderPayment({
     return { skipped: true, reason: 'already_recorded' };
   }
 
-  const { data: lastTx } = await supabase
-    .from('wallet_transactions')
-    .select('balance_after')
-    .eq('user_id', merchantUserId)
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  const prevBalance = lastTx?.balance_after || 0;
+  const prevBalance = await getWalletBalance(merchantUserId, 'merchant');
   const newBalance = Math.round((prevBalance + amount) * 100) / 100;
 
   const { data, error } = await supabase
@@ -160,15 +153,7 @@ export async function recordCourierDeliveryEarnings({ courierId, orderId, amount
     return { skipped: true, reason: 'already_recorded' };
   }
 
-  const { data: lastTx } = await supabase
-    .from('wallet_transactions')
-    .select('balance_after')
-    .eq('user_id', courierId)
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  const prevBalance = Number(lastTx?.balance_after) || 0;
+  const prevBalance = await getWalletBalance(courierId, 'courier');
   const newBalance = Math.round((prevBalance + credit) * 100) / 100;
 
   const { data: tx, error: txError } = await supabase
