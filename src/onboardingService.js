@@ -462,7 +462,7 @@ export async function upsertMerchantOnboarding({
   if (delivery_radius_km !== undefined && delivery_radius_km !== null && delivery_radius_km !== '') {
     const radius = Number(delivery_radius_km);
     if (Number.isFinite(radius) && radius > 0) {
-      storePayload.delivery_radius_km = Math.min(radius, 100);
+      storePayload.delivery_radius_km = radius;
     }
   }
 

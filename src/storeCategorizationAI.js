@@ -7,6 +7,20 @@ import Anthropic from '@anthropic-ai/sdk';
 
 let anthropicClient = null;
 
+/** Immediate corrections for unmistakable specialist stores. */
+export function inferStrongStoreCategory(storeName, description) {
+  const text = `${storeName || ''} ${description || ''}`.toLowerCase();
+  const rules = [
+    [/(butcher|butchery|meat shop|meat market|abattoir)/, 'Butchery'],
+    [/(greengrocer|fruit(?:s)?\s*(?:&|and)\s*veg|produce market)/, 'Fruits & Veg'],
+    [/(pharmacy|chemist|dispensary|drugstore)/, 'Pharmacy'],
+    [/(bakery|patisserie|boulangerie)/, 'Bakery'],
+    [/(liquor store|bottle store|bottle shop|off[- ]licen[cs]e)/, 'Liquor'],
+    [/(hardware store|building supplies|diy store)/, 'Hardware'],
+  ];
+  return rules.find(([pattern]) => pattern.test(text))?.[1] || null;
+}
+
 export function isAiCategorizationConfigured() {
   return !!process.env.ANTHROPIC_API_KEY;
 }
@@ -103,9 +117,34 @@ export async function categorizeStoreWithAI({ storeName, description, businessTy
  *   verification couldn't run (caller should keep the declared type as-is)
  */
 export async function verifyStoreCategory({ storeName, description, declaredType, categoryNames }) {
-  const client = getAnthropicClient();
   const names = (categoryNames || []).filter(Boolean);
-  if (!client || names.length === 0) return null;
+  if (names.length === 0) return null;
+
+  // Resolve strong, unambiguous signals locally before calling the model. This
+  // keeps categorisation correct even when the AI provider is unavailable and
+  // prevents a broad type such as Grocery from swallowing a dedicated type.
+  const haystack = `${storeName || ''} ${description || ''}`.toLowerCase();
+  const exactCategory = (candidates) => {
+    const wanted = candidates.map((v) => v.toLowerCase());
+    return names.find((name) => wanted.includes(name.toLowerCase())) || null;
+  };
+  const strongRules = [
+    [/(butcher|butchery|meat shop|meat market|abattoir)/, ['Butchery', 'Butcher']],
+    [/(greengrocer|fruit(?:s)?\s*(?:&|and)\s*veg|produce market)/, ['Fruits & Veg', 'Fruit & Vegetables', 'Produce']],
+    [/(pharmacy|chemist|dispensary|drugstore)/, ['Pharmacy']],
+    [/(bakery|patisserie|boulangerie)/, ['Bakery']],
+    [/(liquor store|bottle store|bottle shop|off[- ]licen[cs]e)/, ['Liquor', 'Liquor Store']],
+    [/(hardware store|building supplies|diy store)/, ['Hardware']],
+  ];
+  for (const [pattern, candidates] of strongRules) {
+    if (pattern.test(haystack)) {
+      const match = exactCategory(candidates);
+      if (match) return match;
+    }
+  }
+
+  const client = getAnthropicClient();
+  if (!client) return null;
   try {
     const response = await client.messages.create({
       model: 'claude-haiku-4-5-20251001',

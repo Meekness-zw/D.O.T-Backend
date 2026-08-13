@@ -79,6 +79,7 @@ import {
   fallbackCategoryImage,
   isCartoonIcon,
   verifyStoreCategory,
+  inferStrongStoreCategory,
 } from './storeCategorizationAI.js';
 import crypto from 'crypto';
 import axios from 'axios';
@@ -1025,20 +1026,22 @@ app.post('/business-types/suggest', requireAuth, async (req, res) => {
 let storeCategoryBackfillRunning = false;
 async function backfillStoreCategories(rows) {
   if (storeCategoryBackfillRunning) return;
-  const missing = (rows || []).filter((r) => !r.category_override).slice(0, 10);
-  if (missing.length === 0) return;
+  // Re-check existing overrides too. Earlier versions cached the first answer
+  // forever, which meant a bad Grocery assignment could never self-heal.
+  const candidates = (rows || []).slice(0, 25);
+  if (candidates.length === 0) return;
   storeCategoryBackfillRunning = true;
   try {
     const { data: types } = await supabase.from('business_types').select('name');
     const categoryNames = (types || []).map((t) => t.name);
-    for (const row of missing) {
+    for (const row of candidates) {
       const verified = await verifyStoreCategory({
         storeName: row.store_name,
         description: row.description || '',
         declaredType: row.merchants?.business_type || '',
         categoryNames,
       });
-      if (verified) {
+      if (verified && verified.toLowerCase() !== String(row.category_override || '').toLowerCase()) {
         await supabase.from('stores').update({ category_override: verified }).eq('id', row.id);
         console.log(`[CategoryVerify] ${row.store_name} → ${verified}`);
       }
@@ -1156,7 +1159,7 @@ app.get('/stores', async (req, res) => {
     // Only show stores that can actually deliver to this customer — within
     // that store's own delivery_radius_km, not every active store in the
     // database regardless of how far away it is.
-    const DEFAULT_DELIVERY_RADIUS_KM = 10;
+    const DEFAULT_DELIVERY_RADIUS_KM = 20;
     if (hasLocation) {
       stores = stores
         .map((s) => {
@@ -1224,7 +1227,11 @@ app.get('/stores', async (req, res) => {
     // customers never see a miscategorized store; remove the nested object.
     stores = stores.map(({ merchants, category_override, ...rest }) => ({
       ...rest,
-      business_type: category_override || merchants?.business_type || null,
+      business_type:
+        inferStrongStoreCategory(rest.store_name, rest.description) ||
+        category_override ||
+        merchants?.business_type ||
+        null,
     }));
 
     stores = stores.map((s) => enrichStoreForCustomerListing(s));
@@ -1730,12 +1737,15 @@ app.get('/merchant/products', requireAuth, async (req, res) => {
         unit,
         is_available,
         is_featured,
+        display_order,
+        stock_quantity,
         image_url,
         product_categories ( name )
       `,
       )
       .in('store_id', storeIds)
-      .order('created_at', { ascending: false });
+      .order('display_order', { ascending: true })
+      .order('created_at', { ascending: true });
 
     if (error) {
       console.error('merchant products query error:', error);
@@ -1754,6 +1764,8 @@ app.get('/merchant/products', requireAuth, async (req, res) => {
       unit: p.unit,
       is_available: p.is_available,
       is_featured: p.is_featured,
+      display_order: p.display_order || 0,
+      stock_quantity: p.stock_quantity,
       image_url: p.image_url,
       category_name:
         (Array.isArray(p.product_categories)
@@ -1804,6 +1816,7 @@ app.get('/stores/:storeId/menu', async (req, res) => {
         unit,
         is_available,
         is_featured,
+        display_order,
         image_url,
         product_categories ( name )
       `,
@@ -1836,6 +1849,7 @@ app.get('/stores/:storeId/menu', async (req, res) => {
         unit: p.unit,
         is_available: p.is_available,
         is_featured: p.is_featured,
+        display_order: p.display_order || 0,
         image_url: p.image_url,
         category: categoryName,
         option_groups: (menuGroupsMap[p.id] || []).map((g) => ({
@@ -1889,6 +1903,34 @@ app.get('/stores/:storeId/delivery-fee', async (req, res) => {
   }
 });
 
+// PATCH /merchant/products/reorder — persist the exact customer-facing order.
+app.patch('/merchant/products/reorder', requireAuth, async (req, res) => {
+  try {
+    const { store_id, product_ids } = req.body || {};
+    if (!store_id || !Array.isArray(product_ids)) {
+      return res.status(400).json({ error: 'store_id and product_ids are required' });
+    }
+    const { data: store } = await supabase.from('stores').select('id').eq('id', store_id).eq('merchant_id', req.userId).maybeSingle();
+    if (!store) return res.status(403).json({ error: 'Forbidden' });
+
+    const uniqueIds = [...new Set(product_ids.filter(Boolean))];
+    const { data: owned, error: ownedError } = await supabase.from('products').select('id').eq('store_id', store_id).in('id', uniqueIds);
+    if (ownedError) throw new Error(ownedError.message);
+    if ((owned || []).length !== uniqueIds.length) {
+      return res.status(400).json({ error: 'One or more products do not belong to this store' });
+    }
+    const updates = uniqueIds.map((id, display_order) =>
+      supabase.from('products').update({ display_order }).eq('id', id).eq('store_id', store_id),
+    );
+    const results = await Promise.all(updates);
+    const failed = results.find((result) => result.error);
+    if (failed) throw new Error(failed.error.message);
+    return res.json({ product_ids: uniqueIds });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to reorder products', details: error.message });
+  }
+});
+
 // PATCH /merchant/products/:id — update product fields (only for merchant's own products)
 app.patch('/merchant/products/:id', requireAuth, async (req, res) => {
   try {
@@ -1925,7 +1967,7 @@ app.patch('/merchant/products/:id', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden', details: 'Cannot modify this product' });
     }
 
-    const { name, description, price, is_available, is_featured, image_url, category_id, category_name, unit, option_groups, stock_quantity } = req.body || {};
+    const { name, description, price, is_available, is_featured, image_url, category_id, category_name, unit, option_groups, stock_quantity, display_order } = req.body || {};
 
     let resolvedCategoryId = category_id !== undefined ? (category_id || null) : undefined;
     if (resolvedCategoryId === undefined && category_name !== undefined && String(category_name || '').trim()) {
@@ -1959,6 +2001,9 @@ app.patch('/merchant/products/:id', requireAuth, async (req, res) => {
     if (image_url !== undefined) update.image_url = image_url ? String(image_url).trim() : null;
     if (resolvedCategoryId !== undefined) update.category_id = resolvedCategoryId;
     if (unit !== undefined) update.unit = unit === 'kg' ? 'kg' : 'item';
+    if (display_order !== undefined && Number.isFinite(Number(display_order))) {
+      update.display_order = Math.max(0, Math.floor(Number(display_order)));
+    }
     // Optional inventory tracking: null clears tracking; restocking >0 re-enables
     if (stock_quantity !== undefined) {
       const qty = stock_quantity === null || stock_quantity === '' ? null : Math.max(0, Math.floor(Number(stock_quantity)));
@@ -2136,7 +2181,7 @@ app.patch('/merchant/stores/:id', requireAuth, async (req, res) => {
           details: 'delivery_radius_km must be a positive number (km)',
         });
       }
-      update.delivery_radius_km = Math.min(radius, 100);
+      update.delivery_radius_km = radius;
     }
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ error: 'No fields to update', details: 'Provide at least one updatable field' });
@@ -2839,6 +2884,63 @@ app.get('/merchant/stores/:storeId/categories', requireAuth, async (req, res) =>
   }
 });
 
+// Merchants explicitly manage the category tabs shown inside their store.
+app.post('/merchant/stores/:storeId/categories', requireAuth, async (req, res) => {
+  try {
+    const { storeId } = req.params;
+    const name = String(req.body?.name || '').trim();
+    if (!name) return res.status(400).json({ error: 'Category name is required' });
+    const { data: store } = await supabase.from('stores').select('id').eq('id', storeId).eq('merchant_id', req.userId).maybeSingle();
+    if (!store) return res.status(403).json({ error: 'Forbidden' });
+    const { data: existing } = await supabase.from('product_categories').select('id, name, display_order').eq('store_id', storeId).ilike('name', name).maybeSingle();
+    if (existing) return res.status(409).json({ error: 'A category with this name already exists' });
+    const { count } = await supabase.from('product_categories').select('id', { count: 'exact', head: true }).eq('store_id', storeId);
+    const { data, error } = await supabase.from('product_categories').insert({ store_id: storeId, name, display_order: count || 0, is_active: true }).select('id, name, display_order').single();
+    if (error) throw new Error(error.message);
+    return res.status(201).json({ category: data });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to create category', details: error.message });
+  }
+});
+
+app.patch('/merchant/stores/:storeId/categories/:categoryId', requireAuth, async (req, res) => {
+  try {
+    const { storeId, categoryId } = req.params;
+    const name = req.body?.name === undefined ? undefined : String(req.body.name).trim();
+    const displayOrder = req.body?.display_order;
+    const { data: store } = await supabase.from('stores').select('id').eq('id', storeId).eq('merchant_id', req.userId).maybeSingle();
+    if (!store) return res.status(403).json({ error: 'Forbidden' });
+    const update = {};
+    if (name !== undefined) {
+      if (!name) return res.status(400).json({ error: 'Category name is required' });
+      update.name = name;
+    }
+    if (displayOrder !== undefined && Number.isFinite(Number(displayOrder))) update.display_order = Math.max(0, Math.floor(Number(displayOrder)));
+    if (!Object.keys(update).length) return res.status(400).json({ error: 'No fields to update' });
+    const { data, error } = await supabase.from('product_categories').update(update).eq('id', categoryId).eq('store_id', storeId).select('id, name, display_order').maybeSingle();
+    if (error) throw new Error(error.message);
+    if (!data) return res.status(404).json({ error: 'Category not found' });
+    return res.json({ category: data });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to update category', details: error.message });
+  }
+});
+
+app.delete('/merchant/stores/:storeId/categories/:categoryId', requireAuth, async (req, res) => {
+  try {
+    const { storeId, categoryId } = req.params;
+    const { data: store } = await supabase.from('stores').select('id').eq('id', storeId).eq('merchant_id', req.userId).maybeSingle();
+    if (!store) return res.status(403).json({ error: 'Forbidden' });
+    const { count } = await supabase.from('products').select('id', { count: 'exact', head: true }).eq('store_id', storeId).eq('category_id', categoryId);
+    if (count > 0) return res.status(409).json({ error: 'Move or delete products in this category first' });
+    const { error } = await supabase.from('product_categories').delete().eq('id', categoryId).eq('store_id', storeId);
+    if (error) throw new Error(error.message);
+    return res.status(204).send();
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to delete category', details: error.message });
+  }
+});
+
 // POST /merchant/products — create product (store must belong to merchant)
 app.post('/merchant/products', requireAuth, async (req, res) => {
   try {
@@ -2898,6 +3000,15 @@ app.post('/merchant/products', requireAuth, async (req, res) => {
       if (insert.stock_quantity === 0) insert.is_available = false;
     }
     if (resolvedCategoryId) insert.category_id = resolvedCategoryId;
+    // New products appear after the merchant's deliberately arranged items.
+    const { data: lastProduct } = await supabaseAdmin
+      .from('products')
+      .select('display_order')
+      .eq('store_id', store_id)
+      .order('display_order', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    insert.display_order = (lastProduct?.display_order ?? -1) + 1;
     const { data: created, error: insertError } = await supabaseAdmin
       .from('products')
       .insert(insert)
