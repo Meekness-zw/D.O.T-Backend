@@ -867,16 +867,61 @@ app.post('/auth/reset-password', passwordResetLimiter, async (req, res) => {
   }
 });
 
-/** Admin middleware: require x-admin-key or Authorization Bearer matching ADMIN_API_KEY */
+const DASHBOARD_SECTIONS = {
+  admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals'],
+  accountant: ['overview', 'orders', 'deliveries', 'couriers', 'payments'],
+  sales_marketing: ['overview', 'users', 'merchants', 'stores', 'discounts'],
+};
+
+function dashboardRoleForKey(headerKey) {
+  if (!headerKey) return null;
+  const configured = [
+    ['admin', process.env.ADMIN_API_KEY],
+    ['accountant', process.env.ACCOUNTANT_API_KEY],
+    ['sales_marketing', process.env.SALES_MARKETING_API_KEY],
+  ];
+  const matches = configured.filter(([, key]) => key && headerKey === key);
+  // Fail closed if two roles were accidentally configured with the same key.
+  return matches.length === 1 ? matches[0][0] : null;
+}
+
+function dashboardRoleCanAccess(role, method, path) {
+  if (role === 'admin' || path === '/admin/session') return true;
+  const readOnly = method === 'GET';
+  if (role === 'accountant') {
+    return readOnly && [
+      '/admin/stats', '/admin/orders', '/admin/deliveries', '/admin/payments',
+      '/admin/couriers', '/admin/payout-details', '/admin/withdrawals',
+    ].some((prefix) => path.startsWith(prefix));
+  }
+  if (role === 'sales_marketing') {
+    if (path.startsWith('/admin/discount-codes')) return true;
+    if (path.startsWith('/admin/products/') || /^\/admin\/stores\/[^/]+\/products(?:\/upload-image)?$/.test(path)) {
+      return true;
+    }
+    if (!readOnly) return false;
+    if (path === '/admin/users/pending') return false;
+    return [
+      '/admin/stats', '/admin/users', '/admin/merchants', '/admin/stores',
+    ].some((prefix) => path.startsWith(prefix));
+  }
+  return false;
+}
+
+/** Dashboard middleware: authenticate the API key and enforce its role. */
 function requireAdmin(req, res, next) {
-  const apiKey = process.env.ADMIN_API_KEY;
-  if (!apiKey) {
+  if (!process.env.ADMIN_API_KEY) {
     return res.status(503).json({ error: 'Admin API not configured', details: 'Set ADMIN_API_KEY in server env' });
   }
   const headerKey = req.headers['x-admin-key'] || (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : null);
-  if (headerKey !== apiKey) {
-    return res.status(401).json({ error: 'Unauthorized', details: 'Valid admin API key required' });
+  const role = dashboardRoleForKey(headerKey);
+  if (!role) {
+    return res.status(401).json({ error: 'Unauthorized', details: 'Valid dashboard API key required' });
   }
+  if (!dashboardRoleCanAccess(role, req.method, req.path)) {
+    return res.status(403).json({ error: 'Forbidden', details: 'This account does not have access to that dashboard function' });
+  }
+  req.dashboardRole = role;
   next();
 }
 
@@ -8104,6 +8149,13 @@ app.patch('/users/profile', requireAuth, async (req, res) => {
 });
 
 // ========== Admin Dashboard API (require ADMIN_API_KEY) ==========
+
+app.get('/admin/session', requireAdmin, (req, res) => {
+  return res.json({
+    role: req.dashboardRole,
+    sections: DASHBOARD_SECTIONS[req.dashboardRole] || [],
+  });
+});
 
 // POST /admin/create-user { phone, name, role, password }
 // Creates a new user directly (bypasses OTP) — admin use only.
