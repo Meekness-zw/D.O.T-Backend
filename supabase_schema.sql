@@ -345,6 +345,8 @@ CREATE TABLE IF NOT EXISTS orders (
   )),
   subtotal DECIMAL(10, 2) NOT NULL,
   delivery_fee DECIMAL(10, 2) NOT NULL DEFAULT 0.00,
+  customer_delivery_fee DECIMAL(10, 2) NOT NULL DEFAULT 0.00,
+  dot_delivery_subsidy DECIMAL(10, 2) NOT NULL DEFAULT 0.00,
   tax DECIMAL(10, 2) NOT NULL DEFAULT 0.00,
   total_amount DECIMAL(10, 2) NOT NULL,
   payment_method TEXT NOT NULL CHECK (payment_method IN ('card', 'mobile_money', 'cash')),

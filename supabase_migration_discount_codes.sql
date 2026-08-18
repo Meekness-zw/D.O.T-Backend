@@ -2,13 +2,15 @@
 --
 -- Admin-issued discount codes, entered by the customer at checkout
 -- (distinct from the existing automatic store promotions system, which
--- applies without a code). Platform-wide, percent or fixed-amount off,
+-- applies without a code). Platform-wide, percent or fixed-amount off the
+-- CUSTOMER'S DELIVERY CHARGE ONLY. The rider-facing delivery_fee is unchanged,
 -- with an optional total-redemption cap and a per-customer use limit.
 
 CREATE TABLE IF NOT EXISTS discount_codes (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   code TEXT NOT NULL UNIQUE,
   discount_type TEXT NOT NULL CHECK (discount_type IN ('percent', 'fixed')),
+  applies_to TEXT NOT NULL DEFAULT 'delivery_fee' CHECK (applies_to = 'delivery_fee'),
   value NUMERIC(10, 2) NOT NULL CHECK (value > 0),
   -- Percent codes are capped at 100; fixed codes are capped per-order at checkout time.
   max_redemptions INTEGER, -- NULL = unlimited total uses across all customers
@@ -26,6 +28,7 @@ CREATE TABLE IF NOT EXISTS discount_code_redemptions (
   customer_id UUID NOT NULL REFERENCES user_profiles(id) ON DELETE CASCADE,
   order_id UUID REFERENCES orders(id) ON DELETE SET NULL,
   discount_amount NUMERIC(10, 2) NOT NULL,
+  discount_scope TEXT NOT NULL DEFAULT 'delivery_fee' CHECK (discount_scope = 'delivery_fee'),
   redeemed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
@@ -36,6 +39,25 @@ CREATE INDEX IF NOT EXISTS idx_discount_redemptions_code_customer
 -- order history can show it without joining the redemptions table.
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_code TEXT;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_amount NUMERIC(10, 2) NOT NULL DEFAULT 0;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_scope TEXT
+  CHECK (discount_scope IS NULL OR discount_scope = 'delivery_fee');
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_delivery_fee NUMERIC(10, 2);
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS dot_delivery_subsidy NUMERIC(10, 2) NOT NULL DEFAULT 0;
+
+COMMENT ON COLUMN orders.delivery_fee IS
+  'Full undiscounted delivery fee used to calculate rider payout; never reduced by a customer promo code.';
+COMMENT ON COLUMN orders.customer_delivery_fee IS
+  'Delivery charge paid by the customer after a DOT-funded delivery promo.';
+COMMENT ON COLUMN orders.dot_delivery_subsidy IS
+  'Amount DOT funds so the rider payout remains based on the full delivery_fee.';
+COMMENT ON COLUMN orders.discount_amount IS
+  'Legacy/general display amount; for discount codes this equals dot_delivery_subsidy and applies only to delivery.';
+COMMENT ON COLUMN orders.discount_scope IS
+  'Explicit scope for promo discount_amount; currently only delivery_fee is allowed.';
+COMMENT ON COLUMN discount_codes.applies_to IS
+  'Promo-code target; constrained to the customer delivery charge.';
+COMMENT ON COLUMN discount_code_redemptions.discount_scope IS
+  'Meaning of discount_amount; constrained to customer delivery_fee only.';
 
 ALTER TABLE discount_codes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE discount_code_redemptions ENABLE ROW LEVEL SECURITY;

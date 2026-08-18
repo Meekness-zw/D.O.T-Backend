@@ -265,7 +265,16 @@ function calculateDeliveryFee(distanceKm) {
 // Shared by the standalone preview endpoint (checkout, before placing the
 // order) and the actual redemption at order-creation time (re-validated
 // there so a code can't be double-spent between preview and submit).
-async function validateDiscountCode({ code, customerId, subtotal }) {
+function generateDiscountCode() {
+  // Avoid ambiguous characters (0/O and 1/I) when customers type the code.
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const bytes = crypto.randomBytes(8);
+  let code = 'DOT-';
+  for (let i = 0; i < bytes.length; i += 1) code += alphabet[bytes[i] % alphabet.length];
+  return code;
+}
+
+async function validateDiscountCode({ code, customerId, deliveryFee }) {
   const trimmed = String(code || '').trim();
   if (!trimmed) return { valid: false, error: 'Enter a code' };
 
@@ -302,10 +311,17 @@ async function validateDiscountCode({ code, customerId, subtotal }) {
     return { valid: false, error: "You've already used this code" };
   }
 
-  const sub = Number(subtotal) || 0;
+  const fullDeliveryFee = Math.max(0, Number(deliveryFee) || 0);
   const rawDiscount =
-    codeRow.discount_type === 'percent' ? sub * (Number(codeRow.value) / 100) : Number(codeRow.value);
-  const discountAmount = Math.max(0, Math.min(Math.round(rawDiscount * 100) / 100, sub));
+    codeRow.discount_type === 'percent'
+      ? fullDeliveryFee * (Number(codeRow.value) / 100)
+      : Number(codeRow.value);
+  // Promo codes are funded by DOT and only reduce what the customer pays for
+  // delivery. They never reduce the full delivery fee used for rider payout.
+  const discountAmount = Math.max(
+    0,
+    Math.min(Math.round(rawDiscount * 100) / 100, fullDeliveryFee),
+  );
 
   return {
     valid: true,
@@ -487,6 +503,27 @@ async function requireAuth(req, res, next) {
   } catch (err) {
     return res.status(401).json({ error: 'Unauthorized', details: err.message });
   }
+}
+
+/** Like requireAuth, but never rejects — sets req.userId when a valid token
+ *  is present, otherwise leaves it undefined and continues. For endpoints
+ *  that are public but behave differently for a logged-in caller. */
+async function optionalAuth(req, res, next) {
+  const auth = req.headers.authorization;
+  const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return next();
+  try {
+    const decoded = verifyAccessToken(token, process.env.SUPABASE_JWT_SECRET);
+    if (decoded?.sub) {
+      req.userId = decoded.sub;
+      return next();
+    }
+    const { data } = await supabaseAdmin.auth.getUser(token);
+    if (data?.user?.id) req.userId = data.user.id;
+  } catch (_) {
+    // Invalid/expired token on a public endpoint — just proceed unauthenticated.
+  }
+  next();
 }
 
 // POST /auth/firebase-verify { idToken, phone, name, role, password }
@@ -1055,8 +1092,10 @@ async function backfillStoreCategories(rows) {
 
 // ─── Public Stores ───────────────────────────────────────────────────────────
 
-// Public stores listing & search (no auth required; uses public RLS policies)
-app.get('/stores', async (req, res) => {
+// Public stores listing & search (no auth required; uses public RLS policies).
+// optionalAuth lets a logged-in caller get personalized behavior (e.g. the
+// distance-radius bypass below) without requiring auth for everyone else.
+app.get('/stores', optionalAuth, async (req, res) => {
   try {
     const supabasePublic = publicSupabase;
     if (!supabasePublic) throw new Error('Server not configured');
@@ -1156,26 +1195,44 @@ app.get('/stores', async (req, res) => {
 
     let stores = data || [];
 
+    // A flagged account (user_profiles.unrestricted_browsing) sees every
+    // active store regardless of distance — e.g. the client's own account,
+    // for reviewing the full marketplace rather than just what's nearby.
+    let isUnrestrictedBrowsing = false;
+    if (req.userId) {
+      try {
+        const { data: profile } = await supabaseAdmin
+          .from('user_profiles')
+          .select('unrestricted_browsing')
+          .eq('id', req.userId)
+          .maybeSingle();
+        isUnrestrictedBrowsing = !!profile?.unrestricted_browsing;
+      } catch (_) {
+        // Best-effort — fall back to normal distance filtering.
+      }
+    }
+
     // Only show stores that can actually deliver to this customer — within
     // that store's own delivery_radius_km, not every active store in the
     // database regardless of how far away it is.
     const DEFAULT_DELIVERY_RADIUS_KM = 20;
     if (hasLocation) {
-      stores = stores
-        .map((s) => {
-          if (s.latitude == null || s.longitude == null) {
-            return { ...s, distance_km: null, eta_minutes: null };
-          }
-          const distance_km = haversineKm(userLat, userLng, s.latitude, s.longitude);
-          const eta_minutes = estimateEtaMinutes(distance_km);
-          return { ...s, distance_km, eta_minutes };
-        })
-        .filter((s) => {
+      stores = stores.map((s) => {
+        if (s.latitude == null || s.longitude == null) {
+          return { ...s, distance_km: null, eta_minutes: null };
+        }
+        const distance_km = haversineKm(userLat, userLng, s.latitude, s.longitude);
+        const eta_minutes = estimateEtaMinutes(distance_km);
+        return { ...s, distance_km, eta_minutes };
+      });
+      if (!isUnrestrictedBrowsing) {
+        stores = stores.filter((s) => {
           // No coordinates on file → can't confirm it's actually deliverable, exclude rather than guess.
           if (s.distance_km == null) return false;
           const radiusKm = Number(s.delivery_radius_km) || DEFAULT_DELIVERY_RADIUS_KM;
           return s.distance_km <= radiusKm;
         });
+      }
     }
 
     // hasPromos: only stores with a currently-live promotion — same
@@ -5594,11 +5651,18 @@ app.get('/users/me/payments', requireAuth, async (req, res) => {
 app.post('/discount-codes/apply', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
-    const { code, subtotal } = req.body || {};
+    const { code, delivery_fee } = req.body || {};
     if (!code || !String(code).trim()) {
       return res.status(400).json({ error: 'code is required' });
     }
-    const result = await validateDiscountCode({ code, customerId: req.userId, subtotal });
+    if (!Number.isFinite(Number(delivery_fee)) || Number(delivery_fee) < 0) {
+      return res.status(400).json({ error: 'delivery_fee is required' });
+    }
+    const result = await validateDiscountCode({
+      code,
+      customerId: req.userId,
+      deliveryFee: Number(delivery_fee),
+    });
     if (!result.valid) {
       return res.status(400).json({ error: result.error });
     }
@@ -5608,6 +5672,7 @@ app.post('/discount-codes/apply', requireAuth, async (req, res) => {
       discountType: result.discountType,
       value: result.value,
       discountAmount: result.discountAmount,
+      appliesTo: 'delivery_fee',
     });
   } catch (error) {
     console.error('post /discount-codes/apply error:', error);
@@ -5860,14 +5925,16 @@ app.post('/orders', requireAuth, async (req, res) => {
       discountResult = await validateDiscountCode({
         code: discount_code,
         customerId: req.userId,
-        subtotal,
+        deliveryFee,
       });
       if (!discountResult.valid) {
         return res.status(400).json({ error: discountResult.error });
       }
     }
     const discountAmount = discountResult?.discountAmount || 0;
-    const totalAmount = subtotal + deliveryFee + tax - discountAmount;
+    const customerDeliveryFee = Math.round((deliveryFee - discountAmount) * 100) / 100;
+    const dotDeliverySubsidy = discountAmount;
+    const totalAmount = subtotal + customerDeliveryFee + tax;
 
     if (!Number.isFinite(totalAmount) || totalAmount <= 0) {
       return res.status(400).json({
@@ -5932,7 +5999,11 @@ app.post('/orders', requireAuth, async (req, res) => {
         store_id,
         status: orderStatus,
         subtotal: subtotal,
+        // Full rider-facing delivery fee. Promo codes must never mutate this.
         delivery_fee: deliveryFee,
+        // Customer-facing charge after DOT funds the promo-code reduction.
+        customer_delivery_fee: customerDeliveryFee,
+        dot_delivery_subsidy: dotDeliverySubsidy,
         tax,
         total_amount: totalAmount,
         payment_method,
@@ -5946,6 +6017,7 @@ app.post('/orders', requireAuth, async (req, res) => {
         delivery_notes,
         discount_code: discountResult?.codeRow?.code || null,
         discount_amount: discountAmount,
+        discount_scope: discountResult ? 'delivery_fee' : null,
       })
       .select('*')
       .single();
@@ -8435,12 +8507,12 @@ app.post('/admin/broadcast', requireAdmin, async (req, res) => {
 });
 
 // POST /admin/discount-codes — create a code.
-// Body: { code, discount_type: 'percent'|'fixed', value, max_redemptions?, per_customer_limit?, expires_at? }
+// The code itself is generated by the server; admins only configure its rules.
+// Body: { discount_type: 'percent'|'fixed', value, max_redemptions?, per_customer_limit?, expires_at? }
 app.post('/admin/discount-codes', requireAdmin, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
     const {
-      code,
       discount_type,
       value,
       max_redemptions = null,
@@ -8448,8 +8520,6 @@ app.post('/admin/discount-codes', requireAdmin, async (req, res) => {
       expires_at = null,
     } = req.body || {};
 
-    const codeTrimmed = String(code || '').trim().toUpperCase();
-    if (!codeTrimmed) return res.status(400).json({ error: 'code is required' });
     if (!['percent', 'fixed'].includes(discount_type)) {
       return res.status(400).json({ error: "discount_type must be 'percent' or 'fixed'" });
     }
@@ -8461,18 +8531,25 @@ app.post('/admin/discount-codes', requireAdmin, async (req, res) => {
       return res.status(400).json({ error: 'A percent code cannot exceed 100' });
     }
 
-    const { data, error } = await supabase
-      .from('discount_codes')
-      .insert({
-        code: codeTrimmed,
-        discount_type,
-        value: numValue,
-        max_redemptions: max_redemptions != null ? Number(max_redemptions) : null,
-        per_customer_limit: Math.max(1, parseInt(per_customer_limit, 10) || 1),
-        expires_at: expires_at || null,
-      })
-      .select('*')
-      .single();
+    let data = null;
+    let error = null;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const result = await supabase
+        .from('discount_codes')
+        .insert({
+          code: generateDiscountCode(),
+          discount_type,
+          value: numValue,
+          max_redemptions: max_redemptions != null ? Number(max_redemptions) : null,
+          per_customer_limit: Math.max(1, parseInt(per_customer_limit, 10) || 1),
+          expires_at: expires_at || null,
+        })
+        .select('*')
+        .single();
+      data = result.data;
+      error = result.error;
+      if (!error || error.code !== '23505') break;
+    }
 
     if (error) {
       if (error.code === '23505') {
