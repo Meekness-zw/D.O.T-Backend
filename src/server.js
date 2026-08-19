@@ -86,6 +86,7 @@ import axios from 'axios';
 import { hashPassword } from './passwordHash.js';
 import { assertStrongPassword } from './passwordPolicy.js';
 import { getWalletBalance } from './walletLedger.js';
+import * as quickbooksService from './quickbooksService.js';
 import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
 
 const app = express();
@@ -868,9 +869,9 @@ app.post('/auth/reset-password', passwordResetLimiter, async (req, res) => {
 });
 
 const DASHBOARD_SECTIONS = {
-  admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals'],
-  accountant: ['overview', 'orders', 'deliveries', 'couriers', 'payments'],
-  sales_marketing: ['overview', 'users', 'merchants', 'stores', 'discounts'],
+  admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals', 'quickbooks'],
+  accountant: ['overview', 'orders', 'deliveries', 'couriers', 'payments', 'quickbooks'],
+  sales_marketing: ['overview', 'users', 'merchants', 'stores', 'discounts', 'quickbooks'],
 };
 
 function dashboardRoleForKey(headerKey) {
@@ -889,6 +890,9 @@ function dashboardRoleCanAccess(role, method, path) {
   if (role === 'admin' || path === '/admin/session') return true;
   const readOnly = method === 'GET';
   if (role === 'accountant') {
+    // Accountant manages the QuickBooks connection (connect/disconnect/mappings/backfill) in
+    // addition to the usual read-only financial views.
+    if (path.startsWith('/admin/quickbooks')) return true;
     return readOnly && [
       '/admin/stats', '/admin/orders', '/admin/deliveries', '/admin/payments',
       '/admin/couriers', '/admin/payout-details', '/admin/withdrawals',
@@ -897,6 +901,10 @@ function dashboardRoleCanAccess(role, method, path) {
   if (role === 'sales_marketing') {
     if (path.startsWith('/admin/discount-codes')) return true;
     if (path.startsWith('/admin/products/') || /^\/admin\/stores\/[^/]+\/products(?:\/upload-image)?$/.test(path)) {
+      return true;
+    }
+    // Sales can see QuickBooks connection status/sync history, but not manage it.
+    if (readOnly && (path === '/admin/quickbooks/status' || path === '/admin/quickbooks/sync-log' || path === '/admin/quickbooks/mappings')) {
       return true;
     }
     if (!readOnly) return false;
@@ -8782,6 +8790,12 @@ app.patch('/admin/withdrawals/:id', requireAdmin, async (req, res) => {
       console.error('withdrawal status notification failed (non-fatal):', notifyErr);
     }
 
+    if (status === 'paid' && quickbooksService.isConfigured()) {
+      quickbooksService.syncWithdrawal(updated).catch((err) => {
+        console.error('QuickBooks withdrawal sync failed (non-fatal):', err.message);
+      });
+    }
+
     return res.json({ request: updated });
   } catch (error) {
     console.error('patch /admin/withdrawals/:id error:', error);
@@ -8789,6 +8803,156 @@ app.patch('/admin/withdrawals/:id', requireAdmin, async (req, res) => {
       error: 'Failed to update withdrawal request',
       details: error.message || 'Please try again later',
     });
+  }
+});
+
+// ─── QuickBooks Online integration ──────────────────────────────────────────
+// One QuickBooks company connection for the whole business. The accountant
+// dashboard account manages the connection + mappings; the sales dashboard
+// account gets read-only visibility into connection status and sync history.
+
+// GET /admin/quickbooks/status — connection info (all dashboard roles)
+app.get('/admin/quickbooks/status', requireAdmin, async (req, res) => {
+  try {
+    if (!quickbooksService.isConfigured()) {
+      return res.json({ configured: false, connected: false });
+    }
+    const status = await quickbooksService.getConnectionStatus();
+    return res.json({ configured: true, ...status });
+  } catch (error) {
+    console.error('get /admin/quickbooks/status error:', error);
+    return res.status(500).json({ error: 'Failed to load QuickBooks status', details: error.message });
+  }
+});
+
+// GET /admin/quickbooks/connect — returns Intuit's consent-screen URL (admin/accountant).
+// Returns JSON rather than a 302 because a plain browser navigation can't carry the
+// x-admin-key header this route needs; the frontend fetches this, then navigates itself.
+app.get('/admin/quickbooks/connect', requireAdmin, (req, res) => {
+  if (!quickbooksService.isConfigured()) {
+    return res.status(503).json({ error: 'QuickBooks not configured', details: 'Set QUICKBOOKS_CLIENT_ID/SECRET/REDIRECT_URI on the server' });
+  }
+  const url = quickbooksService.getAuthorizeUrl(req.dashboardRole);
+  return res.json({ url });
+});
+
+// GET /admin/quickbooks/callback — Intuit redirects the browser here directly (no x-admin-key header
+// is sent by the browser on this hop, so this route authenticates via the signed `state` param instead).
+app.get('/admin/quickbooks/callback', async (req, res) => {
+  const dashboardUrl = process.env.ADMIN_DASHBOARD_URL || (allowedOrigins[0] || '');
+  try {
+    const { code, realmId, state, error: intuitError } = req.query;
+    if (intuitError) throw new Error(`QuickBooks declined the connection: ${intuitError}`);
+    if (!code || !realmId || !state) throw new Error('Missing code/realmId/state from QuickBooks redirect');
+    await quickbooksService.handleCallback({ code: String(code), realmId: String(realmId), state: String(state) });
+    return res.redirect(`${dashboardUrl}/quickbooks?connected=1`);
+  } catch (error) {
+    console.error('get /admin/quickbooks/callback error:', error);
+    return res.redirect(`${dashboardUrl}/quickbooks?error=${encodeURIComponent(error.message || 'connection_failed')}`);
+  }
+});
+
+// POST /admin/quickbooks/disconnect
+app.post('/admin/quickbooks/disconnect', requireAdmin, async (req, res) => {
+  try {
+    await quickbooksService.disconnect();
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('post /admin/quickbooks/disconnect error:', error);
+    return res.status(500).json({ error: 'Failed to disconnect QuickBooks', details: error.message });
+  }
+});
+
+// GET /admin/quickbooks/accounts — chart of accounts, for mapping dropdowns
+app.get('/admin/quickbooks/accounts', requireAdmin, async (req, res) => {
+  try {
+    const accounts = await quickbooksService.listAccounts();
+    return res.json({ accounts });
+  } catch (error) {
+    console.error('get /admin/quickbooks/accounts error:', error);
+    return res.status(500).json({ error: 'Failed to load QuickBooks accounts', details: error.message });
+  }
+});
+
+// GET /admin/quickbooks/items — sales items, for mapping dropdowns
+app.get('/admin/quickbooks/items', requireAdmin, async (req, res) => {
+  try {
+    const items = await quickbooksService.listItems();
+    return res.json({ items });
+  } catch (error) {
+    console.error('get /admin/quickbooks/items error:', error);
+    return res.status(500).json({ error: 'Failed to load QuickBooks items', details: error.message });
+  }
+});
+
+// GET /admin/quickbooks/customers?q=... — search QuickBooks customers, for the default-customer mapping
+app.get('/admin/quickbooks/customers', requireAdmin, async (req, res) => {
+  try {
+    const customers = await quickbooksService.listCustomers(req.query.q ? String(req.query.q) : null);
+    return res.json({ customers });
+  } catch (error) {
+    console.error('get /admin/quickbooks/customers error:', error);
+    return res.status(500).json({ error: 'Failed to load QuickBooks customers', details: error.message });
+  }
+});
+
+// POST /admin/quickbooks/customers — create a QuickBooks customer (e.g. one umbrella "App Customers" record)
+app.post('/admin/quickbooks/customers', requireAdmin, async (req, res) => {
+  try {
+    const name = String(req.body?.name || '').trim();
+    if (!name) return res.status(400).json({ error: 'name is required' });
+    const customer = await quickbooksService.createDefaultCustomer(name);
+    return res.status(201).json({ customer });
+  } catch (error) {
+    console.error('post /admin/quickbooks/customers error:', error);
+    return res.status(500).json({ error: 'Failed to create QuickBooks customer', details: error.message });
+  }
+});
+
+// GET /admin/quickbooks/mappings
+app.get('/admin/quickbooks/mappings', requireAdmin, async (req, res) => {
+  try {
+    const mappings = await quickbooksService.getMappings();
+    return res.json({ mappings });
+  } catch (error) {
+    console.error('get /admin/quickbooks/mappings error:', error);
+    return res.status(500).json({ error: 'Failed to load QuickBooks mappings', details: error.message });
+  }
+});
+
+// POST /admin/quickbooks/mappings — { sales_item: {id,name}, delivery_item: {...}, ... }
+app.post('/admin/quickbooks/mappings', requireAdmin, async (req, res) => {
+  try {
+    await quickbooksService.saveMappings(req.body || {});
+    const mappings = await quickbooksService.getMappings();
+    return res.json({ mappings });
+  } catch (error) {
+    console.error('post /admin/quickbooks/mappings error:', error);
+    return res.status(500).json({ error: 'Failed to save QuickBooks mappings', details: error.message });
+  }
+});
+
+// GET /admin/quickbooks/sync-log — recent sync attempts (orders + withdrawals)
+app.get('/admin/quickbooks/sync-log', requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const log = await quickbooksService.getSyncLog({ limit });
+    return res.json({ log });
+  } catch (error) {
+    console.error('get /admin/quickbooks/sync-log error:', error);
+    return res.status(500).json({ error: 'Failed to load QuickBooks sync log', details: error.message });
+  }
+});
+
+// POST /admin/quickbooks/sync/backfill — sweep recent paid orders + paid withdrawals not yet synced
+app.post('/admin/quickbooks/sync/backfill', requireAdmin, async (req, res) => {
+  try {
+    const days = Math.min(parseInt(req.body?.days, 10) || 30, 90);
+    const result = await quickbooksService.backfillSync({ days });
+    return res.json(result);
+  } catch (error) {
+    console.error('post /admin/quickbooks/sync/backfill error:', error);
+    return res.status(500).json({ error: 'Backfill sync failed', details: error.message });
   }
 });
 

@@ -6,6 +6,7 @@ import { supabaseAdmin } from './supabaseAdminClient.js';
 import { computeSubtotalSplit, recordMerchantEarningsForOrderPayment } from './orderPaymentSplit.js';
 import { insertUserNotification } from './orderNotifications.js';
 import { getWalletBalance } from './walletLedger.js';
+import * as quickbooksService from './quickbooksService.js';
 
 const supabase = supabaseAdmin;
 
@@ -674,6 +675,12 @@ export async function finalizeOrderPaymentFromPesepay({ payment, paymentStatus, 
     if (orderUpdateError) {
       console.error('[Pesepay] Failed to mark order paid:', orderUpdateError);
       throw new Error(orderUpdateError.message || 'Failed to update order');
+    }
+
+    if (quickbooksService.isConfigured()) {
+      quickbooksService.syncOrder(updatedOrder).catch((err) => {
+        console.error('QuickBooks order sync failed (non-fatal):', err.message);
+      });
     }
 
     // Customer already got "Order placed" (or "Complete payment" while pending);
