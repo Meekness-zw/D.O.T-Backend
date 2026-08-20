@@ -8674,6 +8674,52 @@ app.get('/admin/discount-codes', requireAdmin, async (req, res) => {
   }
 });
 
+// GET /admin/discount-codes/:id/redemptions — paper trail: who used this code, on which order, when
+app.get('/admin/discount-codes/:id/redemptions', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+
+    const { data: redemptions, error } = await supabase
+      .from('discount_code_redemptions')
+      .select('id, customer_id, order_id, discount_amount, redeemed_at, orders ( order_number )')
+      .eq('code_id', id)
+      .order('redeemed_at', { ascending: false });
+    if (error) throw new Error(error.message || 'Failed to load redemptions');
+
+    const customerIds = [...new Set((redemptions || []).map((r) => r.customer_id).filter(Boolean))];
+    let profilesById = {};
+    if (customerIds.length > 0) {
+      const { data: profiles } = await supabase
+        .from('user_profiles')
+        .select('id, full_name, phone')
+        .in('id', customerIds);
+      profilesById = Object.fromEntries((profiles || []).map((p) => [p.id, p]));
+    }
+
+    const shaped = (redemptions || []).map((r) => {
+      const profile = profilesById[r.customer_id] || null;
+      return {
+        id: r.id,
+        discount_amount: r.discount_amount,
+        redeemed_at: r.redeemed_at,
+        order_number: r.orders?.order_number || null,
+        customer: profile
+          ? { id: profile.id, full_name: profile.full_name || null, phone: profile.phone || null }
+          : { id: r.customer_id, full_name: null, phone: null },
+      };
+    });
+
+    return res.json({ redemptions: shaped });
+  } catch (error) {
+    console.error('get /admin/discount-codes/:id/redemptions error:', error);
+    return res.status(500).json({
+      error: 'Failed to load redemption history',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 // PATCH /admin/discount-codes/:id — update or deactivate a code.
 app.patch('/admin/discount-codes/:id', requireAdmin, async (req, res) => {
   try {
