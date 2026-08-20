@@ -871,7 +871,7 @@ app.post('/auth/reset-password', passwordResetLimiter, async (req, res) => {
 const DASHBOARD_SECTIONS = {
   admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals', 'quickbooks'],
   accountant: ['overview', 'orders', 'deliveries', 'couriers', 'payments', 'quickbooks'],
-  sales_marketing: ['overview', 'users', 'merchants', 'stores', 'discounts', 'quickbooks'],
+  sales_marketing: ['overview', 'users', 'merchants', 'stores', 'discounts'],
 };
 
 function dashboardRoleForKey(headerKey) {
@@ -901,10 +901,6 @@ function dashboardRoleCanAccess(role, method, path) {
   if (role === 'sales_marketing') {
     if (path.startsWith('/admin/discount-codes')) return true;
     if (path.startsWith('/admin/products/') || /^\/admin\/stores\/[^/]+\/products(?:\/upload-image)?$/.test(path)) {
-      return true;
-    }
-    // Sales can see QuickBooks connection status/sync history, but not manage it.
-    if (readOnly && (path === '/admin/quickbooks/status' || path === '/admin/quickbooks/sync-log' || path === '/admin/quickbooks/mappings')) {
       return true;
     }
     if (!readOnly) return false;
@@ -1976,7 +1972,27 @@ app.get('/stores/:storeId/menu', async (req, res) => {
       if (p.is_featured) categorySet.add('Popular');
       if (p.category) categorySet.add(p.category);
     });
-    const categories = Array.from(categorySet);
+
+    // Order tabs by the merchant's own category display_order (set from
+    // MenuManagementScreen) instead of "whichever product happens to sort
+    // first" — otherwise merchant and customer can see a different order.
+    const { data: categoryRows } = await supabase
+      .from('product_categories')
+      .select('name')
+      .eq('store_id', storeId)
+      .eq('is_active', true)
+      .order('display_order', { ascending: true });
+
+    const categories = [];
+    if (categorySet.has('Popular')) categories.push('Popular');
+    (categoryRows || []).forEach((c) => {
+      if (categorySet.has(c.name) && !categories.includes(c.name)) categories.push(c.name);
+    });
+    // Anything left (e.g. the 'Other' fallback, or a category not found in
+    // product_categories) still needs a tab — append in whatever order.
+    categorySet.forEach((name) => {
+      if (!categories.includes(name)) categories.push(name);
+    });
     if (categories.length === 0) categories.push('Menu');
 
     return res.json({ categories, products });
@@ -8807,11 +8823,11 @@ app.patch('/admin/withdrawals/:id', requireAdmin, async (req, res) => {
 });
 
 // ─── QuickBooks Online integration ──────────────────────────────────────────
-// One QuickBooks company connection for the whole business. The accountant
-// dashboard account manages the connection + mappings; the sales dashboard
-// account gets read-only visibility into connection status and sync history.
+// One QuickBooks company connection for the whole business. Only the admin
+// and accountant dashboard accounts can see or manage it — the sales
+// dashboard account has no access to any /admin/quickbooks/* route.
 
-// GET /admin/quickbooks/status — connection info (all dashboard roles)
+// GET /admin/quickbooks/status — connection info (admin/accountant only)
 app.get('/admin/quickbooks/status', requireAdmin, async (req, res) => {
   try {
     if (!quickbooksService.isConfigured()) {
@@ -9708,10 +9724,11 @@ app.get('/admin/stores/:storeId/products', requireAdmin, async (req, res) => {
     const { data, error } = await supabase
       .from('products')
       .select(
-        'id, store_id, category_id, name, description, price, unit, is_available, is_featured, image_url, created_at, stock_quantity, product_categories ( name )',
+        'id, store_id, category_id, name, description, price, unit, is_available, is_featured, image_url, display_order, created_at, stock_quantity, product_categories ( name )',
       )
       .eq('store_id', storeId)
-      .order('created_at', { ascending: false });
+      .order('display_order', { ascending: true })
+      .order('created_at', { ascending: true });
     if (error) throw new Error(error.message || 'Failed to load products');
 
     const groupsMap = await fetchOptionGroupsForProducts((data || []).map((p) => p.id));
@@ -9796,14 +9813,47 @@ app.get('/admin/stores/:storeId/categories', requireAdmin, async (req, res) => {
     const { storeId } = req.params;
     const { data, error } = await supabase
       .from('product_categories')
-      .select('id, name')
+      .select('id, name, display_order')
       .eq('store_id', storeId)
-      .order('name', { ascending: true });
+      .order('display_order', { ascending: true });
     if (error) throw new Error(error.message || 'Failed to load categories');
     return res.json({ categories: data || [] });
   } catch (error) {
     console.error('get /admin/stores/:storeId/categories error:', error);
     return res.status(500).json({ error: 'Failed to load categories', details: error.message || 'Try again later' });
+  }
+});
+
+// PATCH /admin/stores/:storeId/categories/:categoryId — rename or reorder a
+// store's category on the merchant's behalf.
+app.patch('/admin/stores/:storeId/categories/:categoryId', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { storeId, categoryId } = req.params;
+    const name = req.body?.name === undefined ? undefined : String(req.body.name).trim();
+    const displayOrder = req.body?.display_order;
+    const update = {};
+    if (name !== undefined) {
+      if (!name) return res.status(400).json({ error: 'Category name is required' });
+      update.name = name;
+    }
+    if (displayOrder !== undefined && Number.isFinite(Number(displayOrder))) {
+      update.display_order = Math.max(0, Math.floor(Number(displayOrder)));
+    }
+    if (!Object.keys(update).length) return res.status(400).json({ error: 'No fields to update' });
+    const { data, error } = await supabase
+      .from('product_categories')
+      .update(update)
+      .eq('id', categoryId)
+      .eq('store_id', storeId)
+      .select('id, name, display_order')
+      .maybeSingle();
+    if (error) throw new Error(error.message || 'Failed to update category');
+    if (!data) return res.status(404).json({ error: 'Category not found' });
+    return res.json({ category: data });
+  } catch (error) {
+    console.error('patch /admin/stores/:storeId/categories/:categoryId error:', error);
+    return res.status(500).json({ error: 'Failed to update category', details: error.message || 'Try again later' });
   }
 });
 
@@ -9889,7 +9939,7 @@ app.patch('/admin/products/:id', requireAdmin, async (req, res) => {
     if (productError) throw new Error(productError.message || 'Failed to load product');
     if (!product) return res.status(404).json({ error: 'Product not found' });
 
-    const { name, description, price, is_available, is_featured, image_url, category_id, category_name, unit, option_groups } = req.body || {};
+    const { name, description, price, is_available, is_featured, image_url, category_id, category_name, unit, option_groups, display_order } = req.body || {};
 
     let resolvedCategoryId = category_id !== undefined ? (category_id || null) : undefined;
     if (resolvedCategoryId === undefined && category_name !== undefined && String(category_name || '').trim()) {
@@ -9921,6 +9971,9 @@ app.patch('/admin/products/:id', requireAdmin, async (req, res) => {
     if (image_url !== undefined) update.image_url = image_url ? String(image_url).trim() : null;
     if (resolvedCategoryId !== undefined) update.category_id = resolvedCategoryId;
     if (unit !== undefined) update.unit = unit === 'kg' ? 'kg' : 'item';
+    if (display_order !== undefined && Number.isFinite(Number(display_order))) {
+      update.display_order = Math.max(0, Math.floor(Number(display_order)));
+    }
 
     if (Object.keys(update).length === 0 && option_groups === undefined) {
       return res.status(400).json({ error: 'No fields to update', details: 'Provide at least one updatable field' });
@@ -9932,7 +9985,7 @@ app.patch('/admin/products/:id', requireAdmin, async (req, res) => {
         .from('products')
         .update(update)
         .eq('id', id)
-        .select('id, store_id, name, description, price, unit, is_available, is_featured, image_url, category_id')
+        .select('id, store_id, name, description, price, unit, is_available, is_featured, image_url, category_id, display_order')
         .maybeSingle();
       if (updateError) throw new Error(updateError.message || 'Failed to update product');
       if (!data) return res.status(404).json({ error: 'Product not found' });
@@ -9940,7 +9993,7 @@ app.patch('/admin/products/:id', requireAdmin, async (req, res) => {
     } else {
       const { data } = await supabase
         .from('products')
-        .select('id, store_id, name, description, price, unit, is_available, is_featured, image_url, category_id')
+        .select('id, store_id, name, description, price, unit, is_available, is_featured, image_url, category_id, display_order')
         .eq('id', id)
         .maybeSingle();
       if (!data) return res.status(404).json({ error: 'Product not found' });

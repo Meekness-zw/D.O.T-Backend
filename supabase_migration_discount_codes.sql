@@ -35,6 +35,15 @@ CREATE TABLE IF NOT EXISTS discount_code_redemptions (
 CREATE INDEX IF NOT EXISTS idx_discount_redemptions_code_customer
   ON discount_code_redemptions(code_id, customer_id);
 
+-- Safe to (re-)run even if discount_codes/discount_code_redemptions already
+-- existed before `applies_to`/`discount_scope` were added to the CREATE
+-- TABLE statements above — CREATE TABLE IF NOT EXISTS is a no-op on an
+-- existing table, it does NOT add new columns to it.
+ALTER TABLE discount_codes ADD COLUMN IF NOT EXISTS applies_to TEXT NOT NULL DEFAULT 'delivery_fee'
+  CHECK (applies_to = 'delivery_fee');
+ALTER TABLE discount_code_redemptions ADD COLUMN IF NOT EXISTS discount_scope TEXT NOT NULL DEFAULT 'delivery_fee'
+  CHECK (discount_scope = 'delivery_fee');
+
 -- Stamp the applied code + amount directly on the order too, so receipts /
 -- order history can show it without joining the redemptions table.
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_code TEXT;
