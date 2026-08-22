@@ -5752,6 +5752,90 @@ app.post('/discount-codes/apply', requireAuth, async (req, res) => {
   }
 });
 
+// ─── Public promo landing (QR codes) ────────────────────────────────────────
+// GET /discount-codes/:code/public — unauthenticated, read-only lookup behind
+// the QR landing page at deliveryontime.co.zw/promo/<CODE>. Someone scanning
+// an influencer's QR has no account yet, so this cannot require auth.
+//
+// Only ever returns what a poster already prints in the open: the code, what
+// it takes off, and when it stops working. Never the redemption cap or how
+// many uses are left — that's campaign data, and a public counter also hands
+// scrapers a cheap way to watch a code drain.
+//
+// CORS is opened explicitly for this one route rather than going through the
+// ALLOWED_ORIGINS whitelist: the marketing site is a separate Netlify origin
+// from the dashboards, the response carries no credentials or personal data,
+// and a promo poster is public by definition.
+const promoLookupLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => ipKeyGenerator(req),
+  handler: (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.status(429).json({ error: 'Too many requests', details: 'Please try again shortly.' });
+  },
+});
+
+app.options('/discount-codes/:code/public', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  return res.sendStatus(204);
+});
+
+app.get('/discount-codes/:code/public', promoLookupLimiter, async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const code = String(req.params.code || '').trim();
+    // Codes are `DOT-` + 8 chars from a fixed alphabet; reject anything else
+    // before it reaches the database so this can't be used as a probe.
+    if (!/^[A-Za-z0-9-]{4,32}$/.test(code)) {
+      return res.status(404).json({ error: 'Not found', reason: 'unknown' });
+    }
+
+    const { data: codeRow, error } = await supabase
+      .from('discount_codes')
+      .select('code, discount_type, value, is_active, expires_at, max_redemptions, per_customer_limit')
+      .ilike('code', code)
+      .maybeSingle();
+    if (error) throw new Error(error.message || 'Failed to look up discount code');
+
+    if (!codeRow) return res.status(404).json({ error: 'Not found', reason: 'unknown' });
+
+    const expired = codeRow.expires_at && new Date(codeRow.expires_at).getTime() < Date.now();
+    if (expired) return res.status(410).json({ error: 'Gone', reason: 'expired' });
+
+    // A multi-use code is auto-deactivated by redeem_discount_code() once its
+    // last slot goes, so an inactive capped code reads as "all claimed" while
+    // an uncapped one was switched off by an admin.
+    if (!codeRow.is_active) {
+      return res.status(410).json({
+        error: 'Gone',
+        reason: codeRow.max_redemptions != null ? 'fully_claimed' : 'inactive',
+      });
+    }
+
+    return res.json({
+      code: codeRow.code,
+      discountType: codeRow.discount_type,
+      value: Number(codeRow.value),
+      appliesTo: 'delivery_fee',
+      expiresAt: codeRow.expires_at,
+      perCustomer: codeRow.per_customer_limit ?? 1,
+    });
+  } catch (error) {
+    console.error('get /discount-codes/:code/public error:', error);
+    return res.status(500).json({
+      error: 'Failed to look up discount code',
+      details: 'Please try again later',
+    });
+  }
+});
+
 app.post('/orders', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
