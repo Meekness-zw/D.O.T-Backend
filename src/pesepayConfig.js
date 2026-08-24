@@ -2,8 +2,8 @@
  * Pesepay configuration – central place to read and validate
  * integration & encryption keys from the environment.
  *
- * NOTE: These are TEST keys right now. For production, swap the values
- * in backend/.env and restart the server.
+ * Credentials must match PESEPAY_ENV: sandbox credentials use the sandbox
+ * host; live credentials use the production host.
  */
 
 const {
@@ -25,3 +25,13 @@ export function getPesepayConfig() {
   };
 }
 
+export function getPesepayEnvironment() {
+  const explicitBase = String(process.env.PESEPAY_BASE_URL || '').trim();
+  const sandbox = String(process.env.PESEPAY_ENV || '').trim().toLowerCase() === 'sandbox';
+  return {
+    name: sandbox ? 'sandbox' : 'production',
+    baseUrl: explicitBase || (sandbox
+      ? 'https://api.test.sandbox.pesepay.com/payments-engine/'
+      : 'https://api.pesepay.com/api/payments-engine/'),
+  };
+}

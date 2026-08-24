@@ -23,11 +23,12 @@ CREATE TABLE IF NOT EXISTS user_profiles (
   role TEXT NOT NULL CHECK (role IN ('customer', 'merchant', 'courier')),
   profile_photo TEXT,
   push_token TEXT,
+  push_role TEXT CHECK (push_role IS NULL OR push_role IN ('customer', 'merchant', 'courier')),
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 -- If table already existed with email NOT NULL, run: ALTER TABLE user_profiles ALTER COLUMN email DROP NOT NULL;
--- Add push_token if upgrading: ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS push_token TEXT;
+-- Existing installations should run migrations/2026-08-24-add-active-push-role.sql.
 
 -- ============================================
 -- CUSTOMERS
@@ -164,6 +165,16 @@ CREATE TABLE IF NOT EXISTS products (
   display_order INTEGER DEFAULT 0,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Merchant-curated cross-sells shown to customers during checkout.
+CREATE TABLE IF NOT EXISTS product_suggestions (
+  product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  suggested_product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  display_order INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  PRIMARY KEY (product_id, suggested_product_id),
+  CHECK (product_id <> suggested_product_id)
 );
 
 -- Store Promotions / Deals

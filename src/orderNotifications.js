@@ -19,11 +19,24 @@ async function sendPushToUser(supabase, userId, { title, message, type, referenc
   try {
     const { data: profile } = await supabase
       .from('user_profiles')
-      .select('push_token')
+      .select('push_token, push_role')
       .eq('id', userId)
       .maybeSingle();
     const token = profile?.push_token;
     if (!token || !token.startsWith('ExponentPushToken')) return;
+    const audience = data?.audience;
+    if (audience && audience !== 'all' && profile?.push_role !== audience) return;
+
+    // A courier must be both signed into the courier role and online before a
+    // courier push can leave the server.
+    if (audience === 'courier') {
+      const { data: courier } = await supabase
+        .from('couriers')
+        .select('is_online')
+        .eq('id', userId)
+        .maybeSingle();
+      if (!courier?.is_online) return;
+    }
 
     await axios.post(
       EXPO_PUSH_URL,

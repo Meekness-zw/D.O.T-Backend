@@ -12,11 +12,20 @@ async function sendExpoPush(userId, { title, body, data = {} }) {
   try {
     const { data: profile } = await supabaseAdmin
       .from('user_profiles')
-      .select('push_token')
+      .select('push_token, push_role')
       .eq('id', userId)
       .maybeSingle();
     const token = profile?.push_token;
     if (!token || !token.startsWith('ExponentPushToken')) return;
+    if (data?.audience && data.audience !== 'all' && profile?.push_role !== data.audience) return;
+    if (data?.audience === 'courier') {
+      const { data: courier } = await supabaseAdmin
+        .from('couriers')
+        .select('is_online')
+        .eq('id', userId)
+        .maybeSingle();
+      if (!courier?.is_online) return;
+    }
     await axios.post(
       'https://exp.host/--/api/v2/push/send',
       { to: token, title, body, data, sound: 'default' },
@@ -561,7 +570,7 @@ export async function approveCourier(courierId) {
   await sendExpoPush(courierId, {
     title: 'Account Approved!',
     body: 'Your courier account has been verified. You can now start accepting deliveries.',
-    data: { type: 'courier_approved' },
+    data: { type: 'courier_approved', audience: 'courier' },
   });
 
   return courier;
@@ -595,7 +604,7 @@ export async function approveMerchant(merchantId) {
   await sendExpoPush(merchantId, {
     title: 'Account Approved!',
     body: `Your merchant account "${merchant.business_name}" has been approved. You can now start receiving orders.`,
-    data: { type: 'merchant_approved' },
+    data: { type: 'merchant_approved', audience: 'merchant' },
   });
 
   return merchant;
@@ -627,7 +636,7 @@ export async function rejectMerchant(merchantId, reason) {
   await sendExpoPush(merchantId, {
     title: 'Application Update',
     body: reason ? `Your merchant application was not approved: ${reason}` : 'Your merchant application was not approved. Please contact support.',
-    data: { type: 'merchant_rejected' },
+    data: { type: 'merchant_rejected', audience: 'merchant' },
   });
 
   return merchant;
@@ -663,7 +672,7 @@ export async function rejectCourier(courierId, reason) {
     body: reason
       ? `Your courier application was declined: ${reason}. Please review the requirements and try again.`
       : 'Your courier application was declined. Please review the requirements and try again.',
-    data: { type: 'courier_rejected', reason: reason || null },
+    data: { type: 'courier_rejected', reason: reason || null, audience: 'courier' },
   });
 
   return courier;

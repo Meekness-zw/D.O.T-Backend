@@ -176,8 +176,9 @@ async function notifyAvailableCouriers(orderId, orderNumber, storeName) {
     // Get all verified couriers
     const { data: couriers } = await supabase
       .from('couriers')
-      .select('id, user_profiles ( push_token )')
-      .eq('is_verified', true);
+      .select('id, user_profiles ( push_token, push_role )')
+      .eq('is_verified', true)
+      .eq('is_online', true);
     if (!couriers?.length) return;
 
     // Exclude couriers currently on an active delivery
@@ -195,7 +196,8 @@ async function notifyAvailableCouriers(orderId, orderNumber, storeName) {
       if (busyIds.has(courier.id)) continue;
       const token = courier.user_profiles?.push_token;
       if (!token || !token.startsWith('ExponentPushToken')) continue;
-      pushMessages.push({ to: token, title: 'Order accepted — head that way', body: `${numLabel} from ${store} was just accepted and is being prepared. Get moving so you're there when it's ready.`, data: { type: 'new_job', orderId }, sound: 'default' });
+      if (courier.user_profiles?.push_role !== 'courier') continue;
+      pushMessages.push({ to: token, title: 'Order accepted — head that way', body: `${numLabel} from ${store} was just accepted and is being prepared. Get moving so you're there when it's ready.`, data: { type: 'new_job', orderId, audience: 'courier' }, sound: 'default' });
     }
     if (!pushMessages.length) return;
     await axios.post('https://exp.host/--/api/v2/push/send', pushMessages, {
@@ -1858,7 +1860,17 @@ app.get('/merchant/products', requireAuth, async (req, res) => {
       throw new Error(error.message || 'Failed to load products');
     }
 
-    const groupsMap = await fetchOptionGroupsForProducts((data || []).map((p) => p.id));
+    const productIds = (data || []).map((p) => p.id);
+    const groupsMap = await fetchOptionGroupsForProducts(productIds);
+    const { data: suggestionRows, error: suggestionError } = productIds.length
+      ? await supabase.from('product_suggestions').select('product_id, suggested_product_id, display_order').in('product_id', productIds).order('display_order')
+      : { data: [], error: null };
+    if (suggestionError) throw new Error(suggestionError.message || 'Failed to load product add-ons');
+    const suggestionsMap = {};
+    (suggestionRows || []).forEach((row) => {
+      if (!suggestionsMap[row.product_id]) suggestionsMap[row.product_id] = [];
+      suggestionsMap[row.product_id].push(row.suggested_product_id);
+    });
 
     const products = (data || []).map((p) => ({
       id: p.id,
@@ -1878,6 +1890,7 @@ app.get('/merchant/products', requireAuth, async (req, res) => {
           ? p.product_categories[0]?.name
           : p.product_categories?.name) || null,
       option_groups: groupsMap[p.id] || [],
+      suggested_product_ids: suggestionsMap[p.id] || [],
     }));
 
     return res.json({ products });
@@ -1936,7 +1949,17 @@ app.get('/stores/:storeId/menu', async (req, res) => {
       throw new Error(productsError.message || 'Failed to load menu');
     }
 
-    const menuGroupsMap = await fetchOptionGroupsForProducts((productsData || []).map((p) => p.id));
+    const menuProductIds = (productsData || []).map((p) => p.id);
+    const menuGroupsMap = await fetchOptionGroupsForProducts(menuProductIds);
+    const { data: menuSuggestionRows, error: menuSuggestionError } = menuProductIds.length
+      ? await supabase.from('product_suggestions').select('product_id, suggested_product_id, display_order').in('product_id', menuProductIds).order('display_order')
+      : { data: [], error: null };
+    if (menuSuggestionError) throw new Error(menuSuggestionError.message || 'Failed to load product add-ons');
+    const menuSuggestionsMap = {};
+    (menuSuggestionRows || []).forEach((row) => {
+      if (!menuSuggestionsMap[row.product_id]) menuSuggestionsMap[row.product_id] = [];
+      menuSuggestionsMap[row.product_id].push(row.suggested_product_id);
+    });
 
     const products = (productsData || []).map((p) => {
       const categoryName =
@@ -1964,6 +1987,7 @@ app.get('/stores/:storeId/menu', async (req, res) => {
             .filter((o) => o.is_available !== false)
             .map((o) => ({ ...o, price_adjustment: applyPlatformMarkup(o.price_adjustment) })),
         })),
+        suggested_product_ids: menuSuggestionsMap[p.id] || [],
       };
     });
 
@@ -2093,7 +2117,7 @@ app.patch('/merchant/products/:id', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden', details: 'Cannot modify this product' });
     }
 
-    const { name, description, price, is_available, is_featured, image_url, category_id, category_name, unit, option_groups, stock_quantity, display_order } = req.body || {};
+    const { name, description, price, is_available, is_featured, image_url, category_id, category_name, unit, option_groups, suggested_product_ids, stock_quantity, display_order } = req.body || {};
 
     let resolvedCategoryId = category_id !== undefined ? (category_id || null) : undefined;
     if (resolvedCategoryId === undefined && category_name !== undefined && String(category_name || '').trim()) {
@@ -2138,7 +2162,7 @@ app.patch('/merchant/products/:id', requireAuth, async (req, res) => {
       else if (update.stock_quantity > 0 && is_available === undefined) update.is_available = true;
     }
 
-    if (Object.keys(update).length === 0 && option_groups === undefined) {
+    if (Object.keys(update).length === 0 && option_groups === undefined && suggested_product_ids === undefined) {
       return res.status(400).json({
         error: 'No fields to update',
         details: 'Provide at least one updatable field',
@@ -2177,6 +2201,26 @@ app.patch('/merchant/products/:id', requireAuth, async (req, res) => {
 
     if (option_groups !== undefined) {
       await replaceProductOptionGroups(id, option_groups);
+    }
+    if (suggested_product_ids !== undefined) {
+      const ids = [...new Set(Array.isArray(suggested_product_ids) ? suggested_product_ids.filter((value) => value && value !== id) : [])];
+      if (ids.length) {
+        const { data: validProducts, error: validError } = await supabase
+          .from('products').select('id').eq('store_id', product.store_id).in('id', ids);
+        if (validError) throw validError;
+        if ((validProducts || []).length !== ids.length) {
+          return res.status(400).json({ error: 'Suggested products must belong to the same store' });
+        }
+      }
+      const { error: deleteError } = await supabase.from('product_suggestions').delete().eq('product_id', id);
+      if (deleteError) throw deleteError;
+      if (ids.length) {
+        const { error: insertSuggestionError } = await supabase.from('product_suggestions').insert(
+          ids.map((suggestedId, index) => ({ product_id: id, suggested_product_id: suggestedId, display_order: index })),
+        );
+        if (insertSuggestionError) throw insertSuggestionError;
+      }
+      updated.suggested_product_ids = ids;
     }
     const groupsMap = await fetchOptionGroupsForProducts([id]);
     return res.json({ ...updated, option_groups: groupsMap[id] || [] });
@@ -3071,7 +3115,7 @@ app.delete('/merchant/stores/:storeId/categories/:categoryId', requireAuth, asyn
 app.post('/merchant/products', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
-    const { store_id, name, description, price, category_id, category_name, unit, image_url, is_available, is_featured, option_groups, stock_quantity } = req.body || {};
+    const { store_id, name, description, price, category_id, category_name, unit, image_url, is_available, is_featured, option_groups, suggested_product_ids, stock_quantity } = req.body || {};
     if (!store_id || !name || price === undefined || price === null) {
       return res.status(400).json({
         error: 'Missing required fields',
@@ -3147,8 +3191,18 @@ app.post('/merchant/products', requireAuth, async (req, res) => {
     if (Array.isArray(option_groups)) {
       await replaceProductOptionGroups(created.id, option_groups);
     }
+    const suggestedIds = [...new Set(Array.isArray(suggested_product_ids) ? suggested_product_ids.filter((id) => id && id !== created.id) : [])];
+    if (suggestedIds.length) {
+      const { data: validProducts } = await supabaseAdmin.from('products').select('id').eq('store_id', store_id).in('id', suggestedIds);
+      if ((validProducts || []).length !== suggestedIds.length) {
+        return res.status(400).json({ error: 'Suggested products must belong to the same store' });
+      }
+      await supabaseAdmin.from('product_suggestions').insert(
+        suggestedIds.map((suggestedId, index) => ({ product_id: created.id, suggested_product_id: suggestedId, display_order: index })),
+      );
+    }
     const groupsMap = await fetchOptionGroupsForProducts([created.id]);
-    return res.status(201).json({ ...created, option_groups: groupsMap[created.id] || [] });
+    return res.status(201).json({ ...created, option_groups: groupsMap[created.id] || [], suggested_product_ids: suggestedIds });
   } catch (error) {
     console.error('post /merchant/products error:', error);
     return res.status(500).json({
@@ -3922,19 +3976,61 @@ app.delete('/users/me/account', requireAuth, async (req, res) => {
 app.put('/users/me/push-token', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
-    const { token } = req.body || {};
+    const { token, role } = req.body || {};
     if (!token || typeof token !== 'string') {
       return res.status(400).json({ error: 'token is required' });
     }
+    if (!['customer', 'merchant', 'courier'].includes(role)) {
+      return res.status(400).json({ error: 'A valid active role is required' });
+    }
     const { error } = await supabase
       .from('user_profiles')
-      .update({ push_token: token })
+      .update({ push_token: token, push_role: role })
       .eq('id', req.userId);
     if (error) throw new Error(error.message || 'Failed to save push token');
     return res.json({ success: true });
   } catch (error) {
     console.error('PUT /users/me/push-token error:', error);
     return res.status(500).json({ error: error.message || 'Failed to save push token' });
+  }
+});
+
+// DELETE /users/me/push-token — stop all pushes for this logged-out device.
+app.delete('/users/me/push-token', requireAuth, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    await supabase.from('couriers').update({ is_online: false }).eq('id', req.userId);
+    const { error } = await supabase
+      .from('user_profiles')
+      .update({ push_token: null, push_role: null })
+      .eq('id', req.userId);
+    if (error) throw error;
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('DELETE /users/me/push-token error:', error);
+    return res.status(500).json({ error: 'Failed to unregister push notifications' });
+  }
+});
+
+app.get('/courier/availability', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('couriers').select('is_online').eq('id', req.userId).maybeSingle();
+    if (error) throw error;
+    return res.json({ isOnline: data?.is_online === true });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to load courier availability' });
+  }
+});
+
+app.put('/courier/availability', requireAuth, async (req, res) => {
+  try {
+    const isOnline = req.body?.isOnline;
+    if (typeof isOnline !== 'boolean') return res.status(400).json({ error: 'isOnline must be a boolean' });
+    const { error } = await supabase.from('couriers').update({ is_online: isOnline }).eq('id', req.userId);
+    if (error) throw error;
+    return res.json({ isOnline });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to update courier availability' });
   }
 });
 
@@ -4559,16 +4655,16 @@ app.post('/courier/orders/:id/arrived', requireAuth, async (req, res) => {
       if (store?.merchant_id) {
         const { data: merchantProfile } = await supabase
           .from('user_profiles')
-          .select('push_token')
+          .select('push_token, push_role')
           .eq('id', store.merchant_id)
           .maybeSingle();
         const token = merchantProfile?.push_token;
-        if (token?.startsWith('ExponentPushToken')) {
+        if (token?.startsWith('ExponentPushToken') && merchantProfile?.push_role === 'merchant') {
           await axios.post('https://exp.host/--/api/v2/push/send', {
             to: token,
             title: 'Courier has arrived',
             body: `The courier for order #${order.order_number} is at your location. Please confirm pickup.`,
-            data: { type: 'courier_arrived', orderId: id },
+            data: { type: 'courier_arrived', orderId: id, audience: 'merchant' },
             sound: 'default',
           }, { headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 10000 });
         }
@@ -6935,11 +7031,11 @@ app.get('/users/me/notifications', requireAuth, async (req, res) => {
       .eq('user_id', req.userId);
 
     // Audience lives inside the data jsonb (set by insertUserNotification).
-    // Untagged legacy rows and admin broadcasts sent to everyone ('all')
-    // are shown regardless of the requested role.
+    // Only this role's rows and explicit all-role broadcasts are returned.
+    // Untagged legacy rows are intentionally excluded to prevent role leakage.
     if (requestedRole) {
       query = query.or(
-        `data->>audience.is.null,data->>audience.eq.${requestedRole},data->>audience.eq.all`,
+        `data->>audience.eq.${requestedRole},data->>audience.eq.all`,
       );
     }
 
@@ -7343,9 +7439,11 @@ app.post('/payments/pesepay/start', requireAuth, async (req, res) => {
   } catch (error) {
     console.error('Pesepay start error:', error);
     console.error('Pesepay start error details:', error.response?.data || error.message);
-    return res.status(500).json({
+    const providerStatus = Number(error?.status || error?.response?.status) || 500;
+    return res.status(providerStatus >= 400 && providerStatus < 500 ? 502 : 500).json({
       error: 'Failed to start Pesepay payment',
       details: error.response?.data?.message || error.response?.data?.error || error.message || 'Please try again later',
+      providerStatus: providerStatus !== 500 ? providerStatus : undefined,
     });
   }
 });
@@ -8607,15 +8705,13 @@ app.post('/admin/broadcast', requireAdmin, async (req, res) => {
     const titleTrimmed = String(title).trim().slice(0, 200);
     const messageTrimmed = String(message).trim().slice(0, 2000);
 
-    // Bulk-insert one notification row per user (visible in every audience's
-    // Notification Center regardless of which role they're currently using —
-    // an announcement isn't role-scoped the way order/delivery pings are).
+    const notificationAudience = audience === 'all' ? 'all' : audience;
     const rows = targetIds.map((userId) => ({
       user_id: userId,
       title: titleTrimmed,
       message: messageTrimmed,
       type: 'announcement',
-      data: { audience: 'all' },
+      data: { audience: notificationAudience },
     }));
     // Chunk inserts to stay well under any single-request payload limit.
     for (let i = 0; i < rows.length; i += 500) {
@@ -8627,19 +8723,20 @@ app.post('/admin/broadcast', requireAdmin, async (req, res) => {
     // up to 100 messages per request).
     const { data: profiles, error: profilesError } = await supabase
       .from('user_profiles')
-      .select('push_token')
+      .select('push_token, push_role')
       .in('id', targetIds)
       .not('push_token', 'is', null);
     if (profilesError) console.error('[broadcast] push token lookup error:', profilesError.message);
 
     const pushMessages = (profiles || [])
       .filter((p) => p.push_token && p.push_token.startsWith('ExponentPushToken'))
+      .filter((p) => notificationAudience === 'all' || p.push_role === notificationAudience)
       .map((p) => ({
         to: p.push_token,
         title: titleTrimmed,
         body: messageTrimmed,
         sound: 'default',
-        data: { type: 'announcement' },
+        data: { type: 'announcement', audience: notificationAudience },
       }));
 
     let pushed = 0;

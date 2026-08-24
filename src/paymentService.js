@@ -132,11 +132,14 @@ class PesepaySecurity {
 function createPesepayHttpClient(integrationKey) {
   // Pesepay's server returns non-RFC-compliant HTTP response headers in some cases.
   // insecureHTTPParser allows Node to parse these without throwing HPE_CR_EXPECTED.
-  const agent = new https.Agent({ insecureHTTPParser: true });
+  const agent = new https.Agent();
 
   return axios.create({
     baseURL: PESEPAY_BASE_URL,
     httpsAgent: agent,
+    // Node's HTTP parser option belongs on the request, not https.Agent.
+    // Pesepay production currently emits a non-standard response header.
+    insecureHTTPParser: true,
     headers: {
       authorization: integrationKey.trim(),
       'content-type': 'application/json',
@@ -232,7 +235,18 @@ export async function createPesepayTransaction({
 
   if (!response?.data?.payload) {
     console.error('[Pesepay] Unexpected initiate response:', response.status, JSON.stringify(response.data));
-    throw new Error(`Pesepay error: invalid response (${response.status})`);
+    const providerMessage =
+      response?.data?.message ||
+      response?.data?.error ||
+      (typeof response?.data === 'string' ? response.data : '');
+    const error = new Error(
+      response.status === 401 || response.status === 403
+        ? `Pesepay rejected the credentials or environment (${response.status})${providerMessage ? `: ${providerMessage}` : ''}`
+        : `Pesepay error: invalid response (${response.status})${providerMessage ? `: ${providerMessage}` : ''}`,
+    );
+    error.status = response.status;
+    error.providerResponse = response.data;
+    throw error;
   }
 
   const transaction = security.decryptData(response.data.payload);
@@ -731,4 +745,3 @@ export async function finalizeOrderPaymentFromPesepay({ payment, paymentStatus, 
 
   return { order, walletTransaction: null };
 }
-
