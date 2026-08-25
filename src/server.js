@@ -872,7 +872,7 @@ app.post('/auth/reset-password', passwordResetLimiter, async (req, res) => {
 
 const DASHBOARD_SECTIONS = {
   admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals', 'quickbooks'],
-  accountant: ['overview', 'orders', 'deliveries', 'couriers', 'payments', 'quickbooks'],
+  accountant: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'payments', 'quickbooks'],
   sales_marketing: ['overview', 'users', 'merchants', 'stores', 'discounts'],
 };
 
@@ -895,9 +895,13 @@ function dashboardRoleCanAccess(role, method, path) {
     // Accountant manages the QuickBooks connection (connect/disconnect/mappings/backfill) in
     // addition to the usual read-only financial views.
     if (path.startsWith('/admin/quickbooks')) return true;
+    // Accountants can inspect registered customers, merchants, and couriers,
+    // but approval and user-management actions remain admin-only.
+    if (path === '/admin/users/pending') return false;
     return readOnly && [
-      '/admin/stats', '/admin/orders', '/admin/deliveries', '/admin/payments',
-      '/admin/couriers', '/admin/payout-details', '/admin/withdrawals',
+      '/admin/stats', '/admin/users', '/admin/orders', '/admin/deliveries',
+      '/admin/payments', '/admin/merchants', '/admin/couriers',
+      '/admin/payout-details', '/admin/withdrawals',
     ].some((prefix) => path.startsWith(prefix));
   }
   if (role === 'sales_marketing') {
