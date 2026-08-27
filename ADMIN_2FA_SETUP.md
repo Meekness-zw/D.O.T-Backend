@@ -1,8 +1,13 @@
-# Admin dashboard: per-admin accounts + two-factor
+# Admin dashboard: per-admin accounts + emailed sign-in codes
 
 Replaces the three shared dashboard keys (`ADMIN_API_KEY`, `ACCOUNTANT_API_KEY`,
-`SALES_MARKETING_API_KEY`) with named accounts, each with its own authenticator
-and its own line in an audit log.
+`SALES_MARKETING_API_KEY`) with named accounts. Each person signs in with their
+own username and password, then a 6-digit code emailed to their own address,
+and each has their own line in an audit log.
+
+Codes go to the individual, not to a shared mailbox: a single shared inbox
+would make every audit entry read the same and turn inbox access into admin
+access.
 
 The rollout is **non-breaking**: until the first account exists, the old keys keep
 working exactly as before. Nothing locks anyone out mid-deploy.
@@ -32,7 +37,7 @@ One call, authenticated with the existing `ADMIN_API_KEY`:
 curl -X POST https://d-o-t-backend.onrender.com/admin/auth/bootstrap \
   -H 'Content-Type: application/json' \
   -H 'x-admin-key: YOUR_ADMIN_API_KEY' \
-  -d '{"username":"tafara","password":"a-long-passphrase-you-choose","full_name":"Tafara M"}'
+  -d '{"username":"tafara","email":"tafara@deliveryontime.co.zw","password":"a-long-passphrase-you-choose","full_name":"Tafara M"}'
 ```
 
 **The moment this succeeds, the env keys stop granting dashboard access.** They are
@@ -41,14 +46,14 @@ in with a username, a password and a 6-digit code from here on.
 
 ### 4. Deploy the dashboard
 
-Then sign in as the account from step 3. You will be walked through scanning a QR
-code and shown ten recovery codes. **Save those** — they are shown once.
+Then sign in as the account from step 3. A 6-digit code is emailed to you, and after
+signing in you are shown ten recovery codes. **Save those** — they are shown once.
 
 ### 5. Add everyone else
 
 Admin Accounts → **+ New admin account**. Set a temporary password and hand it over
-directly. They will be forced to choose their own password and enroll their own
-authenticator before the dashboard opens for them.
+directly, along with the email address you set for them. They must choose their own
+password before the dashboard opens, and every sign-in emails them a code.
 
 ### 6. Clean up
 
@@ -58,12 +63,12 @@ break-glass path below.
 
 ---
 
-## If someone loses their phone
+## If someone cannot reach their email
 
 - **They have recovery codes** — enter one instead of the 6-digit code at sign-in.
   Each works once.
-- **They don't** — any admin can hit **Reset 2FA** on their row. Their old
-  authenticator and recovery codes stop working and they enroll again next sign-in.
+- **They don't** — any admin can change their email address on the Admin Accounts
+  page, or hit **Reset sign-in** to invalidate any outstanding code.
 
 ## If *everyone* is locked out
 
@@ -74,12 +79,16 @@ alone can create an admin account, which is a way around 2FA.
 The last resort is Supabase SQL:
 
 ```sql
--- Force a fresh enrollment for one person (they keep their password).
-UPDATE admin_users SET totp_secret = NULL, totp_enrolled_at = NULL,
+-- Point one account at a mailbox you can actually open, and clear any lockout.
+UPDATE admin_users
+   SET email = 'you@somewhere-you-can-read.com',
        locked_until = NULL, failed_attempts = 0
  WHERE username = 'tafara';
-DELETE FROM admin_recovery_codes
- WHERE admin_user_id = (SELECT id FROM admin_users WHERE username = 'tafara');
+
+-- Kill anything still redeemable for that account.
+UPDATE admin_login_codes SET consumed_at = NOW()
+ WHERE admin_user_id = (SELECT id FROM admin_users WHERE username = 'tafara')
+   AND consumed_at IS NULL;
 ```
 
 ---
@@ -88,17 +97,22 @@ DELETE FROM admin_recovery_codes
 
 | | |
 |---|---|
-| Factor | TOTP, RFC 6238 — SHA-1, 6 digits, 30s, ±30s drift |
+| Factor | 6-digit code emailed to the admin, valid 10 minutes, single use |
+| Email | Resend or SendGrid — `EMAIL_PROVIDER`, `EMAIL_API_KEY`, `EMAIL_FROM` |
+| Code abuse | 5 wrong guesses burns the code; 5 code requests per account per hour |
 | Password storage | bcrypt (shared with the customer path) |
 | Session | 12 hours, random 32 bytes, only its SHA-256 is stored |
-| Between factors | 5-minute token that no dashboard endpoint accepts |
+| Between factors | 10-minute token that no dashboard endpoint accepts |
 | Lockout | 5 failed attempts → 15 minutes, covering password *and* code |
-| Recovery codes | 10 per person, single-use, SHA-256 |
+| Recovery codes | 10 per person, single-use, SHA-256 — for when email is unreachable |
 | Audit | Every non-GET request, plus sign-in successes and failures |
 
 Sessions are revoked immediately when an account is disabled, deleted, has its role
 changed, or has its password or 2FA reset — a live browser tab does not outlive the
 change.
 
-`ADMIN_BOOTSTRAP_ENABLED` is the only new environment variable, and it should
-normally be unset.
+New environment variables: `EMAIL_PROVIDER`, `EMAIL_API_KEY` and `EMAIL_FROM` for
+sending, plus `ADMIN_BOOTSTRAP_ENABLED`, which should normally be unset.
+
+Until the sending domain is verified with Resend, it will only deliver to the
+address that owns the Resend account — test with that one first.

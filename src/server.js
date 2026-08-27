@@ -85,11 +85,7 @@ import crypto from 'crypto';
 import axios from 'axios';
 import { hashPassword } from './passwordHash.js';
 import { assertStrongPassword } from './passwordPolicy.js';
-import {
-  requireAdmin,
-  registerAdminAuthRoutes,
-  registerAdminAccountRoutes,
-} from './adminAuth.js';
+import { guardSms } from './smsGuard.js';
 import { getWalletBalance } from './walletLedger.js';
 import * as quickbooksService from './quickbooksService.js';
 import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
@@ -107,6 +103,12 @@ const PORT = process.env.PORT || 4000;
 // Keyed by IP + phone so one attacker can't lock out a real user by
 // spamming attempts against their number from a different IP, while still
 // capping how many times any single IP can hammer any single number.
+function clientIpForSms(req) {
+  const fwd = req.headers['x-forwarded-for'];
+  if (typeof fwd === 'string' && fwd.length) return fwd.split(',')[0].trim();
+  return req.socket?.remoteAddress || null;
+}
+
 function authRateLimiter({ max, windowMinutes, message }) {
   return rateLimit({
     windowMs: windowMinutes * 60 * 1000,
@@ -660,6 +662,14 @@ app.post('/auth/send-otp', otpRequestLimiter, async (req, res) => {
     const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
     otpStore.set(phone, { code, expiresAt, name, role, password });
 
+    // Durable spend caps. The express-rate-limit guard above keys on IP+phone
+    // and so cannot stop one address walking many numbers, which is how an SMS
+    // pumping attack runs up a bill.
+    const smsVerdict = await guardSms({ phone, ip: clientIpForSms(req), purpose: 'signup_otp' });
+    if (!smsVerdict.allowed) {
+      return res.status(429).json({ error: 'Too many requests', details: smsVerdict.message });
+    }
+
     const dexatelApiKey = process.env.DEXATEL_API_KEY;
     const dexatelSender = process.env.DEXATEL_SENDER;
     if (!dexatelApiKey || !dexatelSender) {
@@ -794,6 +804,11 @@ app.post('/auth/forgot-password', passwordResetLimiter, async (req, res) => {
     const expiresAt = Date.now() + 10 * 60 * 1000;
     resetOtpStore.set(normalised, { code, expiresAt });
 
+    const smsVerdict = await guardSms({ phone: normalised, ip: clientIpForSms(req), purpose: 'password_reset' });
+    if (!smsVerdict.allowed) {
+      return res.status(429).json({ error: 'Too many requests', details: smsVerdict.message });
+    }
+
     const dexatelApiKey = process.env.DEXATEL_API_KEY;
     const dexatelSender = process.env.DEXATEL_SENDER;
     if (!dexatelApiKey || !dexatelSender) {
@@ -890,9 +905,70 @@ app.use((req, res, next) => {
   next();
 });
 
-// Dashboard auth (per-admin accounts + TOTP) lives in src/adminAuth.js.
-// requireAdmin, the role matrix and the sign-in routes all come from there.
-registerAdminAuthRoutes(app);
+const DASHBOARD_SECTIONS = {
+  admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals', 'quickbooks'],
+  accountant: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'payments', 'quickbooks'],
+  sales_marketing: ['overview', 'users', 'merchants', 'stores', 'discounts'],
+};
+
+function dashboardRoleForKey(headerKey) {
+  if (!headerKey) return null;
+  const configured = [
+    ['admin', process.env.ADMIN_API_KEY],
+    ['accountant', process.env.ACCOUNTANT_API_KEY],
+    ['sales_marketing', process.env.SALES_MARKETING_API_KEY],
+  ];
+  const matches = configured.filter(([, key]) => key && headerKey === key);
+  // Fail closed if two roles were accidentally configured with the same key.
+  return matches.length === 1 ? matches[0][0] : null;
+}
+
+function dashboardRoleCanAccess(role, method, path) {
+  if (role === 'admin' || path === '/admin/session') return true;
+  const readOnly = method === 'GET';
+  if (role === 'accountant') {
+    // Accountant manages the QuickBooks connection (connect/disconnect/mappings/backfill) in
+    // addition to the usual read-only financial views.
+    if (path.startsWith('/admin/quickbooks')) return true;
+    // Accountants can inspect registered customers, merchants, and couriers,
+    // but approval and user-management actions remain admin-only.
+    if (path === '/admin/users/pending') return false;
+    return readOnly && [
+      '/admin/stats', '/admin/users', '/admin/orders', '/admin/deliveries',
+      '/admin/payments', '/admin/merchants', '/admin/couriers',
+      '/admin/payout-details', '/admin/withdrawals',
+    ].some((prefix) => path.startsWith(prefix));
+  }
+  if (role === 'sales_marketing') {
+    if (path.startsWith('/admin/discount-codes')) return true;
+    if (path.startsWith('/admin/products/') || /^\/admin\/stores\/[^/]+\/products(?:\/upload-image)?$/.test(path)) {
+      return true;
+    }
+    if (!readOnly) return false;
+    if (path === '/admin/users/pending') return false;
+    return [
+      '/admin/stats', '/admin/users', '/admin/merchants', '/admin/stores',
+    ].some((prefix) => path.startsWith(prefix));
+  }
+  return false;
+}
+
+/** Dashboard middleware: authenticate the API key and enforce its role. */
+function requireAdmin(req, res, next) {
+  if (!process.env.ADMIN_API_KEY) {
+    return res.status(503).json({ error: 'Admin API not configured', details: 'Set ADMIN_API_KEY in server env' });
+  }
+  const headerKey = req.headers['x-admin-key'] || (req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : null);
+  const role = dashboardRoleForKey(headerKey);
+  if (!role) {
+    return res.status(401).json({ error: 'Unauthorized', details: 'Valid dashboard API key required' });
+  }
+  if (!dashboardRoleCanAccess(role, req.method, req.path)) {
+    return res.status(403).json({ error: 'Forbidden', details: 'This account does not have access to that dashboard function' });
+  }
+  req.dashboardRole = role;
+  next();
+}
 
 app.get('/', (req, res) => {
   res.json({
@@ -8304,9 +8380,12 @@ app.patch('/users/profile', requireAuth, async (req, res) => {
 
 // ========== Admin Dashboard API (require ADMIN_API_KEY) ==========
 
-// /admin/session and the account-management routes are registered by
-// src/adminAuth.js so that everything touching credentials lives together.
-registerAdminAccountRoutes(app);
+app.get('/admin/session', requireAdmin, (req, res) => {
+  return res.json({
+    role: req.dashboardRole,
+    sections: DASHBOARD_SECTIONS[req.dashboardRole] || [],
+  });
+});
 
 // POST /admin/create-user { phone, name, role, password }
 // Creates a new user directly (bypasses OTP) — admin use only.

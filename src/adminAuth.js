@@ -1,10 +1,10 @@
 /**
- * Per-admin accounts with TOTP two-factor for the dashboard.
+ * Per-admin accounts with an emailed second factor for the dashboard.
  *
  * Replaces three shared role API keys where the key WAS the credential:
  * whoever held it had that role forever, and nothing recorded who acted.
- * Here each person has an account, an authenticator seed, a session that
- * expires, and an attributable audit trail.
+ * Here each person has an account, a code emailed to their own address, a
+ * session that expires, and an attributable audit trail.
  *
  * The old env keys keep working while `admin_users` is empty so that
  * deploying this cannot lock anyone out. As soon as the first account
@@ -14,35 +14,31 @@
  */
 import crypto from 'crypto';
 import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
-import { TOTP, NobleCryptoPlugin, ScureBase32Plugin, generateSecret } from 'otplib';
 import { hashPassword, verifyPassword } from './passwordHash.js';
 import { assertStrongPassword } from './passwordPolicy.js';
 import { supabaseAdmin as supabase } from './supabaseAdminClient.js';
+import { sendEmail, signInCodeEmail, emailConfigured } from './mailer.js';
 
 export const DASHBOARD_ROLES = ['admin', 'accountant', 'sales_marketing'];
 
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;   // full session, after both factors
-const MFA_WINDOW_MS = 5 * 60 * 1000;          // password done, TOTP outstanding
+const MFA_WINDOW_MS = 10 * 60 * 1000;         // password done, emailed code outstanding
 const MAX_FAILED_ATTEMPTS = 5;
 const LOCKOUT_MS = 15 * 60 * 1000;
 const RECOVERY_CODE_COUNT = 10;
-const TOTP_ISSUER = 'Delivery On Time';
+const CODE_TTL_MS = 10 * 60 * 1000;
+// Six digits is a million combinations; without a per-code ceiling an attacker
+// holding a valid mfa token could simply enumerate them.
+const CODE_MAX_ATTEMPTS = 5;
+// Issuing codes costs money and fills someone's inbox, so cap requests the way
+// the SMS path is capped.
+const CODE_MAX_PER_HOUR = 5;
 
 // Session tokens carry a prefix so the middleware can tell them from a
 // legacy env key without a database round trip on every request.
 const SESSION_PREFIX = 'dot_sess_';
 
-const totp = new TOTP({
-  crypto: new NobleCryptoPlugin(),
-  base32: new ScureBase32Plugin(),
-  digits: 6,
-  period: 30,
-  algorithm: 'sha1',
-});
 
-// One step either side of now, i.e. ±30s, absorbing clock drift between the
-// phone and the server. Wider windows multiply the guess space for free.
-const TOTP_DRIFT_STEPS = 1;
 
 function sha256(value) {
   return crypto.createHash('sha256').update(String(value)).digest('hex');
@@ -168,7 +164,7 @@ async function loadSession(token) {
   if (!token || !token.startsWith(SESSION_PREFIX)) return null;
   const { data, error } = await supabase
     .from('admin_sessions')
-    .select('id, admin_user_id, mfa_pending, expires_at, revoked_at, admin_users ( id, username, full_name, role, is_active, totp_secret, totp_enrolled_at, must_change_password )')
+    .select('id, admin_user_id, mfa_pending, expires_at, revoked_at, admin_users ( id, username, email, full_name, role, is_active, must_change_password )')
     .eq('token_hash', sha256(token))
     .maybeSingle();
   if (error) throw new Error(error.message || 'Failed to load session');
@@ -207,29 +203,106 @@ async function revokeAllSessionsFor(adminUserId) {
     .is('revoked_at', null);
 }
 
-// ─── TOTP + recovery codes ──────────────────────────────────────────────────
+// ─── Emailed sign-in codes + recovery codes ─────────────────────────────────
 
-export function buildOtpauthUri(username, secret) {
-  const label = encodeURIComponent(`${TOTP_ISSUER}:${username}`);
-  const params = new URLSearchParams({
-    secret,
-    issuer: TOTP_ISSUER,
-    algorithm: 'SHA1',
-    digits: '6',
-    period: '30',
-  });
-  return `otpauth://totp/${label}?${params.toString()}`;
+/** Deliberately permissive: the delivery attempt is the real check. */
+function isEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(value || '').trim());
 }
 
-async function totpMatches(secret, code) {
-  const cleaned = String(code || '').replace(/\D/g, '');
-  if (cleaned.length !== 6) return false;
-  const now = Math.floor(Date.now() / 1000);
-  for (let step = -TOTP_DRIFT_STEPS; step <= TOTP_DRIFT_STEPS; step += 1) {
-    const expected = await totp.generate({ secret, epoch: now + step * 30 });
-    if (safeEqual(cleaned, expected)) return true;
+function sixDigitCode() {
+  // randomInt is uniform; Math.random()*900000 is not, and a skewed code space
+  // is a smaller code space.
+  return String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+}
+
+/** Masks an address for display: nobody should learn a full address by guessing a username. */
+export function maskEmail(email) {
+  const [local, domain] = String(email || '').split('@');
+  if (!domain) return '';
+  const head = local.slice(0, 1);
+  const tail = local.length > 2 ? local.slice(-1) : '';
+  return `${head}${'•'.repeat(Math.max(1, local.length - 2))}${tail}@${domain}`;
+}
+
+/** Issues a code, stores only its hash, and emails the plaintext. */
+async function issueLoginCode({ user, req }) {
+  const since = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  const { count, error: countError } = await supabase
+    .from('admin_login_codes')
+    .select('id', { count: 'exact', head: true })
+    .eq('admin_user_id', user.id)
+    .gte('created_at', since);
+  if (countError) throw new Error(countError.message || 'Failed to check recent codes');
+  if ((count || 0) >= CODE_MAX_PER_HOUR) {
+    return { ok: false, reason: 'rate_limited' };
   }
-  return false;
+
+  const code = sixDigitCode();
+  // Supersede any earlier live code, so only the newest one works and an old
+  // message forwarded to someone else is inert.
+  await supabase
+    .from('admin_login_codes')
+    .update({ consumed_at: new Date().toISOString() })
+    .eq('admin_user_id', user.id)
+    .is('consumed_at', null);
+
+  const { error } = await supabase.from('admin_login_codes').insert({
+    admin_user_id: user.id,
+    code_hash: sha256(code),
+    expires_at: new Date(Date.now() + CODE_TTL_MS).toISOString(),
+    ip: clientIp(req),
+  });
+  if (error) throw new Error(error.message || 'Failed to store sign-in code');
+
+  const mail = signInCodeEmail({
+    code,
+    username: user.username,
+    minutes: Math.round(CODE_TTL_MS / 60000),
+  });
+  await sendEmail({ to: user.email, ...mail });
+  return { ok: true };
+}
+
+/**
+ * Checks a submitted code against the newest live one.
+ * Counts wrong guesses against that code and burns it at the ceiling.
+ */
+async function consumeLoginCode(userId, submitted) {
+  const cleaned = String(submitted || '').replace(/\D/g, '');
+  if (cleaned.length !== 6) return false;
+
+  const { data: row, error } = await supabase
+    .from('admin_login_codes')
+    .select('id, code_hash, expires_at, attempts')
+    .eq('admin_user_id', userId)
+    .is('consumed_at', null)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new Error(error.message || 'Failed to look up sign-in code');
+  if (!row) return false;
+  if (new Date(row.expires_at).getTime() <= Date.now()) return false;
+  if ((row.attempts || 0) >= CODE_MAX_ATTEMPTS) return false;
+
+  if (!safeEqual(sha256(cleaned), row.code_hash)) {
+    await supabase
+      .from('admin_login_codes')
+      .update({ attempts: (row.attempts || 0) + 1 })
+      .eq('id', row.id);
+    return false;
+  }
+
+  // Guarded on consumed_at so two racing submissions cannot both win.
+  const { data: claimed, error: claimError } = await supabase
+    .from('admin_login_codes')
+    .update({ consumed_at: new Date().toISOString() })
+    .eq('id', row.id)
+    .is('consumed_at', null)
+    .select('id')
+    .maybeSingle();
+  if (claimError) throw new Error(claimError.message || 'Failed to consume sign-in code');
+  return !!claimed;
 }
 
 function generateRecoveryCodes() {
@@ -335,7 +408,8 @@ function publicUser(user) {
     fullName: user.full_name,
     role: user.role,
     isActive: user.is_active !== false,
-    twoFactorEnrolled: !!user.totp_enrolled_at,
+    email: user.email || null,
+    maskedEmail: maskEmail(user.email),
     mustChangePassword: !!user.must_change_password,
     lastLoginAt: user.last_login_at || null,
     createdAt: user.created_at || null,
@@ -477,7 +551,11 @@ export function registerAdminAuthRoutes(app) {
 
       const username = String(req.body?.username || '').trim();
       const password = String(req.body?.password || '');
+      const email = String(req.body?.email || '').trim().toLowerCase();
       const fullName = String(req.body?.full_name || '').trim() || null;
+      if (!isEmail(email)) {
+        return res.status(400).json({ error: 'A valid email address is required', details: 'Sign-in codes are sent there.' });
+      }
       if (!/^[a-zA-Z0-9._-]{3,32}$/.test(username)) {
         return res.status(400).json({ error: 'Invalid username', details: '3-32 characters: letters, numbers, dot, dash or underscore' });
       }
@@ -488,6 +566,7 @@ export function registerAdminAuthRoutes(app) {
         .from('admin_users')
         .insert({
           username,
+          email,
           full_name: fullName,
           password_hash: hashPassword(password),
           role: 'admin',
@@ -561,24 +640,34 @@ export function registerAdminAuthRoutes(app) {
       // every dashboard endpoint refuses until the code is verified.
       const mfaToken = await createSession({ user, req, mfaPending: true });
 
-      if (!user.totp_enrolled_at) {
-        // Enrollment is mandatory, so hand out a seed now. It is not trusted
-        // until a generated code proves the phone actually holds it.
-        const secret = user.totp_secret || generateSecret();
-        if (!user.totp_secret) {
-          await supabase.from('admin_users').update({ totp_secret: secret }).eq('id', user.id);
-        }
-        await logAdminAction({ req, user, action: 'admin.login.password_ok.enrollment_required' });
-        return res.json({
-          mfaToken,
-          enrollmentRequired: true,
-          otpauthUrl: buildOtpauthUri(user.username, secret),
-          secret,
+      if (!user.email) {
+        // Without an address there is no way to deliver a second factor, and
+        // letting the password alone through would be no second factor at all.
+        await logAdminAction({ req, user, action: 'admin.login.no_email' });
+        return res.status(409).json({
+          error: 'No email on this account',
+          details: 'Ask an admin to add an email address to your account.',
         });
       }
 
-      await logAdminAction({ req, user, action: 'admin.login.password_ok' });
-      return res.json({ mfaToken, enrollmentRequired: false });
+      try {
+        const issued = await issueLoginCode({ user, req });
+        if (!issued.ok) {
+          return res.status(429).json({
+            error: 'Too many codes',
+            details: 'Several codes have already been sent. Check your inbox, or try again later.',
+          });
+        }
+      } catch (mailError) {
+        console.error('failed to send admin sign-in code:', mailError?.message || mailError);
+        return res.status(502).json({
+          error: 'Could not send your code',
+          details: 'The email service did not accept the message. Please try again shortly.',
+        });
+      }
+
+      await logAdminAction({ req, user, action: 'admin.login.code_sent' });
+      return res.json({ mfaToken, codeSentTo: maskEmail(user.email) });
     } catch (error) {
       console.error('post /admin/auth/login error:', error);
       return res.status(500).json({ error: 'Sign-in failed', details: 'Please try again later' });
@@ -599,17 +688,10 @@ export function registerAdminAuthRoutes(app) {
       if (isLocked(user)) {
         return res.status(423).json({ error: 'Account locked', details: 'Too many failed attempts. Try again shortly.' });
       }
-      if (!user.totp_secret) {
-        return res.status(409).json({ error: 'Not enrolled', details: 'Start again from the sign-in screen.' });
-      }
-
-      const enrolling = !user.totp_enrolled_at;
-      let ok = await totpMatches(user.totp_secret, code);
+      let ok = await consumeLoginCode(user.id, code);
       let usedRecovery = false;
-      // A recovery code cannot stand in for the enrollment proof — during
-      // enrollment none exist yet, and accepting one would let someone finish
-      // setup without ever holding the authenticator.
-      if (!ok && !enrolling) {
+      // Recovery codes still work, for the day someone cannot reach their mail.
+      if (!ok) {
         ok = await consumeRecoveryCode(user.id, code);
         usedRecovery = ok;
       }
@@ -619,23 +701,28 @@ export function registerAdminAuthRoutes(app) {
         await logAdminAction({ req, user, action: 'admin.mfa.failed' });
         return res.status(nowLocked ? 423 : 401).json(nowLocked
           ? { error: 'Account locked', details: 'Too many failed attempts. Try again in 15 minutes.' }
-          : { error: 'Invalid code', details: 'That code is not right. Check your authenticator and try again.' });
+          : { error: 'Invalid code', details: 'That code is not right, or it has expired. Request a new one.' });
       }
 
       await clearFailures(user);
       await promoteSession(session.id);
 
+      // Issued once, on the first successful sign-in, so a lost mailbox is not
+      // a locked-out account.
       let recoveryCodes = null;
       const patch = { last_login_at: new Date().toISOString() };
-      if (enrolling) {
-        patch.totp_enrolled_at = new Date().toISOString();
+      const { count: existingCodes } = await supabase
+        .from('admin_recovery_codes')
+        .select('id', { count: 'exact', head: true })
+        .eq('admin_user_id', user.id);
+      if (!existingCodes) {
         recoveryCodes = await issueRecoveryCodes(user.id);
       }
       await supabase.from('admin_users').update(patch).eq('id', user.id);
 
       await logAdminAction({
         req, user,
-        action: enrolling ? 'admin.mfa.enrolled' : (usedRecovery ? 'admin.login.recovery_code' : 'admin.login.success'),
+        action: usedRecovery ? 'admin.login.recovery_code' : 'admin.login.success',
       });
 
       return res.json({
@@ -718,7 +805,7 @@ export function registerAdminAccountRoutes(app) {
     try {
       const { data, error } = await supabase
         .from('admin_users')
-        .select('id, username, full_name, role, is_active, totp_enrolled_at, must_change_password, last_login_at, created_at, locked_until')
+        .select('id, username, email, full_name, role, is_active, must_change_password, last_login_at, created_at, locked_until')
         .order('created_at', { ascending: true });
       if (error) throw new Error(error.message || 'Failed to load admins');
       return res.json({
@@ -736,8 +823,12 @@ export function registerAdminAccountRoutes(app) {
       const username = String(req.body?.username || '').trim();
       const role = String(req.body?.role || '');
       const password = String(req.body?.password || '');
+      const email = String(req.body?.email || '').trim().toLowerCase();
       const fullName = String(req.body?.full_name || '').trim() || null;
 
+      if (!isEmail(email)) {
+        return res.status(400).json({ error: 'A valid email address is required', details: 'Sign-in codes are sent there.' });
+      }
       if (!/^[a-zA-Z0-9._-]{3,32}$/.test(username)) {
         return res.status(400).json({ error: 'Invalid username', details: '3-32 characters: letters, numbers, dot, dash or underscore' });
       }
@@ -751,6 +842,7 @@ export function registerAdminAccountRoutes(app) {
         .from('admin_users')
         .insert({
           username,
+          email,
           full_name: fullName,
           role,
           password_hash: hashPassword(password),
@@ -836,12 +928,23 @@ export function registerAdminAccountRoutes(app) {
         actions.push('reset_password');
       }
 
+      if (req.body?.email !== undefined) {
+        const nextEmail = String(req.body.email).trim().toLowerCase();
+        if (!isEmail(nextEmail)) return res.status(400).json({ error: 'Enter a valid email address' });
+        patch.email = nextEmail;
+        actions.push('email');
+      }
+
       if (req.body?.reset_2fa) {
-        // Clearing the seed forces a fresh enrollment on next sign-in. Old
-        // recovery codes die with it, otherwise they would still open the
-        // account the reset was meant to secure.
-        patch.totp_secret = null;
-        patch.totp_enrolled_at = null;
+        // With emailed codes there is no seed to rotate; what matters is
+        // killing anything that could still be redeemed — a code sitting in an
+        // inbox, and the printed recovery codes. A fresh set is issued on the
+        // next successful sign-in.
+        await supabase
+          .from('admin_login_codes')
+          .update({ consumed_at: new Date().toISOString() })
+          .eq('admin_user_id', targetId)
+          .is('consumed_at', null);
         await supabase.from('admin_recovery_codes').delete().eq('admin_user_id', targetId);
         actions.push('reset_2fa');
       }
@@ -860,7 +963,7 @@ export function registerAdminAccountRoutes(app) {
 
       // Anything that changes who they are or what they can reach must not
       // leave an already-issued session alive.
-      if (patch.is_active === false || patch.role || patch.password_hash || patch.totp_secret === null) {
+      if (patch.is_active === false || patch.role || patch.password_hash || patch.email) {
         await revokeAllSessionsFor(targetId);
       }
       await logAdminAction({
