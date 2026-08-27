@@ -908,7 +908,7 @@ app.use((req, res, next) => {
 const DASHBOARD_SECTIONS = {
   admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals', 'quickbooks'],
   accountant: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'payments', 'quickbooks'],
-  sales_marketing: ['overview', 'users', 'merchants', 'stores', 'discounts'],
+  sales_marketing: ['overview', 'users', 'orders', 'merchants', 'stores', 'discounts'],
 };
 
 function dashboardRoleForKey(headerKey) {
@@ -946,8 +946,10 @@ function dashboardRoleCanAccess(role, method, path) {
     }
     if (!readOnly) return false;
     if (path === '/admin/users/pending') return false;
+    // Orders are readable but not actionable: the GET-only guard above keeps
+    // refunds (POST /admin/orders/:id/refund) with admin and accounting.
     return [
-      '/admin/stats', '/admin/users', '/admin/merchants', '/admin/stores',
+      '/admin/stats', '/admin/users', '/admin/orders', '/admin/merchants', '/admin/stores',
     ].some((prefix) => path.startsWith(prefix));
   }
   return false;
