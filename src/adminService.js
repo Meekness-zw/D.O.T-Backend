@@ -344,6 +344,87 @@ export function ordersToCsv(orders) {
   return lines.join('\r\n');
 }
 
+/** Ceiling on a single promotional credit. Overridable per environment. */
+export const PROMO_CREDIT_MAX = Number(process.env.PROMO_CREDIT_MAX || 500);
+
+/**
+ * Puts promotional balance into a customer's wallet.
+ *
+ * Thrown errors carry a `status` so the route can map them to a response
+ * without re-deriving what went wrong.
+ *
+ * The write goes through the credit_customer_wallet function rather than
+ * reading the balance here and adding to it. The wallet keeps a running
+ * balance in each row, so read-then-write loses money whenever anything else
+ * touches the same wallet in between — and checkout writes to this same table,
+ * so "admin credits an account while the customer is paying" is an ordinary
+ * sequence rather than a rare race.
+ */
+export async function creditCustomerWallet({ userId, amount, reason, max = PROMO_CREDIT_MAX }) {
+  if (!supabase) throw new Error('Server not configured');
+
+  const fail = (status, message, details) => {
+    const err = new Error(message);
+    err.status = status;
+    err.details = details;
+    throw err;
+  };
+
+  const value = Math.round(Number(amount) * 100) / 100;
+  if (!Number.isFinite(value) || value <= 0) {
+    fail(400, 'Invalid amount', 'Enter an amount greater than zero.');
+  }
+  // A ceiling per credit: the difference between 50 and 5000 is one mistyped
+  // key, and the money is spendable the moment it lands.
+  if (value > max) {
+    fail(400, 'Amount too large', `The most that can be credited at once is $${max.toFixed(2)}.`);
+  }
+
+  const { data: user, error: userError } = await supabase
+    .from('user_profiles')
+    .select('id, full_name, phone, roles, role')
+    .eq('id', userId)
+    .maybeSingle();
+  if (userError) throw new Error(userError.message || 'Failed to load user');
+  if (!user) fail(404, 'User not found', 'That account no longer exists.');
+
+  // The wallet is keyed by user_type and this credits the customer one.
+  // Crediting an account with no customer role would create a balance with
+  // nothing to spend it on.
+  const roles = Array.isArray(user.roles) ? user.roles : (user.role ? [user.role] : []);
+  if (!roles.includes('customer')) {
+    fail(400, 'Not a customer', 'Only accounts with a customer role have a wallet to credit.');
+  }
+
+  const note = String(reason || '').trim().slice(0, 200);
+  const description = note ? `Promo credit: ${note}` : 'Promo credit from Delivery On Time';
+
+  const { data, error } = await supabase.rpc('credit_customer_wallet', {
+    p_user_id: userId,
+    p_amount: value,
+    p_description: description,
+    p_reference_id: null,
+    p_transaction_type: 'promo_credit',
+  });
+  if (error) {
+    // A missing function means the migration has not been run. Say that,
+    // rather than reporting a generic failure that reads like a bad request.
+    if (/could not find|does not exist/i.test(error.message || '')) {
+      throw new Error('Wallet credit is not set up on this database yet — run supabase_migration_wallet_promo_credit.sql');
+    }
+    throw new Error(error.message || 'Failed to credit wallet');
+  }
+
+  const row = Array.isArray(data) ? data[0] : data;
+  return {
+    transaction: row,
+    amount: value,
+    note,
+    newBalance: Number(row?.balance_after) || 0,
+    customer: { id: user.id, name: user.full_name, phone: user.phone },
+  };
+}
+
 export async function getAdminDeliveries(options = {}) {
   if (!supabase) throw new Error('Server not configured');
   const { limit = 50, offset = 0 } = options;

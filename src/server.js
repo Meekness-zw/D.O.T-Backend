@@ -39,6 +39,7 @@ import {
   getAdminStats,
   getAdminStatsCharts,
   getAdminUsers,
+  creditCustomerWallet,
   getAdminOrders,
   getAdminOrdersForExport,
   ordersToCsv,
@@ -8576,6 +8577,72 @@ app.delete('/admin/users/:id', requireAdmin, async (req, res) => {
 });
 
 // PATCH /admin/users/:id/suspend — suspend or unsuspend a user
+/**
+ * POST /admin/users/:id/wallet-credit — put promotional balance into a
+ * customer's DOT wallet.
+ *
+ * Body: { amount, reason? }
+ *
+ * Admin only. The role matrix already refuses every non-GET under /admin/users
+ * for accountant and sales_marketing, so this needs no extra gate — but it is
+ * money, so it is worth saying out loud that that is what is holding the door.
+ *
+ * The insert goes through credit_customer_wallet() rather than reading the
+ * balance here and writing it back. This wallet stores a running balance, so
+ * read-then-write loses money if anything else touches the same wallet in
+ * between — and checkout writes to the same table, so an admin crediting an
+ * account while the customer is paying is a real sequence, not a theoretical
+ * one.
+ */
+app.post('/admin/users/:id/wallet-credit', requireAdmin, async (req, res) => {
+  try {
+    const { amount, reason } = req.body || {};
+    const result = await creditCustomerWallet({ userId: req.params.id, amount, reason });
+
+    try {
+      await insertUserNotification(supabase, {
+        userId: req.params.id,
+        title: 'Credit added to your wallet',
+        message: `$${result.amount.toFixed(2)} has been added to your DOT wallet.${result.note ? ` ${result.note}` : ''}`,
+        type: 'payment',
+        audience: 'customer',
+        data: { type: 'promo_credit', amount: result.amount },
+      });
+    } catch (notifyErr) {
+      // The money is already in. Failing the call here would invite a retry
+      // that credits them a second time.
+      console.error('promo credit notification failed (non-fatal):', notifyErr);
+    }
+
+    // A durable record in the Render logs. Dashboard auth is a shared role key,
+    // so there is no individual to attribute this to — the role and the calling
+    // address are the most that can honestly be captured. Named accounts would
+    // change that; see src/adminAuth.js, currently unwired.
+    console.log('[promo-credit] %s', JSON.stringify({
+      at: new Date().toISOString(),
+      by_role: req.dashboardRole || 'unknown',
+      ip: req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || null,
+      customer_id: req.params.id,
+      customer: result.customer.name || result.customer.phone || null,
+      amount: result.amount,
+      reason: result.note || null,
+      balance_after: result.newBalance,
+      transaction_id: result.transaction?.id || null,
+    }));
+
+    return res.json(result);
+  } catch (error) {
+    if (error.status) {
+      return res.status(error.status).json({ error: error.message, details: error.details });
+    }
+    console.error('post /admin/users/:id/wallet-credit error:', error);
+    return res.status(500).json({
+      error: 'Failed to credit wallet',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
 app.patch('/admin/users/:id/suspend', requireAdmin, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
