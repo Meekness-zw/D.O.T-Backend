@@ -382,17 +382,32 @@ export async function creditCustomerWallet({ userId, amount, reason, max = PROMO
 
   const { data: user, error: userError } = await supabase
     .from('user_profiles')
-    .select('id, full_name, phone, roles, role')
+    .select('id, full_name, phone, role')
     .eq('id', userId)
     .maybeSingle();
   if (userError) throw new Error(userError.message || 'Failed to load user');
   if (!user) fail(404, 'User not found', 'That account no longer exists.');
 
-  // The wallet is keyed by user_type and this credits the customer one.
-  // Crediting an account with no customer role would create a balance with
-  // nothing to spend it on.
-  const roles = Array.isArray(user.roles) ? user.roles : (user.role ? [user.role] : []);
-  if (!roles.includes('customer')) {
+  // The wallet is keyed by user_type and this credits the customer one, so the
+  // target has to actually be a customer — otherwise the credit creates a
+  // balance with nothing to spend it on.
+  //
+  // There is no user_profiles.roles column; the roles the dashboard shows are
+  // assembled from three places, and this uses the same three so a person the
+  // list calls a customer is one here too:
+  //   • a row in `customers`
+  //   • a row in `user_roles`
+  //   • user_profiles.role, the original single-role field, as the fallback
+  const [{ data: customerRow }, { data: roleRows }] = await Promise.all([
+    supabase.from('customers').select('id').eq('id', userId).maybeSingle(),
+    supabase.from('user_roles').select('role').eq('user_id', userId),
+  ]);
+
+  const isCustomer = !!customerRow
+    || (roleRows || []).some((r) => String(r.role).toLowerCase() === 'customer')
+    || String(user.role || '').toLowerCase() === 'customer';
+
+  if (!isCustomer) {
     fail(400, 'Not a customer', 'Only accounts with a customer role have a wallet to credit.');
   }
 
