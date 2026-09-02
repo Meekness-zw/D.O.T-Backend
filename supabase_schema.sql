@@ -30,6 +30,21 @@ CREATE TABLE IF NOT EXISTS user_profiles (
 -- If table already existed with email NOT NULL, run: ALTER TABLE user_profiles ALTER COLUMN email DROP NOT NULL;
 -- Existing installations should run migrations/2026-08-24-add-active-push-role.sql.
 
+-- Backend-only audit/counter for outbound SMS spend limits. A null
+-- blocked_reason means the SMS provider accepted the message; rejected or
+-- failed attempts are retained for diagnosis but excluded from send quotas.
+CREATE TABLE IF NOT EXISTS sms_send_log (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  phone TEXT NOT NULL,
+  ip TEXT,
+  purpose TEXT NOT NULL,
+  blocked_reason TEXT,
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+UPDATE sms_send_log SET created_at = NOW() WHERE created_at IS NULL;
+ALTER TABLE sms_send_log ALTER COLUMN created_at SET DEFAULT NOW();
+ALTER TABLE sms_send_log ALTER COLUMN created_at SET NOT NULL;
+
 -- ============================================
 -- CUSTOMERS
 -- ============================================
@@ -491,6 +506,11 @@ CREATE INDEX IF NOT EXISTS idx_user_profiles_role ON user_profiles(role);
 CREATE INDEX IF NOT EXISTS idx_user_profiles_email ON user_profiles(email);
 CREATE INDEX IF NOT EXISTS idx_user_profiles_phone ON user_profiles(phone);
 
+-- SMS guard
+CREATE INDEX IF NOT EXISTS idx_sms_send_log_created ON sms_send_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sms_send_log_phone ON sms_send_log(phone, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sms_send_log_ip ON sms_send_log(ip, created_at DESC);
+
 -- Customers
 CREATE INDEX IF NOT EXISTS idx_customer_addresses_customer_id ON customer_addresses(customer_id);
 CREATE INDEX IF NOT EXISTS idx_customer_payment_methods_customer_id ON customer_payment_methods(customer_id);
@@ -713,6 +733,13 @@ ALTER TABLE order_items ENABLE ROW LEVEL SECURITY;
 ALTER TABLE payments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE wallet_transactions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE notifications ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sms_send_log ENABLE ROW LEVEL SECURITY;
+
+-- The service role bypasses RLS. Explicitly remove browser-role privileges so
+-- raw phone/IP audit data and quota counters cannot be read or manipulated.
+DROP POLICY IF EXISTS "Service role full access on sms_send_log" ON sms_send_log;
+REVOKE ALL ON TABLE sms_send_log FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT ON TABLE sms_send_log TO service_role;
 
 -- User Profiles: Users can read/update their own profile
 DROP POLICY IF EXISTS "Users can view own profile" ON user_profiles;

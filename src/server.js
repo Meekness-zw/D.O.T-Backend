@@ -82,15 +82,20 @@ import {
   inferStrongStoreCategory,
 } from './storeCategorizationAI.js';
 import crypto from 'crypto';
+import { isIP } from 'node:net';
 import axios from 'axios';
 import { hashPassword } from './passwordHash.js';
 import { assertStrongPassword } from './passwordPolicy.js';
-import { guardSms } from './smsGuard.js';
+import { guardSms, recordSmsSent, recordSmsFailure } from './smsGuard.js';
 import { getWalletBalance } from './walletLedger.js';
 import * as quickbooksService from './quickbooksService.js';
 import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
 
 const app = express();
+// Render guarantees the left-most X-Forwarded-For value is the real client
+// address. Let Express resolve that trusted proxy chain, then validate and
+// normalize it before using it in any limiter or durable counter.
+app.set('trust proxy', true);
 const supabase = supabaseAdmin;
 const PORT = process.env.PORT || 4000;
 
@@ -104,20 +109,24 @@ const PORT = process.env.PORT || 4000;
 // spamming attempts against their number from a different IP, while still
 // capping how many times any single IP can hammer any single number.
 function clientIpForSms(req) {
-  const fwd = req.headers['x-forwarded-for'];
-  if (typeof fwd === 'string' && fwd.length) return fwd.split(',')[0].trim();
-  return req.socket?.remoteAddress || null;
+  const candidate = req.ip || req.socket?.remoteAddress || '';
+  return isIP(candidate) ? ipKeyGenerator(candidate) : null;
 }
 
-function authRateLimiter({ max, windowMinutes, message }) {
+function authRateLimiter({ max, windowMinutes, message, skipServerErrors = false }) {
   return rateLimit({
     windowMs: windowMinutes * 60 * 1000,
     max,
     standardHeaders: true,
     legacyHeaders: false,
+    // Provider/infrastructure failures did not send a code and should not lock
+    // out a real user. Validation, abuse and quota 4xx responses still count.
+    skipFailedRequests: skipServerErrors,
+    requestWasSuccessful: (_req, res) => res.statusCode < 500,
     keyGenerator: (req) => {
-      const phone = String(req.body?.phone || '').trim().toLowerCase();
-      return `${ipKeyGenerator(req)}:${phone || 'no-phone'}`;
+      const phone = String(req.body?.phone || '').replace(/[\s\-().]/g, '').toLowerCase();
+      const clientIp = clientIpForSms(req) || 'unknown-ip';
+      return `${clientIp}:${phone || 'no-phone'}`;
     },
     handler: (req, res) => {
       res.status(429).json({
@@ -134,6 +143,9 @@ const otpRequestLimiter = authRateLimiter({
   max: 5,
   windowMinutes: 15,
   message: 'Too many verification code requests for this number. Please try again in 15 minutes.',
+  // Provider/infrastructure failures never send an SMS and therefore must not
+  // exhaust a legitimate user's request allowance.
+  skipServerErrors: true,
 });
 const otpVerifyLimiter = authRateLimiter({
   max: 5,
@@ -145,10 +157,27 @@ const loginLimiter = authRateLimiter({
   windowMinutes: 15,
   message: 'Too many login attempts for this number. Please try again in 15 minutes.',
 });
-const passwordResetLimiter = authRateLimiter({
+const passwordResetRequestLimiter = authRateLimiter({
+  max: 5,
+  windowMinutes: 15,
+  message: 'Too many password reset code requests. Please try again in 15 minutes.',
+  skipServerErrors: true,
+});
+const passwordResetVerifyLimiter = authRateLimiter({
   max: 5,
   windowMinutes: 15,
   message: 'Too many password reset attempts. Please try again in 15 minutes.',
+});
+const smsRequestIpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => clientIpForSms(req) || 'unknown-ip',
+  handler: (_req, res) => res.status(429).json({
+    error: 'Too many attempts',
+    details: 'Too many verification requests from this network. Please try again in 15 minutes.',
+  }),
 });
 
 // Find an auth user by phone number using digit-only comparison.
@@ -624,11 +653,15 @@ function friendlySmsError(smsErr) {
   return 'We could not send the SMS. Please check the number and try again.';
 }
 
+function smsRetryAfterSeconds(reason) {
+  return reason === 'phone_hour' || reason === 'ip_hour' ? 60 * 60 : 24 * 60 * 60;
+}
+
 // In-memory OTP store: phone -> { code, expiresAt, name, role, password }
 const otpStore = new Map();
 
 // POST /auth/send-otp { phone, name, role, password }
-app.post('/auth/send-otp', otpRequestLimiter, async (req, res) => {
+app.post('/auth/send-otp', smsRequestIpLimiter, otpRequestLimiter, async (req, res) => {
   try {
     const { name, role, password } = req.body;
     const phone = normalizeE164(req.body?.phone);
@@ -658,21 +691,30 @@ app.post('/auth/send-otp', otpRequestLimiter, async (req, res) => {
       return res.status(409).json({ error: 'Phone number already registered. Please log in instead.' });
     }
 
-    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const code = String(crypto.randomInt(100000, 1000000));
     const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
-    otpStore.set(phone, { code, expiresAt, name, role, password });
 
     // Durable spend caps. The express-rate-limit guard above keys on IP+phone
     // and so cannot stop one address walking many numbers, which is how an SMS
     // pumping attack runs up a bill.
-    const smsVerdict = await guardSms({ phone, ip: clientIpForSms(req), purpose: 'signup_otp' });
+    const smsRequest = { phone, ip: clientIpForSms(req), purpose: 'signup_otp' };
+    const smsVerdict = await guardSms(smsRequest);
     if (!smsVerdict.allowed) {
-      return res.status(429).json({ error: 'Too many requests', details: smsVerdict.message });
+      const status = smsVerdict.reason === 'country_not_allowed' ? 400 : 429;
+      const retryAfterSeconds = status === 429 ? smsRetryAfterSeconds(smsVerdict.reason) : undefined;
+      if (retryAfterSeconds) res.set('Retry-After', String(retryAfterSeconds));
+      return res.status(status).json({
+        error: status === 429 ? 'Too many requests' : 'Unsupported phone number',
+        details: smsVerdict.message,
+        ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
+      });
     }
+    const smsOutcome = { ...smsRequest, reservationId: smsVerdict.reservationId };
 
     const dexatelApiKey = process.env.DEXATEL_API_KEY;
     const dexatelSender = process.env.DEXATEL_SENDER;
     if (!dexatelApiKey || !dexatelSender) {
+      await recordSmsFailure({ ...smsOutcome, reason: 'service_not_configured' });
       return res.status(503).json({ error: 'OTP service not configured' });
     }
 
@@ -680,9 +722,10 @@ app.post('/auth/send-otp', otpRequestLimiter, async (req, res) => {
       await axios.post(
         'https://api.dexatel.com/v1/messages',
         { data: { from: dexatelSender, to: [phone], text: `Your Delivery On Time verification code is: ${code}`, channel: 'sms' } },
-        { headers: { 'Content-Type': 'application/json', 'X-Dexatel-Key': dexatelApiKey } }
+        { headers: { 'Content-Type': 'application/json', 'X-Dexatel-Key': dexatelApiKey }, timeout: 15000 }
       );
     } catch (smsErr) {
+      await recordSmsFailure({ ...smsOutcome, reason: 'provider_failed' });
       const status = smsErr.response?.status;
       const detail = JSON.stringify(smsErr.response?.data ?? smsErr.message);
       console.error(`Dexatel error [${status}] to ${phone}:`, detail);
@@ -692,10 +735,17 @@ app.post('/auth/send-otp', otpRequestLimiter, async (req, res) => {
       });
     }
 
+    // Do not replace a previously delivered code unless Dexatel accepted the
+    // new message. A blocked/failed resend must leave the old code valid.
+    otpStore.set(phone, { code, expiresAt, name, role, password, failedAttempts: 0 });
+    await recordSmsSent(smsOutcome);
     return res.status(200).json({ success: true });
   } catch (error) {
     console.error('send-otp error:', error.message);
-    return res.status(500).json({ error: 'Failed to send OTP', details: error.message });
+    return res.status(500).json({
+      error: 'Failed to send verification code',
+      details: 'The verification service is temporarily unavailable. Please try again shortly.',
+    });
   }
 });
 
@@ -718,6 +768,14 @@ app.post('/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Verification code has expired. Please request a new one.' });
     }
     if (entry.code !== String(code)) {
+      entry.failedAttempts = (entry.failedAttempts || 0) + 1;
+      if (entry.failedAttempts >= 5) {
+        otpStore.delete(phone);
+        return res.status(429).json({
+          error: 'Too many incorrect verification codes.',
+          details: 'Request a new code and try again.',
+        });
+      }
       return res.status(400).json({ error: 'Incorrect verification code.' });
     }
 
@@ -787,7 +845,7 @@ app.post('/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
 const resetOtpStore = new Map();
 
 // POST /auth/forgot-password { phone }
-app.post('/auth/forgot-password', passwordResetLimiter, async (req, res) => {
+app.post('/auth/forgot-password', smsRequestIpLimiter, passwordResetRequestLimiter, async (req, res) => {
   try {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone number is required' });
@@ -800,18 +858,27 @@ app.post('/auth/forgot-password', passwordResetLimiter, async (req, res) => {
       return res.status(404).json({ error: 'No account found with this phone number.' });
     }
 
-    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const code = String(crypto.randomInt(100000, 1000000));
     const expiresAt = Date.now() + 10 * 60 * 1000;
-    resetOtpStore.set(normalised, { code, expiresAt });
 
-    const smsVerdict = await guardSms({ phone: normalised, ip: clientIpForSms(req), purpose: 'password_reset' });
+    const smsRequest = { phone: normalised, ip: clientIpForSms(req), purpose: 'password_reset' };
+    const smsVerdict = await guardSms(smsRequest);
     if (!smsVerdict.allowed) {
-      return res.status(429).json({ error: 'Too many requests', details: smsVerdict.message });
+      const status = smsVerdict.reason === 'country_not_allowed' ? 400 : 429;
+      const retryAfterSeconds = status === 429 ? smsRetryAfterSeconds(smsVerdict.reason) : undefined;
+      if (retryAfterSeconds) res.set('Retry-After', String(retryAfterSeconds));
+      return res.status(status).json({
+        error: status === 429 ? 'Too many requests' : 'Unsupported phone number',
+        details: smsVerdict.message,
+        ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
+      });
     }
+    const smsOutcome = { ...smsRequest, reservationId: smsVerdict.reservationId };
 
     const dexatelApiKey = process.env.DEXATEL_API_KEY;
     const dexatelSender = process.env.DEXATEL_SENDER;
     if (!dexatelApiKey || !dexatelSender) {
+      await recordSmsFailure({ ...smsOutcome, reason: 'service_not_configured' });
       return res.status(503).json({ error: 'SMS service not configured' });
     }
 
@@ -819,23 +886,29 @@ app.post('/auth/forgot-password', passwordResetLimiter, async (req, res) => {
       await axios.post(
         'https://api.dexatel.com/v1/messages',
         { data: { from: dexatelSender, to: [normalised], text: `Your Delivery On Time password reset code is: ${code}`, channel: 'sms' } },
-        { headers: { 'Content-Type': 'application/json', 'X-Dexatel-Key': dexatelApiKey } }
+        { headers: { 'Content-Type': 'application/json', 'X-Dexatel-Key': dexatelApiKey }, timeout: 15000 }
       );
     } catch (smsErr) {
+      await recordSmsFailure({ ...smsOutcome, reason: 'provider_failed' });
       const detail = JSON.stringify(smsErr.response?.data ?? smsErr.message);
       console.error('forgot-password SMS error:', detail);
       return res.status(502).json({ error: 'Failed to send reset code', details: friendlySmsError(smsErr) });
     }
 
+    resetOtpStore.set(normalised, { code, expiresAt, failedAttempts: 0 });
+    await recordSmsSent(smsOutcome);
     return res.status(200).json({ success: true });
   } catch (error) {
     console.error('forgot-password error:', error);
-    return res.status(500).json({ error: error.message || 'Failed to send reset code' });
+    return res.status(500).json({
+      error: 'Failed to send reset code',
+      details: 'The verification service is temporarily unavailable. Please try again shortly.',
+    });
   }
 });
 
 // POST /auth/reset-password { phone, code, newPassword }
-app.post('/auth/reset-password', passwordResetLimiter, async (req, res) => {
+app.post('/auth/reset-password', passwordResetVerifyLimiter, async (req, res) => {
   try {
     const { phone, code, newPassword } = req.body;
     if (!phone || !code || !newPassword) {
@@ -857,6 +930,14 @@ app.post('/auth/reset-password', passwordResetLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Reset code has expired. Please request a new one.' });
     }
     if (entry.code !== String(code)) {
+      entry.failedAttempts = (entry.failedAttempts || 0) + 1;
+      if (entry.failedAttempts >= 5) {
+        resetOtpStore.delete(normalised);
+        return res.status(429).json({
+          error: 'Too many incorrect reset codes.',
+          details: 'Request a new code and try again.',
+        });
+      }
       return res.status(400).json({ error: 'Incorrect reset code.' });
     }
 
