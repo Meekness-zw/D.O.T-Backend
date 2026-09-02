@@ -992,8 +992,8 @@ app.use((req, res, next) => {
 
 const DASHBOARD_SECTIONS = {
   admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals', 'quickbooks'],
-  accountant: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'payments', 'quickbooks'],
-  sales_marketing: ['overview', 'users', 'orders', 'merchants', 'stores', 'discounts'],
+  accountant: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'quickbooks'],
+  sales_marketing: ['overview', 'users', 'orders', 'merchants', 'couriers', 'stores', 'discounts'],
 };
 
 function dashboardRoleForKey(headerKey) {
@@ -1020,7 +1020,7 @@ function dashboardRoleCanAccess(role, method, path) {
     if (path === '/admin/users/pending') return false;
     return readOnly && [
       '/admin/stats', '/admin/users', '/admin/orders', '/admin/deliveries',
-      '/admin/payments', '/admin/merchants', '/admin/couriers',
+      '/admin/payments', '/admin/merchants', '/admin/couriers', '/admin/stores',
       '/admin/payout-details', '/admin/withdrawals',
     ].some((prefix) => path.startsWith(prefix));
   }
@@ -1034,7 +1034,8 @@ function dashboardRoleCanAccess(role, method, path) {
     // Orders are readable but not actionable: the GET-only guard above keeps
     // refunds (POST /admin/orders/:id/refund) with admin and accounting.
     return [
-      '/admin/stats', '/admin/users', '/admin/orders', '/admin/merchants', '/admin/stores',
+      '/admin/stats', '/admin/users', '/admin/orders', '/admin/merchants',
+      '/admin/couriers', '/admin/stores',
     ].some((prefix) => path.startsWith(prefix));
   }
   return false;
@@ -1376,8 +1377,12 @@ app.get('/stores', optionalAuth, async (req, res) => {
 
     // Only show stores that can actually deliver to this customer — within
     // that store's own delivery_radius_km, not every active store in the
-    // database regardless of how far away it is.
-    const DEFAULT_DELIVERY_RADIUS_KM = 20;
+    // database regardless of how far away it is. A merchant can still set a
+    // *tighter* radius than the cap (e.g. "I only deliver 5km out"), but
+    // nothing shows a regular customer past MAX_CUSTOMER_VISIBLE_RADIUS_KM
+    // regardless of what they've configured.
+    const DEFAULT_DELIVERY_RADIUS_KM = 15;
+    const MAX_CUSTOMER_VISIBLE_RADIUS_KM = 15;
     if (hasLocation) {
       stores = stores.map((s) => {
         if (s.latitude == null || s.longitude == null) {
@@ -1391,7 +1396,8 @@ app.get('/stores', optionalAuth, async (req, res) => {
         stores = stores.filter((s) => {
           // No coordinates on file → can't confirm it's actually deliverable, exclude rather than guess.
           if (s.distance_km == null) return false;
-          const radiusKm = Number(s.delivery_radius_km) || DEFAULT_DELIVERY_RADIUS_KM;
+          const merchantRadiusKm = Number(s.delivery_radius_km) || DEFAULT_DELIVERY_RADIUS_KM;
+          const radiusKm = Math.min(merchantRadiusKm, MAX_CUSTOMER_VISIBLE_RADIUS_KM);
           return s.distance_km <= radiusKm;
         });
       }
