@@ -1,12 +1,17 @@
 import crypto from 'crypto';
 import axios from 'axios';
 
-const MIN_PASSWORD_LENGTH = 12;
+const MIN_PASSWORD_LENGTH = 8;
+const SPECIAL_CHAR_PATTERN = /[!"#$%&'()*+,\-./:;<=>?@[\]^_`{|}~\\]/;
 
-/** Synchronous length check — cheap, so callers can fail fast before any network call. */
+/** Synchronous length + composition check — cheap, so callers can fail fast before any network call. */
 export function checkPasswordLength(password) {
-  if (!password || String(password).length < MIN_PASSWORD_LENGTH) {
+  const value = String(password || '');
+  if (!password || value.length < MIN_PASSWORD_LENGTH) {
     return { valid: false, error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters.` };
+  }
+  if (!SPECIAL_CHAR_PATTERN.test(value)) {
+    return { valid: false, error: 'Password must include at least one special character (e.g. ! @ # $ %).' };
   }
   return { valid: true };
 }
