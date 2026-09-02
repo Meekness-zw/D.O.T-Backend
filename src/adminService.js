@@ -199,9 +199,32 @@ export async function getAdminUsers(options = {}) {
   return { users, total: count ?? 0 };
 }
 
+/**
+ * Sortable columns, as a whitelist mapping the API's name to the PostgREST
+ * expression. Never interpolate a caller's string into an order clause.
+ *
+ * "store" orders the ORDER rows by the store's name through the to-one join.
+ * The dotted form is load-bearing: supabase-js's { referencedTable: 'stores' }
+ * option emits `stores.order=...`, which sorts rows *within* each embedded
+ * store object and leaves the orders themselves in their original sequence —
+ * silently doing nothing while still returning a full, plausible-looking page.
+ */
+const ORDER_SORTS = {
+  date: 'created_at',
+  store: 'stores(store_name)',
+  total: 'total_amount',
+  status: 'status',
+  order_number: 'order_number',
+};
+
+export const ORDER_SORT_KEYS = Object.keys(ORDER_SORTS);
+
 export async function getAdminOrders(options = {}) {
   if (!supabase) throw new Error('Server not configured');
-  const { limit = 50, offset = 0, status, from, to } = options;
+  const { limit = 50, offset = 0, status, from, to, storeId, sort, dir } = options;
+
+  const column = ORDER_SORTS[sort] || ORDER_SORTS.date;
+  const ascending = dir === 'asc';
 
   let query = supabase
     .from('orders')
@@ -220,10 +243,16 @@ export async function getAdminOrders(options = {}) {
       courier_id,
       stores ( store_name )
     `, { count: 'exact' })
-    .order('created_at', { ascending: false })
-    .range(offset, offset + limit - 1);
+    .order(column, { ascending })
+    // Rows sharing a sort value (same store, same status) would otherwise come
+    // back in an arbitrary order that can differ between pages, so a row can
+    // appear twice or not at all while paging. created_at is the tiebreak.
+    .order('created_at', { ascending: false });
+
+  if (limit != null) query = query.range(offset, offset + limit - 1);
 
   if (status) query = query.eq('status', status);
+  if (storeId) query = query.eq('store_id', storeId);
   if (from) query = query.gte('created_at', from);
   if (to) query = query.lte('created_at', to);
 
@@ -249,6 +278,70 @@ export async function getAdminOrders(options = {}) {
     });
   }
   return { orders, total: count ?? 0 };
+}
+
+/** Hard ceiling on an export, so one click cannot try to serialise the table. */
+export const ORDER_EXPORT_MAX = 10000;
+
+/**
+ * Every order matching the filters, for CSV export.
+ *
+ * Pages internally rather than asking for everything at once: PostgREST caps a
+ * single response, so a naive high limit silently returns only the first slice
+ * and the operator gets a short file that looks complete.
+ */
+export async function getAdminOrdersForExport(options = {}) {
+  const CHUNK = 1000;
+  const all = [];
+  let offset = 0;
+  let total = 0;
+
+  for (;;) {
+    const page = await getAdminOrders({ ...options, limit: CHUNK, offset });
+    total = page.total;
+    all.push(...page.orders);
+    offset += CHUNK;
+    if (page.orders.length < CHUNK || all.length >= Math.min(total, ORDER_EXPORT_MAX)) break;
+  }
+
+  return { orders: all.slice(0, ORDER_EXPORT_MAX), total, truncated: total > ORDER_EXPORT_MAX };
+}
+
+/**
+ * One CSV field.
+ *
+ * Beyond the usual quoting, a leading =, +, - or @ is neutralised with a
+ * leading apostrophe: spreadsheets treat such a cell as a formula, and these
+ * rows carry customer-entered names and delivery addresses. An address that
+ * begins "=" would otherwise execute on open.
+ */
+function csvCell(value) {
+  if (value === null || value === undefined) return '';
+  let out = String(value);
+  if (/^[=+\-@\t\r]/.test(out)) out = `'${out}`;
+  if (/[",\n\r]/.test(out)) out = `"${out.replace(/"/g, '""')}"`;
+  return out;
+}
+
+export function ordersToCsv(orders) {
+  const columns = [
+    ['Order number', (o) => o.order_number],
+    ['Date', (o) => (o.created_at ? new Date(o.created_at).toISOString() : '')],
+    ['Store', (o) => o.store_name],
+    ['Customer', (o) => o.customer_name],
+    ['Phone', (o) => o.customer_phone],
+    ['Status', (o) => o.status],
+    ['Payment status', (o) => o.payment_status],
+    ['Payment method', (o) => o.payment_method],
+    ['Total', (o) => (o.total_amount == null ? '' : Number(o.total_amount).toFixed(2))],
+    ['Delivery address', (o) => o.delivery_address],
+    ['Delivered at', (o) => (o.actual_delivery_time ? new Date(o.actual_delivery_time).toISOString() : '')],
+  ];
+
+  const lines = [columns.map(([h]) => csvCell(h)).join(',')];
+  for (const o of orders) lines.push(columns.map(([, get]) => csvCell(get(o))).join(','));
+  // CRLF is what the CSV spec asks for and what Excel on Windows expects.
+  return lines.join('\r\n');
 }
 
 export async function getAdminDeliveries(options = {}) {

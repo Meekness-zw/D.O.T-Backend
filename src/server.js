@@ -40,6 +40,9 @@ import {
   getAdminStatsCharts,
   getAdminUsers,
   getAdminOrders,
+  getAdminOrdersForExport,
+  ordersToCsv,
+  ORDER_EXPORT_MAX,
   getAdminDeliveries,
   getAdminPayments,
   getAdminStores,
@@ -8591,18 +8594,67 @@ app.patch('/admin/users/:id/suspend', requireAdmin, async (req, res) => {
   }
 });
 
+/**
+ * Reads the shared list filters off a query string.
+ *
+ * `to` is widened to the end of that day. A date input yields 2026-09-02, which
+ * as a timestamp means midnight — so "up to the 2nd" would silently exclude
+ * everything that happened on the 2nd, which is the whole day the operator was
+ * asking about.
+ */
+function orderListFilters(query) {
+  const to = query.to
+    ? (/^\d{4}-\d{2}-\d{2}$/.test(query.to) ? `${query.to}T23:59:59.999` : query.to)
+    : undefined;
+  return {
+    status: query.status || undefined,
+    storeId: query.store_id || undefined,
+    from: query.from || undefined,
+    to,
+    sort: query.sort || undefined,
+    dir: query.dir === 'asc' ? 'asc' : 'desc',
+  };
+}
+
 app.get('/admin/orders', requireAdmin, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
     const offset = parseInt(req.query.offset, 10) || 0;
-    const status = req.query.status || undefined;
-    const from = req.query.from || undefined;
-    const to = req.query.to || undefined;
-    const result = await getAdminOrders({ limit, offset, status, from, to });
+    const result = await getAdminOrders({ limit, offset, ...orderListFilters(req.query) });
     return res.json(result);
   } catch (error) {
     console.error('admin/orders error:', error);
     return res.status(500).json({ error: 'Failed to load orders', details: error.message || 'Try again later' });
+  }
+});
+
+/**
+ * GET /admin/orders/export — the filtered orders as a CSV download.
+ *
+ * Exports what the filters select, not the page being viewed: an export that
+ * only covered the visible 25 rows would be quietly wrong every time someone
+ * exported a month.
+ */
+app.get('/admin/orders/export', requireAdmin, async (req, res) => {
+  try {
+    const { orders, total, truncated } = await getAdminOrdersForExport(orderListFilters(req.query));
+    const stamp = new Date().toISOString().slice(0, 10);
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="dot-orders-${stamp}.csv"`);
+    // Lets the dashboard warn that the file is short of the full match.
+    res.setHeader('X-Total-Rows', String(total));
+    res.setHeader('X-Truncated', truncated ? 'true' : 'false');
+    res.setHeader('Access-Control-Expose-Headers', 'X-Total-Rows, X-Truncated');
+
+    if (truncated) {
+      console.warn(`admin/orders/export: ${total} rows matched, capped at ${ORDER_EXPORT_MAX}`);
+    }
+    // BOM so Excel reads it as UTF-8; without it accented names arrive mangled.
+    return res.send('\uFEFF' + ordersToCsv(orders));
+  } catch (error) {
+    console.error('admin/orders/export error:', error);
+    return res.status(500).json({ error: 'Failed to export orders', details: error.message || 'Try again later' });
   }
 });
 
