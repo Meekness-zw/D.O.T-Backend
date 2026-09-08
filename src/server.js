@@ -90,6 +90,7 @@ import { isIP } from 'node:net';
 import axios from 'axios';
 import { hashPassword } from './passwordHash.js';
 import { assertStrongPassword } from './passwordPolicy.js';
+import { sendOtpEmail } from './resendClient.js';
 import { guardSms, recordSmsSent, recordSmsFailure } from './smsGuard.js';
 import { getWalletBalance } from './walletLedger.js';
 import * as quickbooksService from './quickbooksService.js';
@@ -668,16 +669,20 @@ const otpStore = new Map();
 app.post('/auth/send-otp', smsRequestIpLimiter, otpRequestLimiter, async (req, res) => {
   try {
     const { name, role, password } = req.body;
+    const email = String(req.body?.email || '').trim().toLowerCase();
     const phone = normalizeE164(req.body?.phone);
-    if (!phone || !role || !password) {
+    if (!phone || !role || !password || !email) {
       if (req.body?.phone && !phone) {
         return res.status(400).json({
           error: 'Invalid phone number',
           details: 'Enter the number with its country code, e.g. +263 77 123 4567 or +44 7911 123456.',
         });
       }
-      const missing = ['phone', 'role', 'password'].filter(f => !req.body[f]);
+      const missing = ['phone', 'email', 'role', 'password'].filter(f => !(f === 'email' ? email : req.body[f]));
       return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: 'Invalid email address', details: 'Enter a valid email address, e.g. you@example.com.' });
     }
     const validRoles = ['customer', 'merchant', 'courier'];
     if (!validRoles.includes(role)) {
@@ -693,6 +698,14 @@ app.post('/auth/send-otp', smsRequestIpLimiter, otpRequestLimiter, async (req, r
     const existing = await checkPhoneRegistered(phone);
     if (existing.registered) {
       return res.status(409).json({ error: 'Phone number already registered. Please log in instead.' });
+    }
+    const { data: emailTaken } = await supabaseAdmin
+      .from('user_profiles')
+      .select('id')
+      .eq('email', email)
+      .maybeSingle();
+    if (emailTaken) {
+      return res.status(409).json({ error: 'This email address is already in use.' });
     }
 
     const code = String(crypto.randomInt(100000, 1000000));
@@ -741,7 +754,7 @@ app.post('/auth/send-otp', smsRequestIpLimiter, otpRequestLimiter, async (req, r
 
     // Do not replace a previously delivered code unless Dexatel accepted the
     // new message. A blocked/failed resend must leave the old code valid.
-    otpStore.set(phone, { code, expiresAt, name, role, password, failedAttempts: 0 });
+    otpStore.set(phone, { code, expiresAt, name, role, password, email, failedAttempts: 0 });
     await recordSmsSent(smsOutcome);
     return res.status(200).json({ success: true });
   } catch (error) {
@@ -784,7 +797,7 @@ app.post('/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
     }
 
     otpStore.delete(phone);
-    const { name, role, password } = entry;
+    const { name, role, password, email } = entry;
 
     const existing = await checkPhoneRegistered(phone);
     let userId;
@@ -830,7 +843,7 @@ app.post('/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
       }
     }
 
-    await ensureUserProfile({ userId, email: null, phone, fullName: name || '', role, password });
+    await ensureUserProfile({ userId, email: email || null, phone, fullName: name || '', role, password });
 
     const sessionData = await loginWithPassword({ phone, password });
 
@@ -842,6 +855,59 @@ app.post('/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
   } catch (error) {
     console.error('verify-otp error:', error);
     return res.status(400).json({ error: 'Verification failed', details: error.message });
+  }
+});
+
+// POST /auth/resend-otp-email { phone } — used by the "Resend code" action on
+// the signup verification screen. The first code always goes by SMS
+// (/auth/send-otp above); resending switches to email instead, using the
+// address collected at signup. Requires a still-pending signup entry (i.e.
+// /auth/send-otp must have been called first) — this never re-sends by SMS.
+app.post('/auth/resend-otp-email', otpRequestLimiter, async (req, res) => {
+  try {
+    const phone = normalizeE164(req.body?.phone) || req.body?.phone;
+    if (!phone) {
+      return res.status(400).json({ error: 'phone is required' });
+    }
+
+    const entry = otpStore.get(phone);
+    if (!entry) {
+      return res.status(400).json({
+        error: 'No pending verification found for this number.',
+        details: 'Please start sign up again.',
+      });
+    }
+    if (!entry.email) {
+      return res.status(400).json({
+        error: 'No email on file for this signup.',
+        details: 'Please start sign up again and provide an email address.',
+      });
+    }
+
+    // Fresh code on every resend — the old one stays valid only until this
+    // send actually succeeds, matching the SMS resend's "don't invalidate a
+    // working code on a failed resend" behavior.
+    const code = String(crypto.randomInt(100000, 1000000));
+    const expiresAt = Date.now() + 10 * 60 * 1000;
+
+    try {
+      await sendOtpEmail({ to: entry.email, code, name: entry.name });
+    } catch (emailErr) {
+      console.error('resend-otp-email error:', emailErr.message);
+      return res.status(502).json({
+        error: 'Failed to send verification email',
+        details: 'Please try again shortly, or use the original code sent by SMS.',
+      });
+    }
+
+    otpStore.set(phone, { ...entry, code, expiresAt, failedAttempts: 0 });
+    return res.status(200).json({ success: true, channel: 'email' });
+  } catch (error) {
+    console.error('resend-otp-email error:', error.message);
+    return res.status(500).json({
+      error: 'Failed to resend verification code',
+      details: 'Please try again shortly.',
+    });
   }
 });
 
