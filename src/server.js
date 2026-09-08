@@ -1059,7 +1059,7 @@ app.use((req, res, next) => {
 const DASHBOARD_SECTIONS = {
   admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals', 'quickbooks'],
   accountant: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'quickbooks'],
-  sales_marketing: ['overview', 'users', 'orders', 'merchants', 'couriers', 'stores', 'discounts'],
+  sales_marketing: ['overview', 'users', 'orders', 'merchants', 'couriers', 'stores', 'discounts', 'approvals'],
 };
 
 function dashboardRoleForKey(headerKey) {
@@ -1095,8 +1095,14 @@ function dashboardRoleCanAccess(role, method, path) {
     if (path.startsWith('/admin/products/') || /^\/admin\/stores\/[^/]+\/products(?:\/upload-image)?$/.test(path)) {
       return true;
     }
+    // Onboarding sign-ups: marketing recruits couriers and stores, so it also
+    // clears their applications. Matched exactly rather than by prefix — a
+    // prefix on /admin/merchants would also hand over PATCH /admin/merchants/:id,
+    // which edits the merchant record itself and stays with admin.
+    if (method === 'POST' && /^\/admin\/(couriers|merchants)\/[^/]+\/(approve|reject)$/.test(path)) {
+      return true;
+    }
     if (!readOnly) return false;
-    if (path === '/admin/users/pending') return false;
     // Orders are readable but not actionable: the GET-only guard above keeps
     // refunds (POST /admin/orders/:id/refund) with admin and accounting.
     return [
