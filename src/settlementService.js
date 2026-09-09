@@ -42,14 +42,13 @@ export function settlementForOrder(order) {
   const customerDeliveryFee = money(order.customer_delivery_fee);
   const subsidy = money(order.dot_delivery_subsidy);
   const tax = money(order.tax);
-  const tip = money(order.courier_tip);
 
   const { merchantEarnings, platformCommission } = computeSubtotalSplit(subtotal);
   const courierFeeShare = computeCourierDeliveryPayoutUsd(deliveryFee);
   const deliveryPlatformCut = money(deliveryFee - courierFeeShare);
 
-  const courierTotal = money(courierFeeShare + tip);
-  const customerPaid = money(subtotal + customerDeliveryFee + tax + tip);
+  const courierTotal = courierFeeShare;
+  const customerPaid = money(subtotal + customerDeliveryFee + tax);
 
   // What DOT keeps: the product markup plus its share of the delivery fee,
   // less any promo it funded itself. Can legitimately go negative on a
@@ -71,7 +70,6 @@ export function settlementForOrder(order) {
       subtotal,
       tax,
       customer_delivery_fee: customerDeliveryFee,
-      courier_tip: tip,
     },
 
     store: {
@@ -87,7 +85,6 @@ export function settlementForOrder(order) {
     courier: {
       courier_id: order.courier_id,
       delivery_fee_share: courierFeeShare,
-      tip,
       amount_due: courierTotal,
       dot_delivery_cut: deliveryPlatformCut,
     },
@@ -128,7 +125,7 @@ export async function listSettlements({ from, to, storeId, courierId, limit = 50
     .from('orders')
     .select(`id, order_number, created_at, actual_delivery_time, status, payment_status,
              payment_method, subtotal, delivery_fee, customer_delivery_fee, dot_delivery_subsidy,
-             tax, courier_tip, total_amount, store_id, courier_id,
+             tax, total_amount, store_id, courier_id,
              stores!inner ( id, store_name, merchant_id )`)
     .eq('payment_status', 'paid')
     .eq('status', 'delivered')
@@ -175,7 +172,7 @@ export async function settlementDetail(orderId) {
     .from('orders')
     .select(`id, order_number, created_at, actual_delivery_time, status, payment_status,
              payment_method, subtotal, delivery_fee, customer_delivery_fee, dot_delivery_subsidy,
-             tax, courier_tip, total_amount, store_id, courier_id,
+             tax, total_amount, store_id, courier_id,
              stores ( id, store_name, merchant_id, address_line1, city )`)
     .eq('id', orderId)
     .maybeSingle();

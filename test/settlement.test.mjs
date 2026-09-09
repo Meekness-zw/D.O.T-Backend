@@ -15,7 +15,7 @@ const { settlementForOrder, reconcile } = await import('../src/settlementService
 const order = (over = {}) => ({
   id: 'o1', order_number: 'DOT-1', store_id: 's1', courier_id: 'c1',
   subtotal: 115, delivery_fee: 4.99, customer_delivery_fee: 4.99,
-  dot_delivery_subsidy: 0, tax: 0, courier_tip: 0,
+  dot_delivery_subsidy: 0, tax: 0,
   store: { merchant_id: 'm1', store_name: 'Test Store' },
   ...over,
 });
@@ -34,12 +34,14 @@ test('a plain order reconciles', () => {
   assert.ok(r.balanced, `distributed ${r.distributed} vs charged ${r.charged}`);
 });
 
-test('a tip goes to the courier whole and is charged to the customer', () => {
+test('nothing on an order can be a tip', () => {
+  // Tipping is cash, hand to hand. If a courier_tip ever reappears on an
+  // order it must not silently reach the split, so assert the breakdown
+  // ignores it rather than folding it into anyone's share.
   const s = settlementForOrder(order({ courier_tip: 3 }));
-  assert.equal(s.courier.tip, 3);
-  assert.equal(s.courier.amount_due, 7.00);          // 4.00 fee share + 3.00 tip
-  assert.equal(s.dot.net, 15.99, 'DOT takes nothing from a tip');
-  assert.equal(s.customer_paid, 122.99);
+  assert.equal(s.courier.amount_due, 4.00);
+  assert.equal(s.customer_paid, 119.99);
+  assert.equal(s.lines.courier_tip, undefined);
   assert.ok(reconcile(s).balanced);
 });
 

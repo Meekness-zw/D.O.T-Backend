@@ -11,11 +11,10 @@
  * (DELIVERY_PLATFORM_CUT_RATE) — the base $4.99 fee pays the courier
  * exactly $4.00, DOT $0.99.
  *
- * Tips are outside all of that. The courier site promises "100% of your
- * tips", so a tip never enters computeCourierDeliveryPayoutUsd and no cut
- * is taken from it. It is credited as its own ledger line (type 'tip') so
- * the promise stays auditable and so an accountant disbursing money can see
- * fee and tip as two numbers rather than one blended total.
+ * Tips are not handled here and deliberately do not exist in the system:
+ * customers tip couriers in cash, directly. Nothing about a cash tip touches
+ * the platform's books, which is the point — the courier keeps it whole with
+ * no ledger line, no cut and no disbursement step.
  */
 
 import { supabaseAdmin } from './supabaseAdminClient.js';
@@ -207,78 +206,6 @@ export async function recordCourierDeliveryEarnings({ courierId, orderId, amount
   return { walletTransaction: tx, balance_after: newBalance, amount: credit };
 }
 
-
-/**
- * Credit a customer's tip to the courier, in full.
- *
- * Separate from recordCourierDeliveryEarnings on purpose. Merging the two
- * would make the 100%-of-tips promise unverifiable after the fact: once the
- * amounts are summed into one row, nothing distinguishes a $4.00 fee plus a
- * $2.00 tip from a $6.00 fee, and the platform cut on those differs.
- *
- * Idempotent per order, keyed the same way as the earnings row — the two
- * differ by transaction_type, so one can exist without the other.
- */
-export async function recordCourierTip({ courierId, orderId, amount, orderNumber }) {
-  if (!supabase || !courierId || !orderId) return null;
-  const tip = Math.round(Number(amount) * 100) / 100;
-  if (!Number.isFinite(tip) || tip <= 0) return null;
-
-  const { data: existing } = await supabase
-    .from('wallet_transactions')
-    .select('id')
-    .eq('user_id', courierId)
-    .eq('reference_id', orderId)
-    .eq('transaction_type', 'tip')
-    .maybeSingle();
-  if (existing?.id) return { skipped: true, reason: 'already_recorded' };
-
-  const prevBalance = await getWalletBalance(courierId, 'courier');
-  const newBalance = Math.round((prevBalance + tip) * 100) / 100;
-
-  const { data: tx, error } = await supabase
-    .from('wallet_transactions')
-    .insert({
-      user_id: courierId,
-      user_type: 'courier',
-      transaction_type: 'tip',
-      amount: tip,
-      balance_after: newBalance,
-      description: `Customer tip — order ${orderNumber || String(orderId).slice(0, 8)}`,
-      reference_id: orderId,
-      status: 'completed',
-    })
-    .select('*')
-    .single();
-
-  if (error) {
-    // A failed tip must not fail the delivery. It is recoverable from the
-    // order row, which still holds courier_tip.
-    console.error('[orderPaymentSplit] courier tip insert error:', error);
-    return null;
-  }
-
-  // total_earnings tracks what the courier actually received, so the tip
-  // belongs in it. total_deliveries is NOT incremented — the delivery was
-  // already counted by recordCourierDeliveryEarnings, and counting it twice
-  // would inflate every per-delivery average on the courier's dashboard.
-  const { data: courierRow } = await supabase
-    .from('couriers')
-    .select('total_earnings')
-    .eq('id', courierId)
-    .maybeSingle();
-
-  const { error: updErr } = await supabase
-    .from('couriers')
-    .update({
-      account_balance: newBalance,
-      total_earnings: Math.round((Number(courierRow?.total_earnings || 0) + tip) * 100) / 100,
-    })
-    .eq('id', courierId);
-  if (updErr) console.error('[orderPaymentSplit] courier tip row update error:', updErr);
-
-  return { walletTransaction: tx, balance_after: newBalance, amount: tip };
-}
 
 /**
  * Where a courier's money should actually be sent.

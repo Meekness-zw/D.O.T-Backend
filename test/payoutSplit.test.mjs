@@ -18,7 +18,7 @@ const COLUMNS = {
   wallet_transactions: new Set(['id', 'user_id', 'user_type', 'transaction_type', 'amount',
     'balance_after', 'description', 'reference_id', 'status', 'created_at']),
 };
-const TX_TYPES = new Set(['deposit','withdrawal','payment','refund','payout','earnings','promo_credit','tip']);
+const TX_TYPES = new Set(['deposit','withdrawal','payment','refund','payout','earnings','promo_credit']);
 
 function makeFake(seed = {}) {
   const db = { couriers: [], courier_companies: [], courier_payout_methods: [], wallet_transactions: [], ...seed };
@@ -87,7 +87,7 @@ mock.module('../src/walletLedger.js', {
 
 const {
   computeCourierDeliveryPayoutUsd, computeSubtotalSplit,
-  recordCourierTip, resolveCourierPayoutDestination,
+  resolveCourierPayoutDestination,
 } = await import('../src/orderPaymentSplit.js');
 
 // ── The split itself ────────────────────────────────────────────────────────
@@ -96,47 +96,10 @@ test('the documented $4.99 fee splits exactly $4.00 / $0.99', () => {
   assert.equal(computeCourierDeliveryPayoutUsd(4.99), 4.00);
 });
 
-test('a tip is never passed through the delivery-fee cut', () => {
-  // The whole point of holding the tip in its own column: were a $2 tip added
-  // to the fee instead, the courier would lose 20% of it.
-  const feeOnly = computeCourierDeliveryPayoutUsd(4.99);
-  const ifTipWereFolded = computeCourierDeliveryPayoutUsd(4.99 + 2);
-  assert.equal(feeOnly + 2, 6.00);
-  assert.ok(ifTipWereFolded < feeOnly + 2, 'folding a tip into the fee would skim it');
-});
-
 test('subtotal split returns the merchant their base price', () => {
   const { merchantEarnings, platformCommission } = computeSubtotalSplit(115);
   assert.equal(merchantEarnings, 100);
   assert.equal(platformCommission, 15);
-});
-
-// ── Tips ────────────────────────────────────────────────────────────────────
-
-test('a tip credits in full and lands as its own ledger line', async () => {
-  fake.db.couriers.push({ id: 'c1', total_earnings: 0, total_deliveries: 3, account_balance: 0 });
-  const res = await recordCourierTip({ courierId: 'c1', orderId: 'o1', amount: 2.5, orderNumber: 'A1' });
-  assert.equal(res.amount, 2.5);
-  const tx = fake.db.wallet_transactions.filter((t) => t.transaction_type === 'tip');
-  assert.equal(tx.length, 1);
-  assert.equal(tx[0].amount, 2.5);
-});
-
-test('a tip does not inflate the delivery count', async () => {
-  const courier = fake.db.couriers.find((c) => c.id === 'c1');
-  assert.equal(courier.total_deliveries, 3, 'tip must not count as another delivery');
-  assert.equal(courier.total_earnings, 2.5);
-});
-
-test('crediting the same tip twice is a no-op', async () => {
-  const again = await recordCourierTip({ courierId: 'c1', orderId: 'o1', amount: 2.5, orderNumber: 'A1' });
-  assert.equal(again.skipped, true);
-  assert.equal(fake.db.wallet_transactions.filter((t) => t.transaction_type === 'tip').length, 1);
-});
-
-test('a zero or negative tip records nothing', async () => {
-  assert.equal(await recordCourierTip({ courierId: 'c1', orderId: 'o2', amount: 0 }), null);
-  assert.equal(await recordCourierTip({ courierId: 'c1', orderId: 'o3', amount: -5 }), null);
 });
 
 // ── Where the money goes ────────────────────────────────────────────────────

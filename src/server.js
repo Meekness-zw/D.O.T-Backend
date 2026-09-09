@@ -71,7 +71,6 @@ import {
 } from './orderNotifications.js';
 import {
   recordCourierDeliveryEarnings,
-  recordCourierTip,
   computeCourierDeliveryPayoutUsd,
   getOtdPlatformServiceChargeUsd,
   applyPlatformMarkup,
@@ -1065,12 +1064,6 @@ app.use((req, res, next) => {
   });
   next();
 });
-
-/** Ceiling on a single courier tip. Env-tunable; see POST /orders. */
-const MAX_COURIER_TIP_USD = (() => {
-  const raw = Number(process.env.MAX_COURIER_TIP_USD);
-  return Number.isFinite(raw) && raw > 0 ? Math.round(raw * 100) / 100 : 100;
-})();
 
 const DASHBOARD_SECTIONS = {
   admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals', 'settlements', 'companies', 'quickbooks'],
@@ -4569,7 +4562,6 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
         status,
         subtotal,
         delivery_fee,
-        courier_tip,
         tax,
         total_amount,
         payment_method,
@@ -5244,7 +5236,6 @@ app.get('/courier/orders/active', requireAuth, async (req, res) => {
         order_number,
         total_amount,
         delivery_fee,
-        courier_tip,
         status,
         pickup_address,
         pickup_latitude,
@@ -5297,7 +5288,6 @@ app.get('/courier/orders/active', requireAuth, async (req, res) => {
             ...row,
             customer,
             courier_payout_estimate: computeCourierDeliveryPayoutUsd(Number(row.delivery_fee) || 0),
-            courier_tip: Number(row.courier_tip) || 0,
             otd_platform_fee_usd: otdFee,
           }
         : null,
@@ -5363,7 +5353,6 @@ app.get('/courier/jobs/open', requireAuth, async (req, res) => {
         order_number,
         total_amount,
         delivery_fee,
-        courier_tip,
         status,
         pickup_address,
         pickup_latitude,
@@ -5430,7 +5419,6 @@ app.get('/courier/jobs/open', requireAuth, async (req, res) => {
             }
           : null,
         courier_payout_estimate: computeCourierDeliveryPayoutUsd(df),
-        courier_tip: Number(job.courier_tip) || 0,
         otd_platform_fee_usd: otdFee,
       };
     });
@@ -5929,7 +5917,7 @@ app.post('/courier/orders/:id/complete', requireAuth, async (req, res) => {
       })
       .eq('id', id)
       .in('status', allowedBeforeDelivered)
-      .select('id, order_number, status, delivery_fee, courier_tip, actual_delivery_time')
+      .select('id, order_number, status, delivery_fee, actual_delivery_time')
       .maybeSingle();
 
     if (updateError) {
@@ -5954,15 +5942,6 @@ app.post('/courier/orders/:id/complete', requireAuth, async (req, res) => {
       courierId: order.courier_id,
       orderId: id,
       amount: payoutUsd,
-      orderNumber: order.order_number,
-    });
-
-    // Paid in full and as its own ledger line — no platform cut is taken from
-    // a tip. Kept out of the fee calculation above so the two stay separable.
-    await recordCourierTip({
-      courierId: order.courier_id,
-      orderId: id,
-      amount: Number(completed?.courier_tip ?? order.courier_tip) || 0,
       orderNumber: order.order_number,
     });
 
@@ -6161,7 +6140,7 @@ app.post('/orders', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
 
-    const { items, store_id, payment_method, delivery_notes, discount_code, courier_tip } = req.body || {};
+    const { items, store_id, payment_method, delivery_notes, discount_code } = req.body || {};
 
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({
@@ -6408,23 +6387,7 @@ app.post('/orders', requireAuth, async (req, res) => {
     const discountAmount = discountResult?.discountAmount || 0;
     const customerDeliveryFee = Math.round((deliveryFee - discountAmount) * 100) / 100;
     const dotDeliverySubsidy = discountAmount;
-
-    // The courier keeps this in full. Rounded to the cent and bounded: an
-    // unbounded tip field is far more often a mistyped amount or a hijacked
-    // session than a real intention, and the money leaves DOT's account
-    // either way. The cap is deliberately generous, not tight.
-    const courierTip = Math.round((Number(courier_tip) || 0) * 100) / 100;
-    if (!Number.isFinite(courierTip) || courierTip < 0) {
-      return res.status(400).json({ error: 'Invalid tip', details: 'A tip cannot be negative.' });
-    }
-    if (courierTip > MAX_COURIER_TIP_USD) {
-      return res.status(400).json({
-        error: 'Tip too large',
-        details: `The most you can tip on one order is $${MAX_COURIER_TIP_USD.toFixed(2)}.`,
-      });
-    }
-
-    const totalAmount = Math.round((subtotal + customerDeliveryFee + tax + courierTip) * 100) / 100;
+    const totalAmount = Math.round((subtotal + customerDeliveryFee + tax) * 100) / 100;
 
     if (!Number.isFinite(totalAmount) || totalAmount <= 0) {
       return res.status(400).json({
@@ -6495,9 +6458,6 @@ app.post('/orders', requireAuth, async (req, res) => {
         customer_delivery_fee: customerDeliveryFee,
         dot_delivery_subsidy: dotDeliverySubsidy,
         tax,
-        // Held on the order, not merged into delivery_fee: that separation is
-        // what keeps the platform's delivery cut away from the tip.
-        courier_tip: courierTip,
         total_amount: totalAmount,
         payment_method,
         payment_status: paymentStatus,

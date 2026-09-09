@@ -55,7 +55,7 @@ function summarise(settlements, period, pick) {
 
 const ORDER_COLS = `id, order_number, created_at, actual_delivery_time, status, payment_status,
   payment_method, subtotal, delivery_fee, customer_delivery_fee, dot_delivery_subsidy,
-  tax, courier_tip, total_amount, store_id, courier_id,
+  tax, total_amount, store_id, courier_id,
   pickup_address, delivery_address`;
 
 /**
@@ -204,9 +204,8 @@ export async function getCourierOversight(courierId, { period = 'daily', from, t
   const totals = delivered.reduce((acc, s) => ({
     deliveries: acc.deliveries + 1,
     fees: money(acc.fees + s.courier.delivery_fee_share),
-    tips: money(acc.tips + s.courier.tip),
     earned: money(acc.earned + s.courier.amount_due),
-  }), { deliveries: 0, fees: 0, tips: 0, earned: 0 });
+  }), { deliveries: 0, fees: 0, earned: 0 });
 
   return {
     courier,
