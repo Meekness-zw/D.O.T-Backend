@@ -84,6 +84,8 @@ import {
 import {
   getMerchantOversight,
   getCourierOversight,
+  getOrderDetail,
+  getFleet,
 } from './oversightService.js';
 import {
   categorizeStoreWithAI,
@@ -1066,9 +1068,9 @@ app.use((req, res, next) => {
 });
 
 const DASHBOARD_SECTIONS = {
-  admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals', 'settlements', 'companies', 'quickbooks'],
-  accountant: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'settlements', 'companies', 'quickbooks'],
-  sales_marketing: ['overview', 'users', 'orders', 'merchants', 'couriers', 'stores', 'discounts', 'approvals', 'companies'],
+  admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals', 'settlements', 'companies', 'fleet', 'quickbooks'],
+  accountant: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'settlements', 'companies', 'fleet', 'quickbooks'],
+  sales_marketing: ['overview', 'users', 'orders', 'merchants', 'couriers', 'stores', 'discounts', 'approvals', 'companies', 'fleet'],
 };
 
 function dashboardRoleForKey(headerKey) {
@@ -1101,6 +1103,7 @@ function dashboardRoleCanAccess(role, method, path) {
       '/admin/stats', '/admin/users', '/admin/orders', '/admin/deliveries',
       '/admin/payments', '/admin/merchants', '/admin/couriers', '/admin/stores',
       '/admin/payout-details', '/admin/withdrawals', '/admin/courier-companies',
+      '/admin/fleet',
     ].some((prefix) => path.startsWith(prefix));
   }
   if (role === 'sales_marketing') {
@@ -1123,6 +1126,7 @@ function dashboardRoleCanAccess(role, method, path) {
     return [
       '/admin/stats', '/admin/users', '/admin/orders', '/admin/merchants',
       '/admin/couriers', '/admin/stores', '/admin/courier-companies',
+      '/admin/fleet',
     ].some((prefix) => path.startsWith(prefix));
   }
   return false;
@@ -10730,6 +10734,27 @@ app.post('/admin/settlements/:orderId/disburse', requireAdmin, async (req, res) 
     if (error.status) return res.status(error.status).json({ error: error.message, details: error.details });
     console.error('post /admin/settlements/:orderId/disburse error:', error);
     return res.status(500).json({ error: 'Failed to record disbursement', details: error.message });
+  }
+});
+
+/** One order in full: items, prices, timeline and the money split. */
+app.get('/admin/orders/:id/detail', requireAdmin, async (req, res) => {
+  try {
+    return res.json(await getOrderDetail(req.params.id));
+  } catch (error) {
+    if (error.status) return res.status(error.status).json({ error: error.message });
+    console.error('get /admin/orders/:id/detail error:', error);
+    return res.status(500).json({ error: 'Failed to load order', details: error.message });
+  }
+});
+
+/** Live fleet: couriers currently on a job, and where they were last seen. */
+app.get('/admin/fleet', requireAdmin, async (req, res) => {
+  try {
+    return res.json(await getFleet({ companyId: req.query.company_id || undefined }));
+  } catch (error) {
+    console.error('get /admin/fleet error:', error);
+    return res.status(500).json({ error: 'Failed to load fleet', details: error.message });
   }
 });
 

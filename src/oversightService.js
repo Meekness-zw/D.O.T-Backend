@@ -12,10 +12,16 @@
 
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { getWalletBalance } from './walletLedger.js';
-import { settlementForOrder } from './settlementService.js';
+import { settlementForOrder, reconcile } from './settlementService.js';
 
 const supabase = supabaseAdmin;
 const money = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
+/** Statuses where a courier is holding a job and their position matters. */
+const ACTIVE_STATUSES = [
+  'assigned', 'courier_arrived', 'merchant_confirmed',
+  'picked_up', 'in_transit', 'delivery_confirmation_pending',
+];
 
 /**
  * Bucket key for a date, at day / week / month resolution.
@@ -221,5 +227,221 @@ export async function getCourierOversight(courierId, { period = 'daily', from, t
     totals,
     common_routes: [...routes.values()].sort((a, b) => b.trips - a.trips).slice(0, 15),
     recent_deliveries: settlements.slice(0, 50),
+  };
+}
+
+/**
+ * Live fleet: every courier currently on a job, where they were last seen,
+ * and what they are carrying.
+ *
+ * Position is read off the order rather than a separate courier row because
+ * that is where the courier app reports it (PATCH /courier/orders/:id/location).
+ * There is a delivery_tracking table in the schema that nothing has ever
+ * written to; using it here would mean showing an empty map.
+ *
+ * A courier with two active orders appears once, positioned by their most
+ * recently updated one — they are one person on one motorbike, and drawing
+ * them twice would overstate the size of the fleet on screen.
+ */
+export async function getFleet({ companyId } = {}) {
+  if (!supabase) throw new Error('Server not configured');
+
+  const { data: orders, error } = await supabase
+    .from('orders')
+    .select(`id, order_number, status, courier_id, store_id,
+             courier_latitude, courier_longitude, courier_location_updated_at,
+             pickup_address, pickup_latitude, pickup_longitude,
+             delivery_address, delivery_latitude, delivery_longitude,
+             created_at, delivery_fee,
+             stores ( id, store_name )`)
+    .in('status', ACTIVE_STATUSES)
+    .not('courier_id', 'is', null)
+    .order('courier_location_updated_at', { ascending: false });
+  if (error) throw new Error(error.message || 'Failed to load fleet');
+
+  const courierIds = [...new Set((orders || []).map((o) => o.courier_id).filter(Boolean))];
+  if (!courierIds.length) return { couriers: [], jobs: [], generated_at: new Date().toISOString() };
+
+  const [{ data: couriers }, { data: companies }] = await Promise.all([
+    supabase.from('couriers')
+      .select(`id, is_online, rating, company_id, total_deliveries,
+               user_profiles ( full_name, phone, profile_photo )`)
+      .in('id', courierIds),
+    supabase.from('courier_companies').select('id, name, is_active'),
+  ]);
+
+  const companyById = new Map((companies || []).map((c) => [c.id, c]));
+  const byCourier = new Map();
+
+  for (const o of orders || []) {
+    const existing = byCourier.get(o.courier_id);
+    // The list is already ordered by freshest position, so the first row for
+    // a courier is the one to place them by.
+    if (!existing) byCourier.set(o.courier_id, { position_from: o, jobs: [o] });
+    else existing.jobs.push(o);
+  }
+
+  const now = Date.now();
+  const fleet = (couriers || [])
+    .filter((c) => byCourier.has(c.id))
+    .map((c) => {
+      const { position_from: pos, jobs } = byCourier.get(c.id);
+      const seenAt = pos.courier_location_updated_at ? new Date(pos.courier_location_updated_at).getTime() : null;
+      const ageMinutes = seenAt ? Math.round((now - seenAt) / 60000) : null;
+      const company = c.company_id ? companyById.get(c.company_id) : null;
+
+      return {
+        courier_id: c.id,
+        name: c.user_profiles?.full_name || 'Courier',
+        phone: c.user_profiles?.phone || null,
+        rating: c.rating != null ? Number(c.rating) : null,
+        is_online: !!c.is_online,
+        company: company ? { id: company.id, name: company.name, is_active: company.is_active } : null,
+        latitude: pos.courier_latitude != null ? Number(pos.courier_latitude) : null,
+        longitude: pos.courier_longitude != null ? Number(pos.courier_longitude) : null,
+        last_seen: pos.courier_location_updated_at || null,
+        // A position an hour old is not a location, it is a memory. Flagged
+        // rather than hidden: "we have lost this rider" is information the
+        // person supervising needs, and dropping the pin would just look
+        // like they went off shift.
+        stale: ageMinutes == null || ageMinutes > 15,
+        last_seen_minutes: ageMinutes,
+        active_jobs: jobs.map((j) => ({
+          order_id: j.id,
+          order_number: j.order_number,
+          status: j.status,
+          store_name: j.stores?.store_name || null,
+          pickup_address: j.pickup_address,
+          delivery_address: j.delivery_address,
+          pickup: j.pickup_latitude != null ? { lat: Number(j.pickup_latitude), lng: Number(j.pickup_longitude) } : null,
+          dropoff: j.delivery_latitude != null ? { lat: Number(j.delivery_latitude), lng: Number(j.delivery_longitude) } : null,
+          since: j.created_at,
+        })),
+      };
+    })
+    .filter((c) => !companyId || c.company?.id === companyId);
+
+  return {
+    couriers: fleet,
+    counts: {
+      on_job: fleet.length,
+      positioned: fleet.filter((c) => c.latitude != null && !c.stale).length,
+      stale: fleet.filter((c) => c.latitude == null || c.stale).length,
+    },
+    generated_at: new Date().toISOString(),
+  };
+}
+
+/**
+ * One order in full: who ordered it, what was in it at what price, where it
+ * went, what happened to it, and how the money splits.
+ *
+ * Works for any order at any status, unlike settlementDetail, which is scoped
+ * to money that has actually been collected. An admin looking into a
+ * complaint needs to open a cancelled or unpaid order too, and getting a 404
+ * on the exact order someone is asking about is the wrong answer.
+ */
+export async function getOrderDetail(orderId) {
+  if (!supabase) throw new Error('Server not configured');
+
+  const { data: order, error } = await supabase
+    .from('orders')
+    .select(`id, order_number, status, payment_status, payment_method, created_at,
+             updated_at, actual_delivery_time, estimated_delivery_time,
+             subtotal, delivery_fee, customer_delivery_fee, dot_delivery_subsidy,
+             tax, total_amount, discount_code, delivery_notes,
+             pickup_address, delivery_address, delivery_code,
+             courier_latitude, courier_longitude, courier_location_updated_at,
+             customer_id, courier_id, store_id,
+             stores ( id, store_name, merchant_id, phone, address_line1, city )`)
+    .eq('id', orderId)
+    .maybeSingle();
+  if (error) throw new Error(error.message || 'Failed to load order');
+  if (!order) { const e = new Error('Order not found'); e.status = 404; throw e; }
+
+  const [{ data: items }, { data: history }, { data: customer }, { data: courier }] = await Promise.all([
+    supabase.from('order_items')
+      .select('id, product_id, product_name, product_price, quantity, subtotal, special_instructions')
+      .eq('order_id', orderId),
+    supabase.from('order_status_history')
+      .select('status, notes, created_at')
+      .eq('order_id', orderId)
+      .order('created_at', { ascending: true }),
+    order.customer_id
+      ? supabase.from('user_profiles').select('id, full_name, phone, email').eq('id', order.customer_id).maybeSingle()
+      : Promise.resolve({ data: null }),
+    order.courier_id
+      ? supabase.from('couriers')
+          .select('id, rating, company_id, user_profiles ( full_name, phone )')
+          .eq('id', order.courier_id).maybeSingle()
+      : Promise.resolve({ data: null }),
+  ]);
+
+  let company = null;
+  if (courier?.company_id) {
+    const { data } = await supabase.from('courier_companies')
+      .select('id, name, is_active').eq('id', courier.company_id).maybeSingle();
+    company = data || null;
+  }
+
+  const settlement = settlementForOrder({ ...order, store: order.stores });
+
+  // Line totals are recomputed from price × quantity and compared with the
+  // stored subtotal. A mismatch means the row was written wrong or a price
+  // moved underneath it, and an admin resolving a billing complaint needs to
+  // see that rather than be handed a tidy number that does not add up.
+  const lines = (items || []).map((i) => {
+    const computed = money(Number(i.product_price) * Number(i.quantity));
+    const stored = i.subtotal != null ? money(i.subtotal) : null;
+    return {
+      ...i,
+      line_total: stored ?? computed,
+      mismatch: stored != null && Math.abs(stored - computed) >= 0.01 ? { stored, computed } : null,
+    };
+  });
+  const itemsTotal = money(lines.reduce((a, l) => a + l.line_total, 0));
+
+  return {
+    order: {
+      id: order.id,
+      order_number: order.order_number,
+      status: order.status,
+      payment_status: order.payment_status,
+      payment_method: order.payment_method,
+      created_at: order.created_at,
+      delivered_at: order.actual_delivery_time,
+      estimated_delivery_time: order.estimated_delivery_time,
+      discount_code: order.discount_code,
+      delivery_notes: order.delivery_notes,
+      pickup_address: order.pickup_address,
+      delivery_address: order.delivery_address,
+    },
+    customer: customer || null,
+    store: order.stores || null,
+    courier: courier
+      ? {
+          id: courier.id,
+          name: courier.user_profiles?.full_name || null,
+          phone: courier.user_profiles?.phone || null,
+          rating: courier.rating != null ? Number(courier.rating) : null,
+          company,
+          // Where money for this delivery goes, said plainly so the
+          // accountant does not have to re-derive the company rule.
+          pays_to: company ? 'company' : 'courier',
+          last_position: order.courier_latitude != null
+            ? {
+                lat: Number(order.courier_latitude),
+                lng: Number(order.courier_longitude),
+                at: order.courier_location_updated_at,
+              }
+            : null,
+        }
+      : null,
+    items: lines,
+    items_total: itemsTotal,
+    items_reconcile: Math.abs(itemsTotal - money(order.subtotal)) < 0.02,
+    settlement,
+    reconciliation: reconcile(settlement),
+    history: history || [],
   };
 }
