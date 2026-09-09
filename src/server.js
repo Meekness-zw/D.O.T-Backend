@@ -10637,151 +10637,6 @@ app.post('/admin/stores/:storeId/products/upload-image', requireAdmin, async (re
   }
 });
 
-// Global error handler
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({
-    error: 'Internal server error',
-    details: NODE_ENV === 'development' ? err.message : 'Please try again later'
-  });
-});
-
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({
-    error: 'Endpoint not found',
-    details: `${req.method} ${req.path} is not a valid endpoint`
-  });
-});
-
-// Run scheduled promotions: activate promotions whose recurrence matches current UTC time (weekly/monthly).
-async function runScheduledPromotions() {
-  if (!supabase) return;
-  const now = new Date();
-  const utcDow = now.getUTCDay(); // 0=Sun .. 6=Sat
-  const utcDom = now.getUTCDate(); // 1-31
-  const h = now.getUTCHours();
-  const m = now.getUTCMinutes();
-  const timeStr = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-
-  const { data: weekly } = await supabase
-    .from('promotions')
-    .select('id')
-    .eq('recurrence_type', 'weekly')
-    .eq('recurrence_weekday', utcDow)
-    .eq('recurrence_time', timeStr);
-  const { data: monthly } = await supabase
-    .from('promotions')
-    .select('id')
-    .eq('recurrence_type', 'monthly')
-    .eq('recurrence_month_day', utcDom)
-    .eq('recurrence_time', timeStr);
-
-  const ids = [...(weekly || []), ...(monthly || [])].map((r) => r.id);
-  if (ids.length === 0) return;
-  const { error } = await supabase.from('promotions').update({ is_active: true }).in('id', ids);
-  if (error) console.error('runScheduledPromotions error:', error);
-  else if (ids.length) console.log('[Cron] Activated recurring promotions:', ids.length);
-}
-
-// ─── Google Maps proxy endpoints ─────────────────────────────────────────────
-// These proxy requests to the Google Maps APIs so the API key stays on the server.
-
-// Google may return the legacy { status, error_message } shape OR the newer
-// { error: { code, message, status } } shape. Normalise to legacy so clients
-// always see the same structure.
-function normaliseMapsResponse(data) {
-  if (!data || typeof data !== 'object') {
-    return { status: 'INVALID_RESPONSE', error_message: 'Empty or invalid Google Maps response.', results: [] };
-  }
-  if (!data.status && data.error) {
-    return {
-      ...data,
-      status: data.error.status || 'REQUEST_DENIED',
-      error_message: data.error.message || JSON.stringify(data.error),
-    };
-  }
-  if (!data.status) {
-    return {
-      ...data,
-      status: 'UNKNOWN_ERROR',
-      error_message: 'Unexpected response shape from Google Maps (no status field).',
-    };
-  }
-  return data;
-}
-
-// GET /maps/places/autocomplete?input=...&components=...&types=...
-app.get('/maps/places/autocomplete', async (req, res) => {
-  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
-  if (!apiKey) return res.status(503).json({ status: 'REQUEST_DENIED', error_message: 'Google Maps API key not configured on server.' });
-  try {
-    const params = new URLSearchParams({
-      key: apiKey,
-      input: req.query.input || '',
-      ...(req.query.components ? { components: req.query.components } : {}),
-      ...(req.query.types ? { types: req.query.types } : {}),
-      ...(req.query.location ? { location: req.query.location } : {}),
-      ...(req.query.radius ? { radius: req.query.radius } : {}),
-    });
-    const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?${params}`;
-    const r = await axios.get(url, { timeout: 8000 });
-    return res.json(normaliseMapsResponse(r.data));
-  } catch (err) {
-    console.error('GET /maps/places/autocomplete error:', err.message);
-    return res.status(502).json({ status: 'UNKNOWN_ERROR', error_message: err.message });
-  }
-});
-
-// GET /maps/places/details?place_id=...&fields=...
-app.get('/maps/places/details', async (req, res) => {
-  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
-  if (!apiKey) return res.status(503).json({ status: 'REQUEST_DENIED', error_message: 'Google Maps API key not configured on server.' });
-  if (!req.query.place_id) return res.status(400).json({ status: 'INVALID_REQUEST', error_message: 'place_id is required.' });
-  try {
-    const params = new URLSearchParams({
-      key: apiKey,
-      place_id: req.query.place_id,
-      ...(req.query.fields ? { fields: req.query.fields } : {}),
-    });
-    const url = `https://maps.googleapis.com/maps/api/place/details/json?${params}`;
-    const r = await axios.get(url, { timeout: 8000 });
-    return res.json(normaliseMapsResponse(r.data));
-  } catch (err) {
-    console.error('GET /maps/places/details error:', err.message);
-    return res.status(502).json({ status: 'UNKNOWN_ERROR', error_message: err.message });
-  }
-});
-
-// GET /maps/geocode?latlng=lat,lng  OR  ?address=...&components=country:ZW  (reverse / forward geocode)
-app.get('/maps/geocode', async (req, res) => {
-  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
-  if (!apiKey) return res.status(503).json({ status: 'REQUEST_DENIED', error_message: 'Google Maps API key not configured on server.' });
-  const latlng = req.query.latlng;
-  const address = req.query.address;
-  if (!latlng && (address == null || String(address).trim() === '')) {
-    return res.status(400).json({
-      status: 'INVALID_REQUEST',
-      error_message: 'Provide latlng (reverse) or address (forward geocode).',
-    });
-  }
-  try {
-    const params = new URLSearchParams({ key: apiKey });
-    if (latlng) {
-      params.set('latlng', String(latlng));
-    } else {
-      params.set('address', String(address).trim());
-      if (req.query.components) params.set('components', String(req.query.components));
-    }
-    const url = `https://maps.googleapis.com/maps/api/geocode/json?${params}`;
-    const r = await axios.get(url, { timeout: 8000 });
-    return res.json(normaliseMapsResponse(r.data));
-  } catch (err) {
-    console.error('GET /maps/geocode error:', err.message);
-    return res.status(502).json({ status: 'UNKNOWN_ERROR', error_message: err.message });
-  }
-});
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Oversight and settlement
 // ═══════════════════════════════════════════════════════════════════════════
@@ -10996,6 +10851,151 @@ app.patch('/admin/couriers/:id/company', requireAdmin, async (req, res) => {
     return res.status(500).json({ error: 'Failed to update courier', details: error.message });
   }
 });
+
+// ─── Google Maps proxy endpoints ─────────────────────────────────────────────
+// These proxy requests to the Google Maps APIs so the API key stays on the server.
+
+// Google may return the legacy { status, error_message } shape OR the newer
+// { error: { code, message, status } } shape. Normalise to legacy so clients
+// always see the same structure.
+function normaliseMapsResponse(data) {
+  if (!data || typeof data !== 'object') {
+    return { status: 'INVALID_RESPONSE', error_message: 'Empty or invalid Google Maps response.', results: [] };
+  }
+  if (!data.status && data.error) {
+    return {
+      ...data,
+      status: data.error.status || 'REQUEST_DENIED',
+      error_message: data.error.message || JSON.stringify(data.error),
+    };
+  }
+  if (!data.status) {
+    return {
+      ...data,
+      status: 'UNKNOWN_ERROR',
+      error_message: 'Unexpected response shape from Google Maps (no status field).',
+    };
+  }
+  return data;
+}
+
+// GET /maps/places/autocomplete?input=...&components=...&types=...
+app.get('/maps/places/autocomplete', async (req, res) => {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) return res.status(503).json({ status: 'REQUEST_DENIED', error_message: 'Google Maps API key not configured on server.' });
+  try {
+    const params = new URLSearchParams({
+      key: apiKey,
+      input: req.query.input || '',
+      ...(req.query.components ? { components: req.query.components } : {}),
+      ...(req.query.types ? { types: req.query.types } : {}),
+      ...(req.query.location ? { location: req.query.location } : {}),
+      ...(req.query.radius ? { radius: req.query.radius } : {}),
+    });
+    const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?${params}`;
+    const r = await axios.get(url, { timeout: 8000 });
+    return res.json(normaliseMapsResponse(r.data));
+  } catch (err) {
+    console.error('GET /maps/places/autocomplete error:', err.message);
+    return res.status(502).json({ status: 'UNKNOWN_ERROR', error_message: err.message });
+  }
+});
+
+// GET /maps/places/details?place_id=...&fields=...
+app.get('/maps/places/details', async (req, res) => {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) return res.status(503).json({ status: 'REQUEST_DENIED', error_message: 'Google Maps API key not configured on server.' });
+  if (!req.query.place_id) return res.status(400).json({ status: 'INVALID_REQUEST', error_message: 'place_id is required.' });
+  try {
+    const params = new URLSearchParams({
+      key: apiKey,
+      place_id: req.query.place_id,
+      ...(req.query.fields ? { fields: req.query.fields } : {}),
+    });
+    const url = `https://maps.googleapis.com/maps/api/place/details/json?${params}`;
+    const r = await axios.get(url, { timeout: 8000 });
+    return res.json(normaliseMapsResponse(r.data));
+  } catch (err) {
+    console.error('GET /maps/places/details error:', err.message);
+    return res.status(502).json({ status: 'UNKNOWN_ERROR', error_message: err.message });
+  }
+});
+
+// GET /maps/geocode?latlng=lat,lng  OR  ?address=...&components=country:ZW  (reverse / forward geocode)
+app.get('/maps/geocode', async (req, res) => {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+  if (!apiKey) return res.status(503).json({ status: 'REQUEST_DENIED', error_message: 'Google Maps API key not configured on server.' });
+  const latlng = req.query.latlng;
+  const address = req.query.address;
+  if (!latlng && (address == null || String(address).trim() === '')) {
+    return res.status(400).json({
+      status: 'INVALID_REQUEST',
+      error_message: 'Provide latlng (reverse) or address (forward geocode).',
+    });
+  }
+  try {
+    const params = new URLSearchParams({ key: apiKey });
+    if (latlng) {
+      params.set('latlng', String(latlng));
+    } else {
+      params.set('address', String(address).trim());
+      if (req.query.components) params.set('components', String(req.query.components));
+    }
+    const url = `https://maps.googleapis.com/maps/api/geocode/json?${params}`;
+    const r = await axios.get(url, { timeout: 8000 });
+    return res.json(normaliseMapsResponse(r.data));
+  } catch (err) {
+    console.error('GET /maps/geocode error:', err.message);
+    return res.status(502).json({ status: 'UNKNOWN_ERROR', error_message: err.message });
+  }
+});
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({
+    error: 'Internal server error',
+    details: NODE_ENV === 'development' ? err.message : 'Please try again later'
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'Endpoint not found',
+    details: `${req.method} ${req.path} is not a valid endpoint`
+  });
+});
+
+// Run scheduled promotions: activate promotions whose recurrence matches current UTC time (weekly/monthly).
+async function runScheduledPromotions() {
+  if (!supabase) return;
+  const now = new Date();
+  const utcDow = now.getUTCDay(); // 0=Sun .. 6=Sat
+  const utcDom = now.getUTCDate(); // 1-31
+  const h = now.getUTCHours();
+  const m = now.getUTCMinutes();
+  const timeStr = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+
+  const { data: weekly } = await supabase
+    .from('promotions')
+    .select('id')
+    .eq('recurrence_type', 'weekly')
+    .eq('recurrence_weekday', utcDow)
+    .eq('recurrence_time', timeStr);
+  const { data: monthly } = await supabase
+    .from('promotions')
+    .select('id')
+    .eq('recurrence_type', 'monthly')
+    .eq('recurrence_month_day', utcDom)
+    .eq('recurrence_time', timeStr);
+
+  const ids = [...(weekly || []), ...(monthly || [])].map((r) => r.id);
+  if (ids.length === 0) return;
+  const { error } = await supabase.from('promotions').update({ is_active: true }).in('id', ids);
+  if (error) console.error('runScheduledPromotions error:', error);
+  else if (ids.length) console.log('[Cron] Activated recurring promotions:', ids.length);
+}
 
 app.listen(PORT, () => {
   console.log('✅ DOT Backend API started successfully');
