@@ -18,7 +18,11 @@ ALTER TABLE wallet_transactions DROP CONSTRAINT IF EXISTS wallet_transactions_tr
 ALTER TABLE wallet_transactions ADD CONSTRAINT wallet_transactions_transaction_type_check
   CHECK (transaction_type IN (
     'deposit', 'withdrawal', 'payment', 'refund', 'payout', 'earnings',
-    'promo_credit'
+    'promo_credit',
+    -- Kept identical to the list in supabase_migration_courier_tips.sql. Both
+    -- files DROP and re-ADD this one constraint, so if the lists disagree,
+    -- whichever runs last silently revokes the other's type. Change both.
+    'tip'
   ));
 
 COMMENT ON COLUMN wallet_transactions.transaction_type IS

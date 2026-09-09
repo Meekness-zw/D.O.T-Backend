@@ -71,11 +71,21 @@ import {
 } from './orderNotifications.js';
 import {
   recordCourierDeliveryEarnings,
+  recordCourierTip,
   computeCourierDeliveryPayoutUsd,
   getOtdPlatformServiceChargeUsd,
   applyPlatformMarkup,
   getWeeklyCommissionRate,
 } from './orderPaymentSplit.js';
+import {
+  listSettlements,
+  settlementDetail,
+  recordDisbursement,
+} from './settlementService.js';
+import {
+  getMerchantOversight,
+  getCourierOversight,
+} from './oversightService.js';
 import {
   categorizeStoreWithAI,
   isAiCategorizationConfigured,
@@ -1056,10 +1066,16 @@ app.use((req, res, next) => {
   next();
 });
 
+/** Ceiling on a single courier tip. Env-tunable; see POST /orders. */
+const MAX_COURIER_TIP_USD = (() => {
+  const raw = Number(process.env.MAX_COURIER_TIP_USD);
+  return Number.isFinite(raw) && raw > 0 ? Math.round(raw * 100) / 100 : 100;
+})();
+
 const DASHBOARD_SECTIONS = {
-  admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals', 'quickbooks'],
-  accountant: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'quickbooks'],
-  sales_marketing: ['overview', 'users', 'orders', 'merchants', 'couriers', 'stores', 'discounts', 'approvals'],
+  admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals', 'settlements', 'companies', 'quickbooks'],
+  accountant: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'settlements', 'companies', 'quickbooks'],
+  sales_marketing: ['overview', 'users', 'orders', 'merchants', 'couriers', 'stores', 'discounts', 'approvals', 'companies'],
 };
 
 function dashboardRoleForKey(headerKey) {
@@ -1081,13 +1097,17 @@ function dashboardRoleCanAccess(role, method, path) {
     // Accountant manages the QuickBooks connection (connect/disconnect/mappings/backfill) in
     // addition to the usual read-only financial views.
     if (path.startsWith('/admin/quickbooks')) return true;
+    // Disbursement is the accountant's core job: they see who is owed what and
+    // record each transfer. Scoped to /admin/settlements only — this does not
+    // widen anything else they can write.
+    if (path.startsWith('/admin/settlements')) return true;
     // Accountants can inspect registered customers, merchants, and couriers,
     // but approval and user-management actions remain admin-only.
     if (path === '/admin/users/pending') return false;
     return readOnly && [
       '/admin/stats', '/admin/users', '/admin/orders', '/admin/deliveries',
       '/admin/payments', '/admin/merchants', '/admin/couriers', '/admin/stores',
-      '/admin/payout-details', '/admin/withdrawals',
+      '/admin/payout-details', '/admin/withdrawals', '/admin/courier-companies',
     ].some((prefix) => path.startsWith(prefix));
   }
   if (role === 'sales_marketing') {
@@ -1105,9 +1125,11 @@ function dashboardRoleCanAccess(role, method, path) {
     if (!readOnly) return false;
     // Orders are readable but not actionable: the GET-only guard above keeps
     // refunds (POST /admin/orders/:id/refund) with admin and accounting.
+    // Settlements are absent by design — marketing has no business seeing
+    // banking destinations or moving money.
     return [
       '/admin/stats', '/admin/users', '/admin/orders', '/admin/merchants',
-      '/admin/couriers', '/admin/stores',
+      '/admin/couriers', '/admin/stores', '/admin/courier-companies',
     ].some((prefix) => path.startsWith(prefix));
   }
   return false;
@@ -4547,6 +4569,7 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
         status,
         subtotal,
         delivery_fee,
+        courier_tip,
         tax,
         total_amount,
         payment_method,
@@ -5221,6 +5244,7 @@ app.get('/courier/orders/active', requireAuth, async (req, res) => {
         order_number,
         total_amount,
         delivery_fee,
+        courier_tip,
         status,
         pickup_address,
         pickup_latitude,
@@ -5273,6 +5297,7 @@ app.get('/courier/orders/active', requireAuth, async (req, res) => {
             ...row,
             customer,
             courier_payout_estimate: computeCourierDeliveryPayoutUsd(Number(row.delivery_fee) || 0),
+            courier_tip: Number(row.courier_tip) || 0,
             otd_platform_fee_usd: otdFee,
           }
         : null,
@@ -5338,6 +5363,7 @@ app.get('/courier/jobs/open', requireAuth, async (req, res) => {
         order_number,
         total_amount,
         delivery_fee,
+        courier_tip,
         status,
         pickup_address,
         pickup_latitude,
@@ -5404,6 +5430,7 @@ app.get('/courier/jobs/open', requireAuth, async (req, res) => {
             }
           : null,
         courier_payout_estimate: computeCourierDeliveryPayoutUsd(df),
+        courier_tip: Number(job.courier_tip) || 0,
         otd_platform_fee_usd: otdFee,
       };
     });
@@ -5902,7 +5929,7 @@ app.post('/courier/orders/:id/complete', requireAuth, async (req, res) => {
       })
       .eq('id', id)
       .in('status', allowedBeforeDelivered)
-      .select('id, order_number, status, delivery_fee, actual_delivery_time')
+      .select('id, order_number, status, delivery_fee, courier_tip, actual_delivery_time')
       .maybeSingle();
 
     if (updateError) {
@@ -5927,6 +5954,15 @@ app.post('/courier/orders/:id/complete', requireAuth, async (req, res) => {
       courierId: order.courier_id,
       orderId: id,
       amount: payoutUsd,
+      orderNumber: order.order_number,
+    });
+
+    // Paid in full and as its own ledger line — no platform cut is taken from
+    // a tip. Kept out of the fee calculation above so the two stay separable.
+    await recordCourierTip({
+      courierId: order.courier_id,
+      orderId: id,
+      amount: Number(completed?.courier_tip ?? order.courier_tip) || 0,
       orderNumber: order.order_number,
     });
 
@@ -6125,7 +6161,7 @@ app.post('/orders', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
 
-    const { items, store_id, payment_method, delivery_notes, discount_code } = req.body || {};
+    const { items, store_id, payment_method, delivery_notes, discount_code, courier_tip } = req.body || {};
 
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({
@@ -6372,7 +6408,23 @@ app.post('/orders', requireAuth, async (req, res) => {
     const discountAmount = discountResult?.discountAmount || 0;
     const customerDeliveryFee = Math.round((deliveryFee - discountAmount) * 100) / 100;
     const dotDeliverySubsidy = discountAmount;
-    const totalAmount = subtotal + customerDeliveryFee + tax;
+
+    // The courier keeps this in full. Rounded to the cent and bounded: an
+    // unbounded tip field is far more often a mistyped amount or a hijacked
+    // session than a real intention, and the money leaves DOT's account
+    // either way. The cap is deliberately generous, not tight.
+    const courierTip = Math.round((Number(courier_tip) || 0) * 100) / 100;
+    if (!Number.isFinite(courierTip) || courierTip < 0) {
+      return res.status(400).json({ error: 'Invalid tip', details: 'A tip cannot be negative.' });
+    }
+    if (courierTip > MAX_COURIER_TIP_USD) {
+      return res.status(400).json({
+        error: 'Tip too large',
+        details: `The most you can tip on one order is $${MAX_COURIER_TIP_USD.toFixed(2)}.`,
+      });
+    }
+
+    const totalAmount = Math.round((subtotal + customerDeliveryFee + tax + courierTip) * 100) / 100;
 
     if (!Number.isFinite(totalAmount) || totalAmount <= 0) {
       return res.status(400).json({
@@ -6443,6 +6495,9 @@ app.post('/orders', requireAuth, async (req, res) => {
         customer_delivery_fee: customerDeliveryFee,
         dot_delivery_subsidy: dotDeliverySubsidy,
         tax,
+        // Held on the order, not merged into delivery_fee: that separation is
+        // what keeps the platform's delivery cut away from the tip.
+        courier_tip: courierTip,
         total_amount: totalAmount,
         payment_method,
         payment_status: paymentStatus,
@@ -10764,6 +10819,221 @@ app.get('/maps/geocode', async (req, res) => {
   } catch (err) {
     console.error('GET /maps/geocode error:', err.message);
     return res.status(502).json({ status: 'UNKNOWN_ERROR', error_message: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Oversight and settlement
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** Full picture of one merchant: stores, hours, products, banking, sales. */
+app.get('/admin/merchants/:id/oversight', requireAdmin, async (req, res) => {
+  try {
+    const data = await getMerchantOversight(req.params.id, {
+      period: req.query.period || 'daily',
+      from: req.query.from || undefined,
+      to: req.query.to || undefined,
+    });
+    return res.json(data);
+  } catch (error) {
+    if (error.status) return res.status(error.status).json({ error: error.message });
+    console.error('get /admin/merchants/:id/oversight error:', error);
+    return res.status(500).json({ error: 'Failed to load merchant', details: error.message });
+  }
+});
+
+/** Full picture of one courier: jobs, routes, earnings, where they get paid. */
+app.get('/admin/couriers/:id/oversight', requireAdmin, async (req, res) => {
+  try {
+    const data = await getCourierOversight(req.params.id, {
+      period: req.query.period || 'daily',
+      from: req.query.from || undefined,
+      to: req.query.to || undefined,
+    });
+    return res.json(data);
+  } catch (error) {
+    if (error.status) return res.status(error.status).json({ error: error.message });
+    console.error('get /admin/couriers/:id/oversight error:', error);
+    return res.status(500).json({ error: 'Failed to load courier', details: error.message });
+  }
+});
+
+/** Every paid, delivered order broken into who is owed what. */
+app.get('/admin/settlements', requireAdmin, async (req, res) => {
+  try {
+    const rows = await listSettlements({
+      from: req.query.from || undefined,
+      to: req.query.to || undefined,
+      storeId: req.query.store_id || undefined,
+      courierId: req.query.courier_id || undefined,
+      limit: req.query.limit || undefined,
+    });
+    return res.json({ settlements: rows });
+  } catch (error) {
+    console.error('get /admin/settlements error:', error);
+    return res.status(500).json({ error: 'Failed to load settlements', details: error.message });
+  }
+});
+
+/** One order, itemised, with the destination accounts resolved. */
+app.get('/admin/settlements/:orderId', requireAdmin, async (req, res) => {
+  try {
+    return res.json(await settlementDetail(req.params.orderId));
+  } catch (error) {
+    if (error.status) return res.status(error.status).json({ error: error.message });
+    console.error('get /admin/settlements/:orderId error:', error);
+    return res.status(500).json({ error: 'Failed to load settlement', details: error.message });
+  }
+});
+
+/**
+ * Record that a party has been paid for an order.
+ *
+ * This writes the audit row for a transfer the accountant has made. It does
+ * not move money — no payment provider is wired up (see sendDisbursement).
+ */
+app.post('/admin/settlements/:orderId/disburse', requireAdmin, async (req, res) => {
+  try {
+    const { recipient_type: recipientType, note } = req.body || {};
+    const result = await recordDisbursement({
+      orderId: req.params.orderId,
+      recipientType,
+      actor: req.dashboardRole,
+      note,
+    });
+    console.log('[disbursement] %s', JSON.stringify({
+      at: new Date().toISOString(),
+      by_role: req.dashboardRole,
+      ip: req.ip,
+      order_id: req.params.orderId,
+      recipient_type: recipientType,
+      amount: result.disbursement?.amount,
+      company_id: result.disbursement?.company_id || null,
+    }));
+    return res.json(result);
+  } catch (error) {
+    if (error.status) return res.status(error.status).json({ error: error.message, details: error.details });
+    console.error('post /admin/settlements/:orderId/disburse error:', error);
+    return res.status(500).json({ error: 'Failed to record disbursement', details: error.message });
+  }
+});
+
+// ── Umbrella courier companies ──────────────────────────────────────────────
+
+app.get('/admin/courier-companies', requireAdmin, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('courier_companies')
+      .select('*')
+      .order('name');
+    if (error) throw new Error(error.message);
+
+    // Rider counts, so the list answers "how big is this company" without a
+    // second request per row.
+    const { data: riders } = await supabase
+      .from('couriers')
+      .select('id, company_id')
+      .not('company_id', 'is', null);
+    const counts = new Map();
+    for (const r of riders || []) counts.set(r.company_id, (counts.get(r.company_id) || 0) + 1);
+
+    return res.json({
+      companies: (data || []).map((c) => ({ ...c, courier_count: counts.get(c.id) || 0 })),
+    });
+  } catch (error) {
+    console.error('get /admin/courier-companies error:', error);
+    return res.status(500).json({ error: 'Failed to load companies', details: error.message });
+  }
+});
+
+const COMPANY_FIELDS = [
+  'name', 'registration_number', 'contact_name', 'contact_phone', 'contact_email',
+  'address', 'city', 'payout_method_type', 'payout_provider', 'payout_provider_code',
+  'payout_account_number', 'payout_account_name', 'is_active', 'notes',
+];
+
+/** Only the columns above are writable — a body cannot set id or timestamps. */
+function pickCompanyFields(body = {}) {
+  const out = {};
+  for (const f of COMPANY_FIELDS) if (body[f] !== undefined) out[f] = body[f];
+  return out;
+}
+
+app.post('/admin/courier-companies', requireAdmin, async (req, res) => {
+  try {
+    const fields = pickCompanyFields(req.body);
+    if (!String(fields.name || '').trim()) {
+      return res.status(400).json({ error: 'Name required', details: 'Give the company a name.' });
+    }
+    const { data, error } = await supabase
+      .from('courier_companies').insert(fields).select('*').single();
+    if (error) {
+      if (/duplicate key|unique/i.test(error.message || '')) {
+        return res.status(409).json({ error: 'Already exists', details: 'A company with that name is already registered.' });
+      }
+      throw new Error(error.message);
+    }
+    return res.json({ company: data });
+  } catch (error) {
+    console.error('post /admin/courier-companies error:', error);
+    return res.status(500).json({ error: 'Failed to create company', details: error.message });
+  }
+});
+
+app.patch('/admin/courier-companies/:id', requireAdmin, async (req, res) => {
+  try {
+    const fields = pickCompanyFields(req.body);
+    if (!Object.keys(fields).length) return res.status(400).json({ error: 'Nothing to update' });
+    fields.updated_at = new Date().toISOString();
+    const { data, error } = await supabase
+      .from('courier_companies').update(fields).eq('id', req.params.id).select('*').single();
+    if (error) throw new Error(error.message);
+    return res.json({ company: data });
+  } catch (error) {
+    console.error('patch /admin/courier-companies/:id error:', error);
+    return res.status(500).json({ error: 'Failed to update company', details: error.message });
+  }
+});
+
+/**
+ * Deleting a company releases its riders rather than removing them — the FK
+ * is ON DELETE SET NULL, so they revert to being paid individually.
+ */
+app.delete('/admin/courier-companies/:id', requireAdmin, async (req, res) => {
+  try {
+    const { error } = await supabase.from('courier_companies').delete().eq('id', req.params.id);
+    if (error) throw new Error(error.message);
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error('delete /admin/courier-companies/:id error:', error);
+    return res.status(500).json({ error: 'Failed to delete company', details: error.message });
+  }
+});
+
+/** Put a courier under a company, or set company_id null to release them. */
+app.patch('/admin/couriers/:id/company', requireAdmin, async (req, res) => {
+  try {
+    const companyId = req.body?.company_id ?? null;
+    if (companyId) {
+      const { data: company } = await supabase
+        .from('courier_companies').select('id').eq('id', companyId).maybeSingle();
+      if (!company) return res.status(404).json({ error: 'Company not found' });
+    }
+    const { data, error } = await supabase
+      .from('couriers')
+      .update({ company_id: companyId, updated_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .select('id, company_id')
+      .single();
+    if (error) throw new Error(error.message);
+    console.log('[courier-company] %s', JSON.stringify({
+      at: new Date().toISOString(), by_role: req.dashboardRole,
+      courier_id: req.params.id, company_id: companyId,
+    }));
+    return res.json({ courier: data });
+  } catch (error) {
+    console.error('patch /admin/couriers/:id/company error:', error);
+    return res.status(500).json({ error: 'Failed to update courier', details: error.message });
   }
 });
 

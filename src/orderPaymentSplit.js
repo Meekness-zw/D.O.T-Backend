@@ -10,6 +10,12 @@
  * The courier keeps the delivery fee minus DOT's 20% cut
  * (DELIVERY_PLATFORM_CUT_RATE) — the base $4.99 fee pays the courier
  * exactly $4.00, DOT $0.99.
+ *
+ * Tips are outside all of that. The courier site promises "100% of your
+ * tips", so a tip never enters computeCourierDeliveryPayoutUsd and no cut
+ * is taken from it. It is credited as its own ledger line (type 'tip') so
+ * the promise stays auditable and so an accountant disbursing money can see
+ * fee and tip as two numbers rather than one blended total.
  */
 
 import { supabaseAdmin } from './supabaseAdminClient.js';
@@ -199,4 +205,145 @@ export async function recordCourierDeliveryEarnings({ courierId, orderId, amount
   }
 
   return { walletTransaction: tx, balance_after: newBalance, amount: credit };
+}
+
+
+/**
+ * Credit a customer's tip to the courier, in full.
+ *
+ * Separate from recordCourierDeliveryEarnings on purpose. Merging the two
+ * would make the 100%-of-tips promise unverifiable after the fact: once the
+ * amounts are summed into one row, nothing distinguishes a $4.00 fee plus a
+ * $2.00 tip from a $6.00 fee, and the platform cut on those differs.
+ *
+ * Idempotent per order, keyed the same way as the earnings row — the two
+ * differ by transaction_type, so one can exist without the other.
+ */
+export async function recordCourierTip({ courierId, orderId, amount, orderNumber }) {
+  if (!supabase || !courierId || !orderId) return null;
+  const tip = Math.round(Number(amount) * 100) / 100;
+  if (!Number.isFinite(tip) || tip <= 0) return null;
+
+  const { data: existing } = await supabase
+    .from('wallet_transactions')
+    .select('id')
+    .eq('user_id', courierId)
+    .eq('reference_id', orderId)
+    .eq('transaction_type', 'tip')
+    .maybeSingle();
+  if (existing?.id) return { skipped: true, reason: 'already_recorded' };
+
+  const prevBalance = await getWalletBalance(courierId, 'courier');
+  const newBalance = Math.round((prevBalance + tip) * 100) / 100;
+
+  const { data: tx, error } = await supabase
+    .from('wallet_transactions')
+    .insert({
+      user_id: courierId,
+      user_type: 'courier',
+      transaction_type: 'tip',
+      amount: tip,
+      balance_after: newBalance,
+      description: `Customer tip — order ${orderNumber || String(orderId).slice(0, 8)}`,
+      reference_id: orderId,
+      status: 'completed',
+    })
+    .select('*')
+    .single();
+
+  if (error) {
+    // A failed tip must not fail the delivery. It is recoverable from the
+    // order row, which still holds courier_tip.
+    console.error('[orderPaymentSplit] courier tip insert error:', error);
+    return null;
+  }
+
+  // total_earnings tracks what the courier actually received, so the tip
+  // belongs in it. total_deliveries is NOT incremented — the delivery was
+  // already counted by recordCourierDeliveryEarnings, and counting it twice
+  // would inflate every per-delivery average on the courier's dashboard.
+  const { data: courierRow } = await supabase
+    .from('couriers')
+    .select('total_earnings')
+    .eq('id', courierId)
+    .maybeSingle();
+
+  const { error: updErr } = await supabase
+    .from('couriers')
+    .update({
+      account_balance: newBalance,
+      total_earnings: Math.round((Number(courierRow?.total_earnings || 0) + tip) * 100) / 100,
+    })
+    .eq('id', courierId);
+  if (updErr) console.error('[orderPaymentSplit] courier tip row update error:', updErr);
+
+  return { walletTransaction: tx, balance_after: newBalance, amount: tip };
+}
+
+/**
+ * Where a courier's money should actually be sent.
+ *
+ * A courier riding for an umbrella company is paid through the company: the
+ * company settles with its own riders off-platform. The delivery record still
+ * names the individual, so per-rider history and tracking are unaffected —
+ * only the destination account changes.
+ *
+ * Returns null when there is nowhere to send money, which the caller must
+ * treat as "cannot pay yet" rather than "pay the courier directly": silently
+ * falling back to the individual would pay the wrong party.
+ */
+export async function resolveCourierPayoutDestination(courierId) {
+  if (!supabase || !courierId) return null;
+
+  const { data: courier } = await supabase
+    .from('couriers')
+    .select('id, company_id')
+    .eq('id', courierId)
+    .maybeSingle();
+
+  if (courier?.company_id) {
+    const { data: company } = await supabase
+      .from('courier_companies')
+      .select('id, name, is_active, payout_method_type, payout_provider, payout_provider_code, payout_account_number, payout_account_name')
+      .eq('id', courier.company_id)
+      .maybeSingle();
+
+    // An inactive company is a deliberate stop on payments to it. Falling
+    // through to the courier's own account here would route around that.
+    if (company && company.is_active === false) {
+      return { kind: 'blocked', reason: 'company_inactive', company };
+    }
+    if (company?.payout_account_number) {
+      return {
+        kind: 'company',
+        companyId: company.id,
+        companyName: company.name,
+        methodType: company.payout_method_type,
+        provider: company.payout_provider,
+        providerCode: company.payout_provider_code,
+        accountNumber: company.payout_account_number,
+        accountName: company.payout_account_name || company.name,
+      };
+    }
+    return { kind: 'blocked', reason: 'company_has_no_payout_method', company };
+  }
+
+  const { data: method } = await supabase
+    .from('courier_payout_methods')
+    .select('id, method_type, provider, provider_code, account_number, account_name')
+    .eq('courier_id', courierId)
+    .eq('is_default', true)
+    .maybeSingle();
+
+  if (!method?.account_number) return { kind: 'blocked', reason: 'no_payout_method' };
+
+  return {
+    kind: 'courier',
+    payoutMethodId: method.id,
+    methodType: method.method_type,
+    provider: method.provider,
+    providerCode: method.provider_code,
+    accountNumber: method.account_number,
+    accountName: method.account_name,
+  };
 }
