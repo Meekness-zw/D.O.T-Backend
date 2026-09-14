@@ -74,7 +74,6 @@ import {
   computeCourierDeliveryPayoutUsd,
   getOtdPlatformServiceChargeUsd,
   applyPlatformMarkup,
-  getWeeklyCommissionRate,
 } from './orderPaymentSplit.js';
 import {
   listSettlements,
@@ -1118,6 +1117,17 @@ function dashboardRoleCanAccess(role, method, path) {
     if (method === 'POST' && /^\/admin\/(couriers|merchants)\/[^/]+\/(approve|reject)$/.test(path)) {
       return true;
     }
+    // Full store management on a merchant's behalf — set up a store from
+    // scratch, edit its profile, logo/banner, and promotions — everything a
+    // merchant can do to their own storefront except accept/fulfil orders
+    // (there is no such endpoint under /admin/* to begin with; order
+    // acceptance lives on /orders/:id and /merchant/orders/*, both gated by
+    // the merchant's own session token, never reachable via requireAdmin).
+    if (method === 'POST' && /^\/admin\/merchants\/[^/]+\/onboarding$/.test(path)) return true;
+    if (method === 'PATCH' && /^\/admin\/stores\/[^/]+$/.test(path)) return true;
+    if (method === 'POST' && /^\/admin\/stores\/[^/]+\/upload-(logo|banner)$/.test(path)) return true;
+    if (/^\/admin\/stores\/[^/]+\/promotions(\/upload-image)?$/.test(path)) return true;
+    if (['PATCH', 'DELETE'].includes(method) && /^\/admin\/promotions\/[^/]+$/.test(path)) return true;
     if (!readOnly) return false;
     // Orders are readable but not actionable: the GET-only guard above keeps
     // refunds (POST /admin/orders/:id/refund) with admin and accounting.
@@ -9587,7 +9597,6 @@ app.get('/admin/payout-details', requireAdmin, async (req, res) => {
       .in('merchant_id', userIds);
     const storeByMerchant = new Map((storeRows || []).map((s) => [s.merchant_id, s.store_name]));
 
-    const weeklyRate = getWeeklyCommissionRate();
     const recipients = recipientKeys.map((key) => {
       const sep = key.lastIndexOf(':');
       const id = key.slice(0, sep);
@@ -9595,9 +9604,9 @@ app.get('/admin/payout-details', requireAdmin, async (req, res) => {
       const pm = payoutByKey.get(key);
       const profile = profileById.get(id);
       const balance = balances.get(key) || 0;
-      // Weekly platform commission deducted from merchant payouts
-      const weeklyCommission =
-        role === 'merchant' ? Math.round(balance * weeklyRate * 100) / 100 : 0;
+      // The 5% weekly commission is already deducted per-order in
+      // computeSubtotalSplit() before this balance is ever credited — do not
+      // subtract it again here. `balance` is the true payable amount.
       return {
         user_id: id,
         role,
@@ -9605,8 +9614,7 @@ app.get('/admin/payout-details', requireAdmin, async (req, res) => {
         phone: profile?.phone || null,
         store_name: role === 'merchant' ? storeByMerchant.get(id) || null : null,
         balance,
-        weekly_commission: weeklyCommission,
-        payable: Math.round((balance - weeklyCommission) * 100) / 100,
+        payable: balance,
         needs_payout_setup: !pm,
         payout: pm
           ? {
@@ -10682,6 +10690,347 @@ app.post('/admin/stores/:storeId/products/upload-image', requireAdmin, async (re
   } catch (error) {
     console.error('post /admin/stores/:storeId/products/upload-image error:', error);
     return res.status(500).json({ error: 'Failed to upload image', details: error.message || 'Try again later' });
+  }
+});
+
+// ─── Admin: full store management on a merchant's behalf ────────────────────
+// Mirrors the merchant's own PATCH /merchant/stores/:id, upload-logo/-banner,
+// and promotions CRUD — same fields, same storage buckets — just gated by
+// requireAdmin (admin + sales_marketing) instead of the store's own merchant
+// token. Deliberately excludes anything order-fulfillment related (accepting/
+// confirming an order): those live entirely under /orders/:id and
+// /merchant/orders/*, which requireAuth-and-ownership-check on the merchant's
+// own session and were never reachable via requireAdmin to begin with.
+
+// GET /admin/stores/:id — one store's full profile, for the admin store-management page
+app.get('/admin/stores/:id', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { data: store, error } = await supabase
+      .from('stores')
+      .select(
+        'id, merchant_id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country, latitude, longitude, is_open, is_active, operating_hours, delivery_radius_km, rating, total_reviews, created_at',
+      )
+      .eq('id', id)
+      .maybeSingle();
+    if (error) throw new Error(error.message || 'Failed to load store');
+    if (!store) return res.status(404).json({ error: 'Store not found' });
+
+    for (const [urlField, pathPrefix] of [['logo', /\/store-logos\/(.+)$/], ['banner_url', /\/store-logos\/(.+)$/]]) {
+      try {
+        const value = store[urlField];
+        if (value && typeof value === 'string') {
+          const match = value.match(pathPrefix);
+          if (match) {
+            const { data: signed } = await supabase.storage.from('store-logos').createSignedUrl(match[1], 3600);
+            if (signed?.signedUrl) store[urlField] = signed.signedUrl;
+          }
+        }
+      } catch (e) {
+        console.error(`admin store ${urlField} signed url error:`, e);
+      }
+    }
+
+    return res.json(store);
+  } catch (error) {
+    console.error('get /admin/stores/:id error:', error);
+    return res.status(500).json({ error: 'Failed to load store', details: error.message || 'Please try again later' });
+  }
+});
+
+// PATCH /admin/stores/:id — edit store profile (name, address, hours, etc.)
+app.patch('/admin/stores/:id', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('id')
+      .eq('id', id)
+      .maybeSingle();
+    if (storeError || !store) return res.status(404).json({ error: 'Store not found' });
+
+    const {
+      store_name, logo, banner_url, description, phone, email,
+      address_line1, address_line2, city, state_province, postal_code, country,
+      latitude, longitude, is_open, is_active, operating_hours, delivery_radius_km,
+    } = req.body || {};
+    const update = {};
+    if (store_name !== undefined && String(store_name).trim()) update.store_name = String(store_name).trim();
+    if (logo !== undefined) update.logo = logo ? String(logo).trim() : null;
+    if (banner_url !== undefined) update.banner_url = banner_url ? String(banner_url).trim() : null;
+    if (description !== undefined) update.description = description ? String(description).trim() : null;
+    if (phone !== undefined) update.phone = phone ? String(phone).trim() : null;
+    if (email !== undefined) update.email = email ? String(email).trim() : null;
+    if (address_line1 !== undefined && String(address_line1).trim()) update.address_line1 = String(address_line1).trim();
+    if (address_line2 !== undefined) update.address_line2 = address_line2 ? String(address_line2).trim() : null;
+    if (city !== undefined && String(city).trim()) update.city = String(city).trim();
+    if (state_province !== undefined) update.state_province = state_province ? String(state_province).trim() : null;
+    if (postal_code !== undefined) update.postal_code = postal_code ? String(postal_code).trim() : null;
+    if (country !== undefined) update.country = country ? String(country).trim() : null;
+    if (latitude !== undefined && latitude !== null && latitude !== '') update.latitude = Number(latitude);
+    if (longitude !== undefined && longitude !== null && longitude !== '') update.longitude = Number(longitude);
+    if (is_open !== undefined) update.is_open = !!is_open;
+    if (is_active !== undefined) update.is_active = !!is_active;
+    if (operating_hours !== undefined) {
+      if (operating_hours === null) update.operating_hours = null;
+      else if (typeof operating_hours === 'object') update.operating_hours = operating_hours;
+    }
+    if (delivery_radius_km !== undefined && delivery_radius_km !== null && delivery_radius_km !== '') {
+      const radius = Number(delivery_radius_km);
+      if (!Number.isFinite(radius) || radius <= 0) {
+        return res.status(400).json({ error: 'Invalid delivery_radius_km', details: 'delivery_radius_km must be a positive number (km)' });
+      }
+      update.delivery_radius_km = radius;
+    }
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ error: 'No fields to update', details: 'Provide at least one updatable field' });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('stores')
+      .update(update)
+      .eq('id', id)
+      .select()
+      .single();
+    if (updateError) throw new Error(updateError.message || 'Failed to update store');
+    return res.json(updated);
+  } catch (error) {
+    console.error('patch /admin/stores/:id error:', error);
+    return res.status(500).json({ error: 'Failed to update store', details: error.message || 'Please try again later' });
+  }
+});
+
+// POST /admin/stores/:id/upload-logo
+app.post('/admin/stores/:id/upload-logo', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { image_base64 } = req.body || {};
+    if (!image_base64) return res.status(400).json({ error: 'Missing image_base64', details: 'image_base64 is required' });
+
+    const { data: store } = await supabase.from('stores').select('id').eq('id', id).maybeSingle();
+    if (!store) return res.status(404).json({ error: 'Store not found' });
+
+    const match = String(image_base64).match(/^data:([^;]+);base64,(.+)$/);
+    if (!match) return res.status(400).json({ error: 'Invalid image payload', details: 'Expected base64 data URL' });
+    const mime = match[1];
+    if (!ALLOWED_IMAGE_MIME_TYPES.has(mime.toLowerCase())) {
+      return res.status(400).json({ error: 'Unsupported image type', details: 'Only PNG, JPEG, and WebP images are accepted.' });
+    }
+    const buffer = Buffer.from(match[2], 'base64');
+    const ext = mime.includes('png') ? 'png' : mime.includes('jpeg') || mime.includes('jpg') ? 'jpg' : 'bin';
+    const filename = `stores/${id}/logo.${ext}`;
+
+    const { error: uploadError } = await supabase.storage.from('store-logos').upload(filename, buffer, { contentType: mime, upsert: true });
+    if (uploadError) throw new Error(uploadError.message || 'Failed to upload logo');
+
+    const { data: urlData } = supabase.storage.from('store-logos').getPublicUrl(filename);
+    const logoUrl = urlData?.publicUrl || null;
+    if (!logoUrl) return res.status(500).json({ error: 'Failed to resolve logo URL' });
+
+    const { error: updateError } = await supabase.from('stores').update({ logo: logoUrl }).eq('id', id);
+    if (updateError) throw new Error(updateError.message || 'Failed to update store logo');
+
+    return res.json({ logo_url: logoUrl });
+  } catch (error) {
+    console.error('post /admin/stores/:id/upload-logo error:', error);
+    return res.status(500).json({ error: 'Failed to upload logo', details: error.message || 'Please try again later' });
+  }
+});
+
+// POST /admin/stores/:id/upload-banner
+app.post('/admin/stores/:id/upload-banner', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { image_base64 } = req.body || {};
+    if (!image_base64) return res.status(400).json({ error: 'Missing image_base64', details: 'image_base64 is required' });
+
+    const { data: store } = await supabase.from('stores').select('id').eq('id', id).maybeSingle();
+    if (!store) return res.status(404).json({ error: 'Store not found' });
+
+    const match = String(image_base64).match(/^data:([^;]+);base64,(.+)$/);
+    if (!match) return res.status(400).json({ error: 'Invalid image payload', details: 'Expected base64 data URL' });
+    const mime = match[1];
+    if (!ALLOWED_IMAGE_MIME_TYPES.has(mime.toLowerCase())) {
+      return res.status(400).json({ error: 'Unsupported image type', details: 'Only PNG, JPEG, and WebP images are accepted.' });
+    }
+    const buffer = Buffer.from(match[2], 'base64');
+    const ext = mime.includes('png') ? 'png' : mime.includes('jpeg') || mime.includes('jpg') ? 'jpg' : 'bin';
+    const filename = `stores/${id}/banner.${ext}`;
+
+    const { error: uploadError } = await supabase.storage.from('store-logos').upload(filename, buffer, { contentType: mime, upsert: true });
+    if (uploadError) throw new Error(uploadError.message || 'Failed to upload banner');
+
+    const { data: urlData } = supabase.storage.from('store-logos').getPublicUrl(filename);
+    const bannerUrl = urlData?.publicUrl || null;
+    if (!bannerUrl) return res.status(500).json({ error: 'Failed to resolve banner URL' });
+
+    const { error: updateError } = await supabase.from('stores').update({ banner_url: bannerUrl }).eq('id', id);
+    if (updateError) throw new Error(updateError.message || 'Failed to update store banner');
+
+    return res.json({ banner_url: bannerUrl });
+  } catch (error) {
+    console.error('post /admin/stores/:id/upload-banner error:', error);
+    return res.status(500).json({ error: 'Failed to upload banner', details: error.message || 'Please try again later' });
+  }
+});
+
+// GET /admin/stores/:storeId/promotions
+app.get('/admin/stores/:storeId/promotions', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { storeId } = req.params;
+    const { data, error } = await supabase
+      .from('promotions')
+      .select('id, store_id, title, description, tag, category, image_url, is_active, starts_at, ends_at, recurrence_type, recurrence_weekday, recurrence_month_day, recurrence_time')
+      .eq('store_id', storeId)
+      .order('created_at', { ascending: false });
+    if (error) throw new Error(error.message || 'Failed to load promotions');
+    return res.json({ promotions: data || [] });
+  } catch (error) {
+    console.error('get /admin/stores/:storeId/promotions error:', error);
+    return res.status(500).json({ error: 'Failed to load promotions', details: error.message || 'Please try again later' });
+  }
+});
+
+// POST /admin/stores/:storeId/promotions
+app.post('/admin/stores/:storeId/promotions', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { storeId } = req.params;
+    const { title, description, tag, category, image_url, is_active, starts_at, ends_at, recurrence_type, recurrence_weekday, recurrence_month_day, recurrence_time } = req.body || {};
+    if (!title) return res.status(400).json({ error: 'Missing required fields', details: 'title is required' });
+
+    const { data: store } = await supabase.from('stores').select('id').eq('id', storeId).maybeSingle();
+    if (!store) return res.status(404).json({ error: 'Store not found' });
+
+    const insert = {
+      store_id: storeId,
+      title: String(title).trim(),
+      description: description ? String(description).trim() : null,
+      tag: tag ? String(tag).trim() : null,
+      category: category ? String(category).trim() : null,
+      image_url: image_url ? String(image_url).trim() : null,
+      is_active: is_active !== false,
+      starts_at: starts_at || null,
+      ends_at: ends_at || null,
+      recurrence_type: recurrence_type === 'weekly' || recurrence_type === 'monthly' ? recurrence_type : 'once',
+      recurrence_weekday: recurrence_type === 'weekly' && recurrence_weekday >= 0 && recurrence_weekday <= 6 ? Number(recurrence_weekday) : null,
+      recurrence_month_day: recurrence_type === 'monthly' && recurrence_month_day >= 1 && recurrence_month_day <= 31 ? Number(recurrence_month_day) : null,
+      recurrence_time: recurrence_type === 'weekly' || recurrence_type === 'monthly' ? (recurrence_time && /^\d{1,2}:\d{2}$/.test(String(recurrence_time).trim()) ? String(recurrence_time).trim() : null) : null,
+    };
+
+    const { data, error } = await supabase
+      .from('promotions')
+      .insert(insert)
+      .select('id, store_id, title, description, tag, category, image_url, is_active, starts_at, ends_at, recurrence_type, recurrence_weekday, recurrence_month_day, recurrence_time')
+      .single();
+    if (error) throw new Error(error.message || 'Failed to create promotion');
+    return res.status(201).json(data);
+  } catch (error) {
+    console.error('post /admin/stores/:storeId/promotions error:', error);
+    return res.status(500).json({ error: 'Failed to create promotion', details: error.message || 'Please try again later' });
+  }
+});
+
+// PATCH /admin/promotions/:id
+app.patch('/admin/promotions/:id', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { data: promo } = await supabase.from('promotions').select('id').eq('id', id).maybeSingle();
+    if (!promo) return res.status(404).json({ error: 'Promotion not found' });
+
+    const { title, description, tag, category, image_url, is_active, starts_at, ends_at, recurrence_type, recurrence_weekday, recurrence_month_day, recurrence_time } = req.body || {};
+    const update = {};
+    if (title !== undefined && String(title).trim()) update.title = String(title).trim();
+    if (description !== undefined) update.description = description ? String(description).trim() : null;
+    if (tag !== undefined) update.tag = tag ? String(tag).trim() : null;
+    if (category !== undefined) update.category = category ? String(category).trim() : null;
+    if (image_url !== undefined) update.image_url = image_url ? String(image_url).trim() : null;
+    if (is_active !== undefined) update.is_active = !!is_active;
+    if (starts_at !== undefined) update.starts_at = starts_at || null;
+    if (ends_at !== undefined) update.ends_at = ends_at || null;
+    if (recurrence_type !== undefined) {
+      update.recurrence_type = recurrence_type === 'weekly' || recurrence_type === 'monthly' ? recurrence_type : 'once';
+      if (update.recurrence_type === 'once') {
+        update.recurrence_weekday = null;
+        update.recurrence_month_day = null;
+        update.recurrence_time = null;
+      }
+    }
+    if (recurrence_weekday !== undefined) update.recurrence_weekday = recurrence_type === 'weekly' && recurrence_weekday >= 0 && recurrence_weekday <= 6 ? Number(recurrence_weekday) : null;
+    if (recurrence_month_day !== undefined) update.recurrence_month_day = recurrence_type === 'monthly' && recurrence_month_day >= 1 && recurrence_month_day <= 31 ? Number(recurrence_month_day) : null;
+    if (recurrence_time !== undefined) update.recurrence_time = (recurrence_type === 'weekly' || recurrence_type === 'monthly') && recurrence_time && /^\d{1,2}:\d{2}$/.test(String(recurrence_time).trim()) ? String(recurrence_time).trim() : null;
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ error: 'No fields to update', details: 'Provide at least one updatable field' });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('promotions')
+      .update(update)
+      .eq('id', id)
+      .select('id, store_id, title, description, tag, category, image_url, is_active, starts_at, ends_at, recurrence_type, recurrence_weekday, recurrence_month_day, recurrence_time')
+      .single();
+    if (updateError) throw new Error(updateError.message || 'Failed to update promotion');
+    return res.json(updated);
+  } catch (error) {
+    console.error('patch /admin/promotions/:id error:', error);
+    return res.status(500).json({ error: 'Failed to update promotion', details: error.message || 'Please try again later' });
+  }
+});
+
+// DELETE /admin/promotions/:id
+app.delete('/admin/promotions/:id', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+    const { data: promo } = await supabase.from('promotions').select('id').eq('id', id).maybeSingle();
+    if (!promo) return res.status(404).json({ error: 'Promotion not found' });
+
+    const { error: deleteError } = await supabase.from('promotions').delete().eq('id', id);
+    if (deleteError) throw new Error(deleteError.message || 'Failed to delete promotion');
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('delete /admin/promotions/:id error:', error);
+    return res.status(500).json({ error: 'Failed to delete promotion', details: error.message || 'Please try again later' });
+  }
+});
+
+// POST /admin/stores/:storeId/promotions/upload-image
+app.post('/admin/stores/:storeId/promotions/upload-image', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { storeId } = req.params;
+    const { image_base64 } = req.body || {};
+    if (!image_base64) return res.status(400).json({ error: 'Missing required fields', details: 'image_base64 is required' });
+
+    const { data: store } = await supabase.from('stores').select('id').eq('id', storeId).maybeSingle();
+    if (!store) return res.status(404).json({ error: 'Store not found' });
+
+    const match = String(image_base64).match(/^data:([^;]+);base64,(.+)$/);
+    if (!match) return res.status(400).json({ error: 'Invalid image payload', details: 'Expected base64 data URL' });
+    const mime = match[1];
+    if (!ALLOWED_IMAGE_MIME_TYPES.has(mime.toLowerCase())) {
+      return res.status(400).json({ error: 'Unsupported image type', details: 'Only PNG, JPEG, and WebP images are accepted.' });
+    }
+    const buffer = Buffer.from(match[2], 'base64');
+    const ext = mime.includes('png') ? 'png' : mime.includes('jpeg') || mime.includes('jpg') ? 'jpg' : 'bin';
+    const filename = `promotions/${storeId}/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+
+    const { error: uploadError } = await supabase.storage.from('promo-images').upload(filename, buffer, { contentType: mime, upsert: true });
+    if (uploadError) throw new Error(uploadError.message || 'Failed to upload image');
+
+    const { data: urlData } = supabase.storage.from('promo-images').getPublicUrl(filename);
+    if (!urlData?.publicUrl) return res.status(500).json({ error: 'Failed to resolve image URL' });
+    return res.json({ image_url: urlData.publicUrl });
+  } catch (error) {
+    console.error('post /admin/stores/:storeId/promotions/upload-image error:', error);
+    return res.status(500).json({ error: 'Failed to upload image', details: error.message || 'Please try again later' });
   }
 });
 

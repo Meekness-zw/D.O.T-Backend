@@ -3,8 +3,14 @@
  *  - Every merchant price is automatically marked up 15% for customers
  *    (PLATFORM_MARKUP_RATE). The markup stays in DOT's account on every
  *    transaction; the merchant is credited their own base price.
- *  - A weekly 5% commission (WEEKLY_COMMISSION_RATE) is deducted from
- *    merchant balances at distribution time (see /admin/payout-details).
+ *  - On top of that, DOT takes a further 5% (WEEKLY_COMMISSION_RATE) of the
+ *    merchant's post-markup earnings on every order — applied right here in
+ *    computeSubtotalSplit(), the moment the order is paid, not later at
+ *    withdrawal/distribution time. This means merchants.wallet balance (via
+ *    wallet_transactions) is already the true payable amount; nothing
+ *    downstream (POST /wallet/withdraw, /admin/payout-details) deducts it
+ *    again. Naming is a holdover from an earlier "at distribution time"
+ *    design — the rate is unchanged, only where it's applied moved earlier.
  *
  * Courier delivery payout: credited when the customer confirms delivery.
  * The courier keeps the delivery fee minus DOT's 20% cut
@@ -73,14 +79,19 @@ export function computeCourierDeliveryPayoutUsd(deliveryFee) {
 }
 
 /**
- * The customer-paid subtotal already contains the platform markup
- * (menu prices are served marked up). The merchant is credited their
- * base price; the markup remains with DOT.
+ * The customer-paid subtotal already contains the platform markup (menu
+ * prices are served marked up). The merchant's base price is then further
+ * reduced by the weekly commission rate (default 5%) — DOT's total take is
+ * the markup plus that 5% of what's left. `platformCommission` is always the
+ * remainder (subtotal - merchantEarnings), never computed independently, so
+ * the two can never drift apart by a rounding cent.
  */
 export function computeSubtotalSplit(subtotal) {
   const sub = Number(subtotal || 0);
   const markup = getPlatformMarkupRate();
-  const merchantEarnings = Math.round((sub / (1 + markup)) * 100) / 100;
+  const basePrice = sub / (1 + markup);
+  const commissionRate = getWeeklyCommissionRate();
+  const merchantEarnings = Math.round(basePrice * (1 - commissionRate) * 100) / 100;
   const platformCommission = Math.round((sub - merchantEarnings) * 100) / 100;
   return { platformCommission, merchantEarnings };
 }
