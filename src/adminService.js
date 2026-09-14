@@ -537,7 +537,23 @@ export async function getAdminMerchants(options = {}) {
     .range(offset, offset + limit - 1);
 
   if (error) throw new Error(error.message || 'Failed to fetch merchants');
-  return { merchants: data || [], total: count ?? 0 };
+
+  const merchants = data || [];
+  const ids = merchants.map((m) => m.id);
+  let withStore = new Set();
+  if (ids.length > 0) {
+    const { data: storeRows, error: storesError } = await supabase
+      .from('stores')
+      .select('merchant_id')
+      .in('merchant_id', ids);
+    if (storesError) throw new Error(storesError.message || 'Failed to check store ownership');
+    withStore = new Set((storeRows || []).map((s) => s.merchant_id));
+  }
+
+  return {
+    merchants: merchants.map((m) => ({ ...m, has_store: withStore.has(m.id) })),
+    total: count ?? 0,
+  };
 }
 
 export async function getAdminCouriers(options = {}) {

@@ -9696,6 +9696,50 @@ app.post('/admin/merchants/:id/reject', requireAdmin, async (req, res) => {
   }
 });
 
+// POST /admin/merchants/:id/onboarding — DOT staff set up (or finish setting up) a store on
+// behalf of a merchant who has an account but no time/ability to do it themselves. Same body
+// shape and DB-write logic as the merchant's own POST /merchants/onboarding, just admin-gated
+// and targeting an explicit merchant id instead of the caller's own token subject.
+app.post('/admin/merchants/:id/onboarding', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+
+    const { data: profile, error: profileError } = await supabase
+      .from('user_profiles')
+      .select('id, role')
+      .eq('id', id)
+      .maybeSingle();
+    if (profileError) throw new Error(profileError.message || 'Failed to look up account');
+    if (!profile) return res.status(404).json({ error: 'Account not found' });
+    if (profile.role !== 'merchant') {
+      return res.status(400).json({ error: 'Not a merchant account', details: 'This account is not registered as a merchant' });
+    }
+
+    const {
+      businessName, businessType, storeName, ownerName, phone, email,
+      address, address_line2, city, state_province, postal_code, country,
+      latitude, longitude, description, operating_hours, is_open, delivery_radius_km,
+      business_registration_number, tax_id,
+      storeLogoBase64, storeBannerBase64, ownerIdBase64, businessCertificateBase64, proofOfAddressBase64,
+    } = req.body || {};
+
+    const data = await upsertMerchantOnboarding({
+      userId: id,
+      businessName, businessType, storeName, ownerName, phone, email,
+      address, address_line2, city, state_province, postal_code, country,
+      latitude, longitude, description, operating_hours, is_open, delivery_radius_km,
+      business_registration_number, tax_id,
+      storeLogoBase64, storeBannerBase64, ownerIdBase64, businessCertificateBase64, proofOfAddressBase64,
+    });
+
+    return res.status(201).json(data);
+  } catch (error) {
+    console.error('admin/merchants/:id/onboarding error:', error);
+    return res.status(400).json({ error: error.message || 'Failed to set up store', details: error.message });
+  }
+});
+
 // Reject a courier by ID
 app.post('/admin/couriers/:id/reject', requireAdmin, async (req, res) => {
   try {
