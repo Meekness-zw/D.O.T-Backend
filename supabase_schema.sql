@@ -102,6 +102,10 @@ CREATE TABLE IF NOT EXISTS merchants (
   tax_id TEXT,
   is_verified BOOLEAN DEFAULT FALSE,
   is_active BOOLEAN DEFAULT TRUE,
+  approval_status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (approval_status IN ('pending', 'approved', 'rejected')),
+  rejected_reason TEXT,
+  approved_at TIMESTAMP WITH TIME ZONE,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -389,6 +393,11 @@ CREATE TABLE IF NOT EXISTS orders (
   pickup_notes TEXT,
   delivery_notes TEXT,
   qr_code TEXT,
+  -- When the order most recently entered the open, unaccepted courier pool
+  -- (first 'preparing', or a courier drop / merchant repost putting it back),
+  -- and when it was pulled from that pool for sitting 45 minutes unaccepted.
+  courier_match_started_at TIMESTAMP WITH TIME ZONE,
+  courier_match_expired_at TIMESTAMP WITH TIME ZONE,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -515,6 +524,9 @@ CREATE INDEX IF NOT EXISTS idx_sms_send_log_ip ON sms_send_log(ip, created_at DE
 CREATE INDEX IF NOT EXISTS idx_customer_addresses_customer_id ON customer_addresses(customer_id);
 CREATE INDEX IF NOT EXISTS idx_customer_payment_methods_customer_id ON customer_payment_methods(customer_id);
 
+-- Merchants
+CREATE INDEX IF NOT EXISTS idx_merchants_approval_status ON merchants(approval_status);
+
 -- Stores
 CREATE INDEX IF NOT EXISTS idx_stores_merchant_id ON stores(merchant_id);
 CREATE INDEX IF NOT EXISTS idx_stores_location ON stores(latitude, longitude);
@@ -533,6 +545,8 @@ CREATE INDEX IF NOT EXISTS idx_orders_courier_id ON orders(courier_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_orders_order_number ON orders(order_number);
+CREATE INDEX IF NOT EXISTS idx_orders_courier_match_started_at ON orders(courier_match_started_at)
+  WHERE courier_id IS NULL AND courier_match_expired_at IS NULL;
 
 -- Order Items
 CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id);
@@ -741,6 +755,29 @@ DROP POLICY IF EXISTS "Service role full access on sms_send_log" ON sms_send_log
 REVOKE ALL ON TABLE sms_send_log FROM PUBLIC, anon, authenticated;
 GRANT SELECT, INSERT ON TABLE sms_send_log TO service_role;
 
+-- Keep merchant identity/compliance columns private while still allowing RLS
+-- policies to answer the one public question they need: may this merchant's
+-- storefront be published? The fixed search_path prevents object shadowing.
+CREATE OR REPLACE FUNCTION public.is_merchant_approved_for_public_store(candidate_merchant_id UUID)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $function$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.merchants AS merchant
+    WHERE merchant.id = candidate_merchant_id
+      AND merchant.is_active IS TRUE
+      AND merchant.approval_status = 'approved'
+  );
+$function$;
+
+REVOKE ALL ON FUNCTION public.is_merchant_approved_for_public_store(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.is_merchant_approved_for_public_store(UUID)
+  TO anon, authenticated, service_role;
+
 -- User Profiles: Users can read/update their own profile
 DROP POLICY IF EXISTS "Users can view own profile" ON user_profiles;
 CREATE POLICY "Users can view own profile" ON user_profiles
@@ -767,20 +804,29 @@ DROP POLICY IF EXISTS "Customers can manage own payment methods" ON customer_pay
 CREATE POLICY "Customers can manage own payment methods" ON customer_payment_methods
   FOR ALL USING (auth.uid() = customer_id);
 
--- Stores: Public can view active stores, merchants can manage their stores
+-- Stores: Public can only view active stores whose merchant passed review;
+-- merchants can still view and manage their own pending storefront while they
+-- complete onboarding.
 DROP POLICY IF EXISTS "Anyone can view active stores" ON stores;
 CREATE POLICY "Anyone can view active stores" ON stores
-  FOR SELECT USING (is_active = TRUE);
+  FOR SELECT USING (
+    is_active IS TRUE
+    AND public.is_merchant_approved_for_public_store(merchant_id)
+  );
 
 DROP POLICY IF EXISTS "Merchants can manage own stores" ON stores;
 CREATE POLICY "Merchants can manage own stores" ON stores
   FOR ALL USING (auth.uid() = merchant_id);
 
--- Products: Public can view available products, merchants can manage their products
+-- Products inherit the same publication gate as their owning store.
 DROP POLICY IF EXISTS "Anyone can view available products" ON products;
 CREATE POLICY "Anyone can view available products" ON products
-  FOR SELECT USING (is_available = TRUE AND EXISTS (
-    SELECT 1 FROM stores WHERE stores.id = products.store_id AND stores.is_active = TRUE
+  FOR SELECT USING (is_available IS TRUE AND EXISTS (
+    SELECT 1
+    FROM stores
+    WHERE stores.id = products.store_id
+      AND stores.is_active IS TRUE
+      AND public.is_merchant_approved_for_public_store(stores.merchant_id)
   ));
 
 DROP POLICY IF EXISTS "Merchants can manage own products" ON products;

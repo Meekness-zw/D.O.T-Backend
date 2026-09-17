@@ -103,6 +103,8 @@ import { assertStrongPassword } from './passwordPolicy.js';
 import { sendOtpEmail } from './resendClient.js';
 import { guardSms, recordSmsSent, recordSmsFailure } from './smsGuard.js';
 import { getWalletBalance } from './walletLedger.js';
+import { createRequireApprovedCourier } from './courierApproval.js';
+import { createRequireApprovedMerchant } from './merchantApproval.js';
 import * as quickbooksService from './quickbooksService.js';
 import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
 
@@ -112,6 +114,8 @@ const app = express();
 // normalize it before using it in any limiter or durable counter.
 app.set('trust proxy', true);
 const supabase = supabaseAdmin;
+const requireApprovedCourier = createRequireApprovedCourier({ client: supabase });
+const requireApprovedMerchant = createRequireApprovedMerchant({ client: supabase });
 const PORT = process.env.PORT || 4000;
 
 // Rate limiting for auth endpoints (login, signup OTP, password reset).
@@ -216,7 +220,7 @@ async function findAuthUserByPhone(phone) {
   }
 }
 
-// Send push notification to all verified, non-busy couriers as soon as a merchant
+// Send push notification to all approved, verified, non-busy couriers as soon as a merchant
 // accepts an order, so they can start heading toward the store while it's prepared.
 // The job also becomes claimable in /courier/jobs/open at this same moment (status
 // 'preparing') rather than waiting for 'ready' — couriers can be en route before
@@ -224,11 +228,12 @@ async function findAuthUserByPhone(phone) {
 async function notifyAvailableCouriers(orderId, orderNumber, storeName) {
   if (!supabase) return;
   try {
-    // Get all verified couriers
+    // Both fields must agree: legacy/incomplete rows must not receive live jobs.
     const { data: couriers } = await supabase
       .from('couriers')
       .select('id, user_profiles ( push_token, push_role )')
       .eq('is_verified', true)
+      .eq('verification_status', 'approved')
       .eq('is_online', true);
     if (!couriers?.length) return;
 
@@ -1414,10 +1419,12 @@ app.get('/stores', optionalAuth, async (req, res) => {
           operating_hours,
           category_override,
           delivery_radius_km,
-          merchants ( business_type )
+          merchants!inner ( business_type, is_active, approval_status )
         `,
       )
-      .eq('is_active', true);
+      .eq('is_active', true)
+      .eq('merchants.is_active', true)
+      .eq('merchants.approval_status', 'approved');
 
     if (id) {
       query = query.eq('id', id);
@@ -2129,8 +2136,10 @@ app.get('/stores/:storeId/menu', async (req, res) => {
 
     const { data: store, error: storeError } = await supabase
       .from('stores')
-      .select('id, is_active, is_open, operating_hours')
+      .select('id, is_active, is_open, operating_hours, merchants!inner ( is_active, approval_status )')
       .eq('id', storeId)
+      .eq('merchants.is_active', true)
+      .eq('merchants.approval_status', 'approved')
       .maybeSingle();
 
     if (storeError || !store || store.is_active === false) {
@@ -2259,8 +2268,11 @@ app.get('/stores/:storeId/delivery-fee', async (req, res) => {
     }
     const { data: store, error } = await supabase
       .from('stores')
-      .select('latitude, longitude')
+      .select('latitude, longitude, merchants!inner ( is_active, approval_status )')
       .eq('id', storeId)
+      .eq('is_active', true)
+      .eq('merchants.is_active', true)
+      .eq('merchants.approval_status', 'approved')
       .maybeSingle();
     if (error || !store) return res.status(404).json({ error: 'Store not found' });
     const distanceKm = haversineKm(store.latitude, store.longitude, deliveryLat, deliveryLng);
@@ -3597,13 +3609,18 @@ app.get('/public/promotions', async (req, res) => {
         is_active,
         starts_at,
         ends_at,
-        stores (
+        stores!inner (
           store_name,
           logo,
-          city
+          city,
+          is_active,
+          merchants!inner ( is_active, approval_status )
         )
       `,
       )
+      .eq('stores.is_active', true)
+      .eq('stores.merchants.is_active', true)
+      .eq('stores.merchants.approval_status', 'approved')
       .order('created_at', { ascending: false })
       .limit(50);
 
@@ -4230,7 +4247,7 @@ app.delete('/users/me/push-token', requireAuth, async (req, res) => {
   }
 });
 
-app.get('/courier/availability', requireAuth, async (req, res) => {
+app.get('/courier/availability', requireAuth, requireApprovedCourier, async (req, res) => {
   try {
     const { data, error } = await supabase.from('couriers').select('is_online').eq('id', req.userId).maybeSingle();
     if (error) throw error;
@@ -4240,7 +4257,7 @@ app.get('/courier/availability', requireAuth, async (req, res) => {
   }
 });
 
-app.put('/courier/availability', requireAuth, async (req, res) => {
+app.put('/courier/availability', requireAuth, requireApprovedCourier, async (req, res) => {
   try {
     const isOnline = req.body?.isOnline;
     if (typeof isOnline !== 'boolean') return res.status(400).json({ error: 'isOnline must be a boolean' });
@@ -4271,7 +4288,7 @@ app.get('/users/me/orders', requireAuth, async (req, res) => {
 });
 
 // PATCH /orders/:id — merchant updates order status (confirm, preparing, ready, cancelled)
-app.patch('/orders/:id', requireAuth, async (req, res) => {
+app.patch('/orders/:id', requireAuth, requireApprovedMerchant, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
     const { id } = req.params;
@@ -4361,9 +4378,16 @@ app.patch('/orders/:id', requireAuth, async (req, res) => {
       });
     }
 
+    // 'preparing' is the moment the order first becomes visible to couriers
+    // (see notifyAvailableCouriers below) — start the 45-minute unmatched
+    // clock right here so it covers the full time the order sits open.
+    const orderUpdate = status === 'preparing'
+      ? { status, courier_match_started_at: new Date().toISOString(), courier_match_expired_at: null }
+      : { status };
+
     const { data: updated, error: updateError } = await supabase
       .from('orders')
-      .update({ status })
+      .update(orderUpdate)
       .eq('id', id)
       .eq('status', order.status)
       .select('id, order_number, status')
@@ -4817,7 +4841,7 @@ app.post('/orders/:id/messages', requireAuth, async (req, res) => {
 });
 
 // POST /courier/orders/:id/arrived — courier signals they are physically at the pickup location
-app.post('/courier/orders/:id/arrived', requireAuth, async (req, res) => {
+app.post('/courier/orders/:id/arrived', requireAuth, requireApprovedCourier, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
     const { id } = req.params;
@@ -4899,7 +4923,7 @@ app.post('/courier/orders/:id/arrived', requireAuth, async (req, res) => {
 });
 
 // POST /merchant/orders/:id/confirm-dispatch — merchant confirms that the courier may leave with the order
-app.post('/merchant/orders/:id/confirm-dispatch', requireAuth, async (req, res) => {
+app.post('/merchant/orders/:id/confirm-dispatch', requireAuth, requireApprovedMerchant, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
     const { id } = req.params;
@@ -4973,6 +4997,86 @@ app.post('/merchant/orders/:id/confirm-dispatch', requireAuth, async (req, res) 
     console.error('post /merchant/orders/:id/confirm-dispatch error:', error);
     return res.status(500).json({
       error: 'Failed to confirm dispatch',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// POST /merchant/orders/:id/repost — put an order that expired unaccepted (45
+// min, nobody took it) back in the open courier pool, same order/payment.
+app.post('/merchant/orders/:id/repost', requireAuth, requireApprovedMerchant, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { id } = req.params;
+
+    const { data: order, error: orderError } = await supabase
+      .from('orders')
+      .select('id, store_id, courier_id, status, order_number, courier_match_expired_at')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (orderError) {
+      console.error('merchant repost order error:', orderError);
+      throw new Error(orderError.message || 'Failed to load order');
+    }
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const { data: store, error: storeError } = await supabase
+      .from('stores')
+      .select('merchant_id, store_name')
+      .eq('id', order.store_id)
+      .maybeSingle();
+
+    if (storeError || !store || store.merchant_id !== req.userId) {
+      return res.status(403).json({ error: 'Forbidden', details: 'Cannot update this order' });
+    }
+
+    if (!order.courier_match_expired_at || order.courier_id || !['preparing', 'ready'].includes(order.status)) {
+      return res.status(400).json({
+        error: 'Cannot repost order',
+        details: 'This order has not expired — it is either already assigned to a courier or still within its matching window.',
+      });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from('orders')
+      .update({ courier_match_started_at: new Date().toISOString(), courier_match_expired_at: null })
+      .eq('id', id)
+      .is('courier_id', null)
+      .not('courier_match_expired_at', 'is', null)
+      .select('id, order_number, status')
+      .maybeSingle();
+
+    if (updateError) {
+      console.error('merchant repost update error:', updateError);
+      throw new Error(updateError.message || 'Failed to repost order');
+    }
+    if (!updated) {
+      return res.status(409).json({
+        error: 'Cannot repost order',
+        details: 'This order changed — refresh and try again.',
+      });
+    }
+
+    const { error: historyError } = await supabase.from('order_status_history').insert({
+      order_id: id,
+      status: updated.status,
+      notes: 'Merchant reposted order for courier pickup',
+      changed_by: req.userId,
+    });
+    if (historyError) {
+      console.error('order_status_history insert (repost) error:', historyError);
+    }
+
+    notifyAvailableCouriers(updated.id, updated.order_number, store.store_name).catch(() => {});
+
+    return res.json({ order: updated });
+  } catch (error) {
+    console.error('post /merchant/orders/:id/repost error:', error);
+    return res.status(500).json({
+      error: 'Failed to repost order',
       details: error.message || 'Please try again later',
     });
   }
@@ -5229,8 +5333,14 @@ app.delete('/orders/:id', requireAuth, async (req, res) => {
 
 const COURIER_ACTIVE_STATUSES = ['assigned', 'courier_arrived', 'merchant_confirmed', 'picked_up', 'in_transit', 'delivery_confirmation_pending'];
 
+// Any status before the courier has actually picked the order up from the
+// store — a courier may drop out of the job at any of these, no time limit.
+// Once the order is 'picked_up'/'in_transit'/'delivery_confirmation_pending'
+// they're already carrying the customer's goods and must complete delivery.
+const COURIER_PRE_PICKUP_STATUSES = ['assigned', 'courier_arrived', 'merchant_confirmed'];
+
 // GET /courier/orders/active — delivery in progress for this courier (resume after app restart)
-app.get('/courier/orders/active', requireAuth, async (req, res) => {
+app.get('/courier/orders/active', requireAuth, requireApprovedCourier, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
 
@@ -5318,7 +5428,7 @@ app.get('/courier/orders/active', requireAuth, async (req, res) => {
 // GET /courier/jobs/open — list unassigned orders the merchant has accepted
 // (status 'preparing' or 'ready') — visible from the moment of acceptance,
 // not just once marked ready, so couriers can start heading over early.
-app.get('/courier/jobs/open', requireAuth, async (req, res) => {
+app.get('/courier/jobs/open', requireAuth, requireApprovedCourier, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
 
@@ -5384,6 +5494,7 @@ app.get('/courier/jobs/open', requireAuth, async (req, res) => {
       )
       .in('status', ['preparing', 'ready'])
       .is('courier_id', null)
+      .is('courier_match_expired_at', null)
       .order('created_at', { ascending: true });
 
     if (droppedOrderIds.length > 0) {
@@ -5448,7 +5559,7 @@ app.get('/courier/jobs/open', requireAuth, async (req, res) => {
 });
 
 // POST /courier/jobs/:id/accept — courier accepts a job
-app.post('/courier/jobs/:id/accept', requireAuth, async (req, res) => {
+app.post('/courier/jobs/:id/accept', requireAuth, requireApprovedCourier, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
     const { id } = req.params;
@@ -5535,7 +5646,7 @@ app.post('/courier/jobs/:id/accept', requireAuth, async (req, res) => {
 });
 
 // POST /courier/orders/:id/drop — assigned courier drops a job before pickup
-app.post('/courier/orders/:id/drop', requireAuth, async (req, res) => {
+app.post('/courier/orders/:id/drop', requireAuth, requireApprovedCourier, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
     const { id } = req.params;
@@ -5567,42 +5678,27 @@ app.post('/courier/orders/:id/drop', requireAuth, async (req, res) => {
         details: 'You are not assigned to this order',
       });
     }
-    if (order.status !== 'assigned') {
-      const postArrival = ['courier_arrived', 'merchant_confirmed', 'picked_up', 'in_transit', 'delivery_confirmation_pending'].includes(order.status);
+    if (!COURIER_PRE_PICKUP_STATUSES.includes(order.status)) {
       return res.status(400).json({
         error: 'Cannot drop job',
-        details: postArrival
-          ? 'You have already arrived at the pickup location and must complete this delivery.'
-          : 'Job can only be dropped before pickup.',
+        details: 'You have already picked up this order and must complete the delivery.',
       });
     }
 
-    // Enforce 3-minute drop window from acceptance
-    const { data: assignedRow } = await supabase
-      .from('order_status_history')
-      .select('created_at')
-      .eq('order_id', id)
-      .eq('status', 'assigned')
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-
-    if (assignedRow?.created_at) {
-      const msElapsed = Date.now() - new Date(assignedRow.created_at).getTime();
-      if (msElapsed > 3 * 60 * 1000) {
-        return res.status(400).json({
-          error: 'Cannot drop job',
-          details: 'The 3-minute cancellation window has passed. You must complete this delivery.',
-        });
-      }
-    }
-
+    // No time limit — a courier may drop any time before pickup. Restart the
+    // unmatched-order clock (courier_match_started_at) since the order goes
+    // back into the open pool exactly as if no courier had ever taken it.
     const { data: updated, error: updateError } = await supabase
       .from('orders')
-      .update({ courier_id: null, status: 'ready' })
+      .update({
+        courier_id: null,
+        status: 'ready',
+        courier_match_started_at: new Date().toISOString(),
+        courier_match_expired_at: null,
+      })
       .eq('id', id)
       .eq('courier_id', req.userId)
-      .eq('status', 'assigned')
+      .in('status', COURIER_PRE_PICKUP_STATUSES)
       .select('id, order_number, status, courier_id, customer_id')
       .maybeSingle();
 
@@ -5638,7 +5734,7 @@ app.post('/courier/orders/:id/drop', requireAuth, async (req, res) => {
 });
 
 // PATCH /courier/orders/:id/location — assigned courier reports GPS (customer live map)
-app.patch('/courier/orders/:id/location', requireAuth, async (req, res) => {
+app.patch('/courier/orders/:id/location', requireAuth, requireApprovedCourier, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
     const { id } = req.params;
@@ -5708,7 +5804,7 @@ app.patch('/courier/orders/:id/location', requireAuth, async (req, res) => {
 });
 
 // POST /courier/orders/:id/pickup — mark order picked up / en route (assigned → in_transit)
-app.post('/courier/orders/:id/pickup', requireAuth, async (req, res) => {
+app.post('/courier/orders/:id/pickup', requireAuth, requireApprovedCourier, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
     const { id } = req.params;
@@ -5832,7 +5928,7 @@ app.post('/courier/orders/:id/pickup', requireAuth, async (req, res) => {
 const deliveryCodeAttempts = new Map();
 
 // POST /courier/orders/:id/complete { delivery_code } — verify handoff and complete
-app.post('/courier/orders/:id/complete', requireAuth, async (req, res) => {
+app.post('/courier/orders/:id/complete', requireAuth, requireApprovedCourier, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
     const { id } = req.params;
@@ -6205,9 +6301,11 @@ app.post('/orders', requireAuth, async (req, res) => {
     const { data: store, error: storeError } = await supabase
       .from('stores')
       .select(
-        'id, store_name, address_line1, city, latitude, longitude, is_active, is_open, operating_hours, merchant_id',
+        'id, store_name, address_line1, city, latitude, longitude, is_active, is_open, operating_hours, merchant_id, merchants!inner ( is_active, approval_status )',
       )
       .eq('id', store_id)
+      .eq('merchants.is_active', true)
+      .eq('merchants.approval_status', 'approved')
       .maybeSingle();
 
     if (storeError) {
@@ -6748,7 +6846,7 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
 });
 
 // GET /courier/map — stores with coordinates + active courier positions for the live map
-app.get('/courier/map', requireAuth, async (req, res) => {
+app.get('/courier/map', requireAuth, requireApprovedCourier, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
 
@@ -9700,7 +9798,7 @@ app.post('/admin/merchants/:id/reject', requireAdmin, async (req, res) => {
     return res.json({ merchant });
   } catch (error) {
     console.error('admin/merchants/:id/reject error:', error);
-    return res.status(500).json({ error: 'Failed to reject merchant', details: error.message || 'Try again later' });
+    return res.status(error.status || 500).json({ error: 'Failed to reject merchant', details: error.message || 'Try again later' });
   }
 });
 
@@ -9757,7 +9855,7 @@ app.post('/admin/couriers/:id/reject', requireAdmin, async (req, res) => {
     return res.json({ courier });
   } catch (error) {
     console.error('admin/couriers/:id/reject error:', error);
-    return res.status(500).json({ error: 'Failed to reject courier', details: error.message || 'Try again later' });
+    return res.status(error.status || 500).json({ error: 'Failed to reject courier', details: error.message || 'Try again later' });
   }
 });
 
@@ -11415,6 +11513,79 @@ async function runScheduledPromotions() {
   else if (ids.length) console.log('[Cron] Activated recurring promotions:', ids.length);
 }
 
+// Pulls any order that has sat open (preparing/ready, no courier) for 45
+// minutes without a single courier accepting it out of every courier's open
+// jobs list, and prompts the merchant to repost it. A courier who already
+// accepted and is just slow to pick up is unaffected — that's the drop
+// endpoint's territory, not this one.
+const COURIER_MATCH_TIMEOUT_MS = 45 * 60 * 1000;
+
+async function expireUnmatchedCourierJobs() {
+  if (!supabase) return;
+  try {
+    const cutoff = new Date(Date.now() - COURIER_MATCH_TIMEOUT_MS).toISOString();
+    const { data: expiring, error } = await supabase
+      .from('orders')
+      .select('id, order_number, status, store_id, stores ( merchant_id, store_name )')
+      .in('status', ['preparing', 'ready'])
+      .is('courier_id', null)
+      .is('courier_match_expired_at', null)
+      .not('courier_match_started_at', 'is', null)
+      .lte('courier_match_started_at', cutoff);
+
+    if (error) {
+      console.error('expireUnmatchedCourierJobs query error:', error);
+      return;
+    }
+    if (!expiring?.length) return;
+
+    for (const order of expiring) {
+      // Atomic per-row: skip it quietly if a courier grabbed it between the
+      // query above and this update running.
+      const { data: updated } = await supabase
+        .from('orders')
+        .update({ courier_match_expired_at: new Date().toISOString() })
+        .eq('id', order.id)
+        .is('courier_id', null)
+        .is('courier_match_expired_at', null)
+        .select('id')
+        .maybeSingle();
+      if (!updated) continue;
+
+      await supabase.from('order_status_history').insert({
+        order_id: order.id,
+        status: order.status,
+        notes: 'No courier accepted within 45 minutes — awaiting merchant repost',
+      });
+
+      const merchantId = order.stores?.merchant_id;
+      if (!merchantId) continue;
+      try {
+        const { data: merchantProfile } = await supabase
+          .from('user_profiles')
+          .select('push_token, push_role')
+          .eq('id', merchantId)
+          .maybeSingle();
+        const token = merchantProfile?.push_token;
+        if (token?.startsWith('ExponentPushToken') && merchantProfile?.push_role === 'merchant') {
+          await axios.post('https://exp.host/--/api/v2/push/send', {
+            to: token,
+            title: 'Order needs a courier',
+            body: `No courier has accepted order #${order.order_number} yet. Tap to repost it.`,
+            data: { type: 'order_courier_expired', orderId: order.id, audience: 'merchant' },
+            sound: 'default',
+          }, { headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 10000 });
+        }
+      } catch (notifyErr) {
+        console.warn('[Push] Failed to notify merchant of expired match for order', order.id, notifyErr?.message);
+      }
+    }
+    console.log('[Cron] Expired unmatched courier jobs:', expiring.length);
+  } catch (err) {
+    console.error('expireUnmatchedCourierJobs error:', err);
+  }
+}
+
 app.listen(PORT, () => {
   console.log('✅ DOT Backend API started successfully');
   console.log(`📍 Server: http://localhost:${PORT}`);
@@ -11428,4 +11599,6 @@ app.listen(PORT, () => {
   console.log(`🔒 CORS allowed origins:`, allowedOrigins);
   runScheduledPromotions();
   setInterval(runScheduledPromotions, 15 * 60 * 1000);
+  expireUnmatchedCourierJobs();
+  setInterval(expireUnmatchedCourierJobs, 3 * 60 * 1000);
 });

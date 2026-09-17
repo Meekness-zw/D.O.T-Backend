@@ -96,10 +96,16 @@ test('the documented $4.99 fee splits exactly $4.00 / $0.99', () => {
   assert.equal(computeCourierDeliveryPayoutUsd(4.99), 4.00);
 });
 
-test('subtotal split returns the merchant their base price', () => {
-  const { merchantEarnings, platformCommission } = computeSubtotalSplit(115);
-  assert.equal(merchantEarnings, 100);
-  assert.equal(platformCommission, 15);
+test('subtotal split returns the merchant their base price minus the weekly commission', () => {
+  const { merchantEarnings, platformCommission, markupAmount, weeklyCommissionAmount } =
+    computeSubtotalSplit(115);
+  // $115 subtotal = $100 base price marked up 15% ($15). DOT then also takes
+  // 5% of that $100 base price ($5) as its weekly commission — merchant nets
+  // $95, DOT's total take is $15 + $5 = $20.
+  assert.equal(markupAmount, 15);
+  assert.equal(weeklyCommissionAmount, 5);
+  assert.equal(platformCommission, 20);
+  assert.equal(merchantEarnings, 95);
 });
 
 // ── Where the money goes ────────────────────────────────────────────────────

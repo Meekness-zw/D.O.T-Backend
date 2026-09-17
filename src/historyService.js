@@ -6,6 +6,7 @@
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { getProfile, getRoles } from './userService.js';
 import { getWalletBalances } from './walletLedger.js';
+import { computeSubtotalSplit } from './orderPaymentSplit.js';
 
 const supabase = supabaseAdmin;
 
@@ -122,6 +123,8 @@ export async function getOrdersForUser(userId, options = {}) {
         updated_at,
         store_id,
         customer_id,
+        courier_id,
+        courier_match_expired_at,
         stores ( store_name ),
         order_items (
           product_id,
@@ -427,6 +430,8 @@ export async function getMerchantDashboardStats(userId) {
       totalOrders: 0,
       avgOrderValue: 0,
       openOrders: 0,
+      netEarnings: 0,
+      platformFees: 0,
       revenueByDay: buildEmptyRevenueByDay(),
       bestProducts: [],
       categoryCounts: [],
@@ -452,6 +457,8 @@ export async function getMerchantDashboardStats(userId) {
       id,
       status,
       total_amount,
+      subtotal,
+      payment_status,
       created_at,
       order_items (
         product_id,
@@ -467,6 +474,19 @@ export async function getMerchantDashboardStats(userId) {
   const orderList = orders || [];
 
   const revenueByDay = buildRevenueByDay(orderList);
+
+  // Real net earnings vs. what DOT kept (15% markup + 5% commission), for
+  // paid orders only — matches exactly what's actually in the merchant's wallet.
+  let netEarnings = 0;
+  let platformFees = 0;
+  orderList.forEach((o) => {
+    if (o.payment_status !== 'paid') return;
+    const { merchantEarnings, platformCommission } = computeSubtotalSplit(o.subtotal);
+    netEarnings += merchantEarnings;
+    platformFees += platformCommission;
+  });
+  netEarnings = money(netEarnings);
+  platformFees = money(platformFees);
 
   const soldByProductId = {};
   orderList.forEach((o) => {
@@ -538,6 +558,10 @@ export async function getMerchantDashboardStats(userId) {
     totalOrders,
     avgOrderValue,
     openOrders,
+    // Net of the 15% platform markup and 5% commission — what actually
+    // landed (or will land) in the wallet, vs. what DOT kept, for paid orders.
+    netEarnings,
+    platformFees,
     revenueByDay,
     bestProducts,
     categoryCounts: categoryCounts.length
@@ -578,10 +602,20 @@ function buildRevenueByDay(orders) {
     const created = (o.created_at || '').toString().slice(0, 10);
     const amount = Number(o.total_amount) || 0;
     const row = days.find((d) => d.date === created);
-    if (row) {
-      row.revenue += amount;
-      row.netIncome += amount * 0.7;
+    if (!row) return;
+    row.revenue += amount;
+    // Net income only exists for orders that were actually paid — an unpaid
+    // order was never credited to the merchant's wallet in the first place.
+    // Uses the real split (15% markup reversed, then the 5% platform
+    // commission taken), not a flat guess.
+    if (o.payment_status === 'paid') {
+      row.netIncome += computeSubtotalSplit(o.subtotal).merchantEarnings;
     }
   });
+  days.forEach((d) => { d.revenue = money(d.revenue); d.netIncome = money(d.netIncome); });
   return days;
+}
+
+function money(n) {
+  return Math.round((Number(n) || 0) * 100) / 100;
 }

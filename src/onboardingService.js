@@ -114,6 +114,8 @@ export async function upsertCourierProfile({
       date_of_birth: dobIso,
       city: city ? String(city).trim() : null,
       verification_status: 'pending',
+      is_verified: false,
+      is_online: false,
     },
     { onConflict: 'id' },
   );
@@ -177,7 +179,7 @@ export async function saveCourierVehicle({
 
   // Ensure courier row exists
   const { error: ensureCourierError } = await supabase.from('couriers').upsert(
-    { id: userId, verification_status: 'pending' },
+    { id: userId, verification_status: 'pending', is_verified: false, is_online: false },
     { onConflict: 'id' },
   );
   if (ensureCourierError) throw new Error(ensureCourierError.message || 'Failed to ensure courier');
@@ -256,6 +258,8 @@ export async function saveCourierDriverLicense({
       id: userId,
       drivers_license_number: String(licenseNumber).trim(),
       verification_status: 'pending',
+      is_verified: false,
+      is_online: false,
     },
     { onConflict: 'id' },
   );
@@ -580,4 +584,3 @@ export async function upsertMerchantOnboarding({
 
   return { success: true, storeId };
 }
-

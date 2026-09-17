@@ -22,10 +22,15 @@ const order = (over = {}) => ({
 
 test('a plain order splits into the documented shares', () => {
   const s = settlementForOrder(order());
-  assert.equal(s.store.amount_due, 100);       // merchant's own base price
-  assert.equal(s.store.dot_markup, 15);        // the 15% added for the customer
-  assert.equal(s.courier.amount_due, 4.00);    // $4.99 fee less DOT's 20%
-  assert.equal(s.dot.net, 15.99);
+  // $115 subtotal = $100 base price + $15 markup (15%). DOT also takes a
+  // further 5% of the $100 base price ($5) as its weekly commission, so the
+  // merchant nets $95 and DOT's product-side take is $15 + $5 = $20.
+  assert.equal(s.store.amount_due, 95);          // merchant's base price minus the 5% commission
+  assert.equal(s.store.markup_amount, 15);       // the 15% markup on its own
+  assert.equal(s.store.weekly_commission_amount, 5); // the 5% commission on its own
+  assert.equal(s.store.dot_markup, 20);          // markup + commission combined
+  assert.equal(s.courier.amount_due, 4.00);      // $4.99 fee less DOT's 20%
+  assert.equal(s.dot.net, 20.99);
   assert.equal(s.customer_paid, 119.99);
 });
 
@@ -50,7 +55,7 @@ test('a promo-subsidised order reconciles', () => {
   // fee, and the customer was charged $2 less.
   const s = settlementForOrder(order({ customer_delivery_fee: 2.99, dot_delivery_subsidy: 2 }));
   assert.equal(s.courier.amount_due, 4.00, 'a promo must not come out of the rider');
-  assert.equal(s.dot.net, 13.99, 'DOT absorbs the subsidy');
+  assert.equal(s.dot.net, 18.99, 'DOT absorbs the subsidy');
   assert.equal(s.customer_paid, 117.99);
   const r = reconcile(s);
   assert.ok(r.balanced, `distributed ${r.distributed} vs charged ${r.charged}`);

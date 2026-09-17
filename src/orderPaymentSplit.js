@@ -85,6 +85,14 @@ export function computeCourierDeliveryPayoutUsd(deliveryFee) {
  * the markup plus that 5% of what's left. `platformCommission` is always the
  * remainder (subtotal - merchantEarnings), never computed independently, so
  * the two can never drift apart by a rounding cent.
+ *
+ * Also returns `markupAmount` and `weeklyCommissionAmount` — the same total
+ * split into its two named pieces, so callers that want to show "platform
+ * commission (5%)" as its own line (rather than folded into one combined
+ * "DOT markup" figure) can. markupAmount + weeklyCommissionAmount ==
+ * platformCommission (rounding-safe: weeklyCommissionAmount is the
+ * remainder of platformCommission, not computed independently, same
+ * technique as platformCommission itself).
  */
 export function computeSubtotalSplit(subtotal) {
   const sub = Number(subtotal || 0);
@@ -93,7 +101,9 @@ export function computeSubtotalSplit(subtotal) {
   const commissionRate = getWeeklyCommissionRate();
   const merchantEarnings = Math.round(basePrice * (1 - commissionRate) * 100) / 100;
   const platformCommission = Math.round((sub - merchantEarnings) * 100) / 100;
-  return { platformCommission, merchantEarnings };
+  const markupAmount = Math.round((sub - basePrice) * 100) / 100;
+  const weeklyCommissionAmount = Math.round((platformCommission - markupAmount) * 100) / 100;
+  return { platformCommission, merchantEarnings, markupAmount, weeklyCommissionAmount };
 }
 
 /**

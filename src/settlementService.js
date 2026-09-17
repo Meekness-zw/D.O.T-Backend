@@ -43,7 +43,7 @@ export function settlementForOrder(order) {
   const subsidy = money(order.dot_delivery_subsidy);
   const tax = money(order.tax);
 
-  const { merchantEarnings, platformCommission } = computeSubtotalSplit(subtotal);
+  const { merchantEarnings, platformCommission, markupAmount, weeklyCommissionAmount } = computeSubtotalSplit(subtotal);
   const courierFeeShare = computeCourierDeliveryPayoutUsd(deliveryFee);
   const deliveryPlatformCut = money(deliveryFee - courierFeeShare);
 
@@ -79,7 +79,11 @@ export function settlementForOrder(order) {
       // The merchant's own base price. The 15% markup was added on top for
       // the customer and was never the merchant's money.
       amount_due: merchantEarnings,
+      // Combined total DOT keeps from this store's side (markup + commission).
+      // Split into its two named pieces below for anywhere that shows them separately.
       dot_markup: platformCommission,
+      markup_amount: markupAmount,
+      weekly_commission_amount: weeklyCommissionAmount,
     },
 
     courier: {
@@ -91,6 +95,8 @@ export function settlementForOrder(order) {
 
     dot: {
       product_markup: platformCommission,
+      markup_amount: markupAmount,
+      weekly_commission_amount: weeklyCommissionAmount,
       delivery_cut: deliveryPlatformCut,
       promo_subsidy: subsidy,
       net: dotNet,

@@ -7,7 +7,11 @@ import axios from 'axios';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 
 /** Send a push notification via Expo Push API. Silently ignores missing or invalid tokens. */
-async function sendExpoPush(userId, { title, body, data = {} }) {
+async function sendExpoPush(
+  userId,
+  { title, body, data = {} },
+  { ignoreActiveRole = false, ignoreCourierOnline = false } = {},
+) {
   if (!supabaseAdmin) return;
   try {
     const { data: profile } = await supabaseAdmin
@@ -17,8 +21,8 @@ async function sendExpoPush(userId, { title, body, data = {} }) {
       .maybeSingle();
     const token = profile?.push_token;
     if (!token || !token.startsWith('ExponentPushToken')) return;
-    if (data?.audience && data.audience !== 'all' && profile?.push_role !== data.audience) return;
-    if (data?.audience === 'courier') {
+    if (!ignoreActiveRole && data?.audience && data.audience !== 'all' && profile?.push_role !== data.audience) return;
+    if (!ignoreCourierOnline && data?.audience === 'courier') {
       const { data: courier } = await supabaseAdmin
         .from('couriers')
         .select('is_online')
@@ -815,72 +819,271 @@ export async function approveMerchant(merchantId) {
   return merchant;
 }
 
-// Reject a merchant
+const APPLICATION_ROLE_TABLES = {
+  customer: 'customers',
+  merchant: 'merchants',
+  courier: 'couriers',
+};
+
+const SURVIVING_ROLE_ORDER = ['customer', 'merchant', 'courier'];
+
+function applicationError(message, status = 500) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+function relationOne(value) {
+  return Array.isArray(value) ? (value[0] || null) : (value || null);
+}
+
+/**
+ * Role membership is determined by the role tables, just like getRoles().
+ * user_roles is maintained as an index/back-compatibility aid, but must not
+ * keep a rejected role alive when its actual application row has gone.
+ */
+async function getApplicationAccountState(userId) {
+  const roleResults = await Promise.all(
+    SURVIVING_ROLE_ORDER.map((role) => (
+      supabase.from(APPLICATION_ROLE_TABLES[role]).select('id').eq('id', userId).maybeSingle()
+    )),
+  );
+
+  for (let index = 0; index < roleResults.length; index += 1) {
+    const result = roleResults[index];
+    if (result.error) {
+      throw new Error(result.error.message || `Failed to check ${SURVIVING_ROLE_ORDER[index]} role`);
+    }
+  }
+
+  const [{ data: profile, error: profileError }, { data: indexedRoles, error: indexedRolesError }] = await Promise.all([
+    supabase
+      .from('user_profiles')
+      .select('id, role, push_role')
+      .eq('id', userId)
+      .maybeSingle(),
+    supabase
+      .from('user_roles')
+      .select('role')
+      .eq('user_id', userId),
+  ]);
+
+  if (profileError) throw new Error(profileError.message || 'Failed to load applicant profile');
+  if (!profile) throw applicationError('Applicant account not found', 404);
+  if (indexedRolesError) throw new Error(indexedRolesError.message || 'Failed to load applicant roles');
+
+  return {
+    profile,
+    roles: SURVIVING_ROLE_ORDER.filter((_, index) => !!roleResults[index].data),
+    indexedRoles: (indexedRoles || []).map((row) => String(row.role || '').toLowerCase()),
+  };
+}
+
+async function restoreRoleMetadata({ userId, rejectedRole, profile, profileChanged, indexedRoleRemoved }) {
+  // This is compensation for the rare case where the final cascading role
+  // delete fails after its lightweight metadata was prepared. Never mask the
+  // original database error with a rollback error.
+  try {
+    if (indexedRoleRemoved) {
+      await supabase
+        .from('user_roles')
+        .upsert({ user_id: userId, role: rejectedRole }, { onConflict: 'user_id,role' });
+    }
+    if (profileChanged) {
+      await supabase
+        .from('user_profiles')
+        .update({ role: profile.role, push_role: profile.push_role })
+        .eq('id', userId);
+    }
+  } catch (error) {
+    console.error(`[Admin] Failed to restore ${rejectedRole} role metadata for ${userId}:`, error);
+  }
+}
+
+/**
+ * Delete a rejected application without destroying a user's other roles.
+ *
+ * The actual role row is deleted last because it owns all role-specific data
+ * through ON DELETE CASCADE (stores, products, documents, vehicles, payout
+ * methods, and so on). If that atomic database statement fails, the small
+ * profile/index changes are restored so the account remains usable.
+ */
+async function deleteRejectedRoleOnly({ userId, rejectedRole, accountState }) {
+  const remainingRoles = accountState.roles.filter((role) => role !== rejectedRole);
+  const survivingRole = SURVIVING_ROLE_ORDER.find((role) => remainingRoles.includes(role));
+  if (!survivingRole) throw new Error('Cannot remove the only account role with the role-only deletion path');
+
+  const profileUpdates = {};
+  if (!remainingRoles.includes(String(accountState.profile.role || '').toLowerCase())) {
+    profileUpdates.role = survivingRole;
+  }
+  if (String(accountState.profile.push_role || '').toLowerCase() === rejectedRole) {
+    profileUpdates.push_role = survivingRole;
+  }
+
+  let profileChanged = false;
+  let indexedRoleRemoved = false;
+
+  if (Object.keys(profileUpdates).length > 0) {
+    const { error } = await supabase
+      .from('user_profiles')
+      .update(profileUpdates)
+      .eq('id', userId);
+    if (error) throw new Error(error.message || 'Failed to update the surviving account role');
+    profileChanged = true;
+  }
+
+  if (accountState.indexedRoles.includes(rejectedRole)) {
+    const { error } = await supabase
+      .from('user_roles')
+      .delete()
+      .eq('user_id', userId)
+      .eq('role', rejectedRole);
+    if (error) {
+      await restoreRoleMetadata({
+        userId,
+        rejectedRole,
+        profile: accountState.profile,
+        profileChanged,
+        indexedRoleRemoved: false,
+      });
+      throw new Error(error.message || `Failed to remove ${rejectedRole} role index`);
+    }
+    indexedRoleRemoved = true;
+  }
+
+  const { data: deletedRole, error: deleteError } = await supabase
+    .from(APPLICATION_ROLE_TABLES[rejectedRole])
+    .delete()
+    .eq('id', userId)
+    .select('id')
+    .maybeSingle();
+
+  if (deleteError || !deletedRole) {
+    await restoreRoleMetadata({
+      userId,
+      rejectedRole,
+      profile: accountState.profile,
+      profileChanged,
+      indexedRoleRemoved,
+    });
+    throw new Error(deleteError?.message || `${rejectedRole} application no longer exists`);
+  }
+
+  return remainingRoles;
+}
+
+async function deleteRejectedApplicationAccount({ userId, rejectedRole, accountState }) {
+  const remainingRoles = accountState.roles.filter((role) => role !== rejectedRole);
+  if (remainingRoles.length > 0) {
+    const roles = await deleteRejectedRoleOnly({ userId, rejectedRole, accountState });
+    return { deletionScope: 'role', remainingRoles: roles };
+  }
+
+  // deleteUser performs a hard auth deletion by default. user_profiles points
+  // to auth.users ON DELETE CASCADE, and every application-owned database row
+  // cascades from user_profiles / merchants / couriers. One database cascade
+  // therefore removes both the login and the pending request without leaving
+  // a half-deleted account that cannot re-register its phone number.
+  const { error } = await supabase.auth.admin.deleteUser(userId);
+  if (error) throw new Error(error.message || `Failed to delete rejected ${rejectedRole} account`);
+  return { deletionScope: 'account', remainingRoles: [] };
+}
+
+// Reject a merchant by removing their pending application. A merchant-only
+// signup is removed completely so the phone number can register from scratch;
+// a multi-role user keeps their other roles and history.
 export async function rejectMerchant(merchantId, reason) {
   if (!supabase) throw new Error('Server not configured');
 
   const { data: merchant, error } = await supabase
     .from('merchants')
-    .update({ approval_status: 'rejected', rejected_reason: reason || null })
-    .eq('id', merchantId)
     .select(
       `
       id,
       business_name,
       business_type,
       approval_status,
-      rejected_reason,
-      user_profiles ( full_name, email, phone )
+      user_profiles ( full_name, email, phone, role, push_role )
     `,
     )
+    .eq('id', merchantId)
     .maybeSingle();
 
-  if (error) throw new Error(error.message || 'Failed to reject merchant');
-  if (!merchant) throw new Error('Merchant not found');
+  if (error) throw new Error(error.message || 'Failed to load merchant application');
+  if (!merchant) throw applicationError('Merchant application not found', 404);
+  if (merchant.approval_status === 'approved') {
+    throw applicationError('An approved merchant cannot be rejected from the pending applications queue', 409);
+  }
+
+  const accountState = await getApplicationAccountState(merchantId);
+  const rejectionReason = String(reason || '').trim() || null;
 
   await sendExpoPush(merchantId, {
     title: 'Application Update',
-    body: reason ? `Your merchant application was not approved: ${reason}` : 'Your merchant application was not approved. Please contact support.',
-    data: { type: 'merchant_rejected', audience: 'merchant' },
+    body: rejectionReason ? `Your merchant application was not approved: ${rejectionReason}` : 'Your merchant application was not approved. You can review the requirements and apply again.',
+    data: { type: 'merchant_rejected', reason: rejectionReason, audience: 'merchant' },
+  }, { ignoreActiveRole: true });
+
+  const deletion = await deleteRejectedApplicationAccount({
+    userId: merchantId,
+    rejectedRole: 'merchant',
+    accountState,
   });
 
-  return merchant;
+  return {
+    id: merchant.id,
+    business_name: merchant.business_name,
+    business_type: merchant.business_type,
+    user_profiles: relationOne(merchant.user_profiles),
+    deleted: true,
+    deletion_scope: deletion.deletionScope,
+    remaining_roles: deletion.remainingRoles,
+    rejection_reason: rejectionReason,
+  };
 }
 
-// Reject a courier — mirrors rejectMerchant: persist the rejection + reason
-// (documents/vehicle/payout data are kept, not wiped) so the courier sees
-// exactly why they were declined and can fix and resubmit instead of the
-// app silently showing onboarding as "not started" with everything gone.
+// Reject a courier with the same account-vs-role semantics as merchants.
 export async function rejectCourier(courierId, reason) {
   if (!supabase) throw new Error('Server not configured');
 
   const { data: courier, error } = await supabase
     .from('couriers')
-    .update({ verification_status: 'rejected', rejected_reason: reason || null, is_verified: false })
+    .select('id, verification_status, user_profiles ( full_name, email, phone, role, push_role )')
     .eq('id', courierId)
-    .select('id, verification_status, rejected_reason, user_profiles ( full_name, email, phone )')
     .maybeSingle();
 
-  if (error) throw new Error(error.message || 'Failed to reject courier');
-  if (!courier) throw new Error('Courier not found');
+  if (error) throw new Error(error.message || 'Failed to load courier application');
+  if (!courier) throw applicationError('Courier application not found', 404);
+  if (courier.verification_status === 'approved') {
+    throw applicationError('An approved courier cannot be rejected from the pending applications queue', 409);
+  }
 
-  // Mark their pending documents as rejected so the re-upload UI knows which
-  // ones need fixing, instead of them staying stuck at 'pending' forever.
-  await supabase
-    .from('courier_documents')
-    .update({ status: 'rejected' })
-    .eq('courier_id', courierId)
-    .eq('status', 'pending');
+  const accountState = await getApplicationAccountState(courierId);
+  const rejectionReason = String(reason || '').trim() || null;
 
   await sendExpoPush(courierId, {
     title: 'Application Declined',
-    body: reason
-      ? `Your courier application was declined: ${reason}. Please review the requirements and try again.`
+    body: rejectionReason
+      ? `Your courier application was declined: ${rejectionReason}. Please review the requirements and try again.`
       : 'Your courier application was declined. Please review the requirements and try again.',
-    data: { type: 'courier_rejected', reason: reason || null, audience: 'courier' },
+    data: { type: 'courier_rejected', reason: rejectionReason, audience: 'courier' },
+  }, { ignoreActiveRole: true, ignoreCourierOnline: true });
+
+  const deletion = await deleteRejectedApplicationAccount({
+    userId: courierId,
+    rejectedRole: 'courier',
+    accountState,
   });
 
-  return courier;
+  return {
+    id: courier.id,
+    user_profiles: relationOne(courier.user_profiles),
+    deleted: true,
+    deletion_scope: deletion.deletionScope,
+    remaining_roles: deletion.remainingRoles,
+    rejection_reason: rejectionReason,
+  };
 }
 
 // Detailed view for a specific courier (for admin "Approve Users" modal)
