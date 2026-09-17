@@ -416,10 +416,23 @@ export async function upsertMerchantOnboarding({
     if (profileError) throw new Error(profileError.message || 'Failed to update user profile');
   }
 
+  // A client may accidentally submit a business_types.id instead of its name (this happened once via
+  // the admin dashboard's onboarding form). Normalize here so a raw id can never land in this free-text
+  // column and surface to customers as-is.
+  let resolvedBusinessType = String(businessType).trim();
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(resolvedBusinessType)) {
+    const { data: typeRow } = await supabase
+      .from('business_types')
+      .select('name')
+      .eq('id', resolvedBusinessType)
+      .maybeSingle();
+    if (typeRow?.name) resolvedBusinessType = typeRow.name;
+  }
+
   const merchantPayload = {
     id: userId,
     business_name: String(businessName).trim(),
-    business_type: String(businessType).trim(),
+    business_type: resolvedBusinessType,
     is_active: true,
   };
   if (business_registration_number !== undefined) merchantPayload.business_registration_number = business_registration_number ? String(business_registration_number).trim() : null;
@@ -493,7 +506,7 @@ export async function upsertMerchantOnboarding({
     const verified = await verifyStoreCategory({
       storeName: String(storeName).trim(),
       description: description ? String(description).trim() : '',
-      declaredType: String(businessType).trim(),
+      declaredType: resolvedBusinessType,
       categoryNames,
     });
     if (verified) {
@@ -534,7 +547,7 @@ export async function upsertMerchantOnboarding({
     console.error('merchant onboarding categories check error:', categoriesError);
   } else if (!existingCategories || existingCategories.length === 0) {
     const hint = `${String(businessName || '').trim()} ${String(storeName || '').trim()}`.trim();
-    const categoriesToInsert = getSuggestedProductCategoryNames(businessType, { businessName: hint });
+    const categoriesToInsert = getSuggestedProductCategoryNames(resolvedBusinessType, { businessName: hint });
 
     const rows = categoriesToInsert.map((name, index) => ({
       store_id: storeId,
