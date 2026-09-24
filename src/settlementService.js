@@ -10,12 +10,12 @@
  * worth, and the arithmetic can be re-checked against the money that actually
  * moved. The one thing stored is the disbursement itself.
  *
- * Deliberately NOT here: the call to a payment provider. Nothing in this
- * repository talks to Contipay — the payout_disbursements table was created
- * for it, but no code was ever written. `recordDisbursement` writes the ledger
- * and the audit row for a transfer the accountant has made; `sendDisbursement`
- * is the single seam where a provider call belongs when credentials exist.
- * Pretending money moved when it did not would be far worse than saying so.
+ * `recordDisbursement` writes the ledger and the audit row for a transfer the
+ * accountant has made. The payout rail on that row is ZB Smile Cash, with
+ * Pesepay recorded as the backup — the same order used for customer charges.
+ * `sendDisbursement` is the seam for an automated transfer. Neither Smile & Pay
+ * nor Pesepay exposes a payout API here, so that call does not pretend the
+ * money moved.
  */
 
 import { supabaseAdmin } from './supabaseAdminClient.js';
@@ -24,10 +24,27 @@ import {
   computeSubtotalSplit,
   resolveCourierPayoutDestination,
 } from './orderPaymentSplit.js';
+import { resolveCheckoutGateway } from './checkoutGateway.js';
+import { getSmilePayConfig } from './smilePayService.js';
+import { getPesepayConfig } from './pesepayConfig.js';
 
 const supabase = supabaseAdmin;
 
 const money = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
+function payoutRoute() {
+  const smile = getSmilePayConfig();
+  const pesepay = getPesepayConfig();
+  return resolveCheckoutGateway({
+    smileConfigured: smile.configured,
+    pesepayConfigured: Boolean(pesepay.integrationKey && pesepay.encryptionKey),
+  });
+}
+
+const PAYOUT_GATEWAY_LABEL = {
+  smilepay: 'ZB Smile Cash',
+  pesepay: 'Pesepay',
+};
 
 /**
  * Split one order into every party's share.
@@ -253,6 +270,7 @@ export async function recordDisbursement({ orderId, recipientType, actor, note }
     fail(409, 'No payout destination', 'This store has no default payout method on file.');
   }
 
+  const route = payoutRoute();
   const amount = recipientType === 'courier' ? s.courier.amount_due : s.store.amount_due;
   const recipientUserId = recipientType === 'courier' ? s.courier.courier_id : s.store.merchant_id;
   const short = String(orderId).slice(0, 8);
@@ -274,7 +292,14 @@ export async function recordDisbursement({ orderId, recipientType, actor, note }
     company_id: recipientType === 'courier' && dest.kind === 'company' ? dest.companyId : null,
     status: 'completed',
     completed_at: new Date().toISOString(),
-    raw_request: { recorded_by: actor || 'dashboard', note: note || null, breakdown: s[recipientType === 'courier' ? 'courier' : 'store'] },
+    raw_request: {
+      recorded_by: actor || 'dashboard',
+      note: note || null,
+      breakdown: s[recipientType === 'courier' ? 'courier' : 'store'],
+      payout_gateway: route.gateway,
+      payout_backup: route.backup,
+      using_backup: route.usingBackup,
+    },
   };
 
   const { data, error } = await supabase
@@ -289,19 +314,22 @@ export async function recordDisbursement({ orderId, recipientType, actor, note }
     }
     throw new Error(error.message || 'Failed to record disbursement');
   }
-  return { disbursement: data, settlement: s };
+  return { disbursement: data, settlement: s, payoutGateway: route.gateway, payoutBackup: route.backup };
 }
 
 /**
- * The seam a real provider call goes behind.
+ * Outbound payouts try ZB Smile Cash first, then Pesepay.
  *
- * Left unimplemented on purpose: there is no Contipay client in this repo and
- * no credentials to make one work. Wiring a stub that returned success would
- * mark money as sent that never left the account.
+ * Neither provider currently exposes a disbursement API, so this does not
+ * mark money as sent. The accountant still records a transfer they have
+ * made; that row is tagged with whichever gate is active.
  */
 export async function sendDisbursement() {
-  const e = new Error('Automated transfers are not connected');
+  const route = payoutRoute();
+  const primary = PAYOUT_GATEWAY_LABEL[route.gateway] || route.gateway;
+  const backup = PAYOUT_GATEWAY_LABEL[route.backup] || route.backup;
+  const e = new Error('Automated payouts are not connected');
   e.status = 501;
-  e.details = 'No payment provider is configured. Record the transfer here after making it, and it will be tracked and printable.';
+  e.details = `Payouts try ${primary} first and ${backup} if that gate is down. Neither provider can send the transfer from here yet, so record it after it is paid out.`;
   throw e;
 }

@@ -9,3 +9,6 @@ firebase-service-account.json
 .DS_Store
 *.log
 
+# Live checkout-gateway override written by PUT /admin/payments/gateway
+data/checkout-gateway.json
+

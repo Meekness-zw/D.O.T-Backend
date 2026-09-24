@@ -23,6 +23,18 @@ import {
   finalizeOrderPaymentFromPesepay,
 } from './paymentService.js';
 import { getPesepayConfig } from './pesepayConfig.js';
+import {
+  describeCheckoutGateway,
+  isOnlineCheckoutMethod,
+  resolveCheckoutGateway,
+  setActiveCheckoutGateway,
+} from './checkoutGateway.js';
+import {
+  applySmilePayStatus,
+  createSmilePayCheckout,
+  getSmilePayConfig,
+  reconcileSmilePayOrder,
+} from './smilePayService.js';
 import { createSupabaseAccessToken, verifyAccessToken } from './sessionToken.js';
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import {
@@ -1196,6 +1208,49 @@ app.get('/debug/pesepay', requireAdmin, (req, res) => {
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+function checkoutGatewayPayload() {
+  const smile = getSmilePayConfig();
+  const pesepay = getPesepayConfig();
+  const route = resolveCheckoutGateway({
+    smileConfigured: smile.configured,
+    pesepayConfigured: Boolean(pesepay.integrationKey && pesepay.encryptionKey),
+  });
+  const described = describeCheckoutGateway(route.gateway);
+  const configured = route.gateway === 'smilepay'
+    ? smile.configured
+    : Boolean(pesepay.integrationKey && pesepay.encryptionKey);
+  return {
+    gateway: route.gateway,
+    preferred: route.preferred,
+    backup: route.backup,
+    usingBackup: route.usingBackup,
+    label: described.label,
+    subtitle: described.subtitle,
+    configured,
+    smilePayConfigured: smile.configured,
+    smilePayEnv: smile.env,
+  };
+}
+
+// GET /admin/payments/gateway — which hosted checkout the apps are using.
+// PUT /admin/payments/gateway { gateway: "pesepay" | "smilepay" } — flip it
+// without restarting the API and without a new App Store / Play build.
+app.get('/admin/payments/gateway', requireAdmin, (req, res) => {
+  res.json(checkoutGatewayPayload());
+});
+
+app.put('/admin/payments/gateway', requireAdmin, (req, res) => {
+  try {
+    setActiveCheckoutGateway(req.body?.gateway);
+    return res.json(checkoutGatewayPayload());
+  } catch (error) {
+    return res.status(400).json({
+      error: 'Invalid checkout gateway',
+      details: error.message || 'gateway must be pesepay or smilepay',
+    });
   }
 });
 
@@ -4352,7 +4407,7 @@ app.patch('/orders/:id', requireAuth, requireApprovedMerchant, async (req, res) 
     }
     if (
       !isCancelling &&
-      order.payment_method === 'pesepay' &&
+      isOnlineCheckoutMethod(order.payment_method) &&
       !['paid', 'completed'].includes(String(order.payment_status || '').toLowerCase())
     ) {
       return res.status(400).json({
@@ -4536,7 +4591,11 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
     if (wasPaid) {
       const prevBalance = await getWalletBalance(order.customer_id, 'customer');
       const newBalance = Math.round((prevBalance + totalAmount) * 100) / 100;
-      const methodLabel = order.payment_method === 'pesepay' ? ' (paid via Pesepay)' : '';
+      const methodLabel = order.payment_method === 'pesepay'
+        ? ' (paid via Pesepay)'
+        : order.payment_method === 'smilepay'
+          ? ' (paid via Smile Cash)'
+          : '';
 
       const { error: refundError } = await supabase.from('wallet_transactions').insert({
         user_id: order.customer_id,
@@ -6273,10 +6332,10 @@ app.post('/orders', requireAuth, async (req, res) => {
       });
     }
 
-    if (payment_method !== 'pesepay' && payment_method !== 'wallet') {
+    if (payment_method !== 'wallet' && !isOnlineCheckoutMethod(payment_method)) {
       return res.status(400).json({
         error: 'Invalid payment_method',
-        details: 'payment_method must be pesepay or wallet',
+        details: 'payment_method must be pesepay, smilepay, or wallet',
       });
     }
 
@@ -6552,8 +6611,9 @@ app.post('/orders', requireAuth, async (req, res) => {
       discountRedemptionId = Array.isArray(redemption) ? redemption[0]?.id : redemption?.id;
     }
 
-    // Pesepay-only online flow: order is created awaiting payment, then the
-    // client calls /payments/pesepay/start to get the hosted checkout URL.
+    // Online checkout (Pesepay or Smile Cash) creates the order awaiting
+    // payment. The client then opens whichever hosted page the active gateway
+    // returns. Wallet orders are paid in this same request, below.
     let paymentStatus = 'pending';
     const orderStatus = 'awaiting_payment';
 
@@ -8141,6 +8201,250 @@ app.get('/payments/pesepay/status', requireAuth, async (req, res) => {
     console.error('get /payments/pesepay/status error:', error);
     return res.status(500).json({
       error: 'Failed to load payment status',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+function publicPaymentApiBase() {
+  const apiBase = String(process.env.PUBLIC_API_BASE_URL || process.env.API_BASE_URL || '').replace(/\/$/, '');
+  if (!apiBase || /localhost|127\.0\.0\.1|0\.0\.0\.0/i.test(apiBase)) return null;
+  return apiBase;
+}
+
+function paymentReturnHtml(query) {
+  const scheme = process.env.APP_PAYMENT_DEEP_LINK_SCHEME || 'dotdeliveryontime';
+  const q = new URLSearchParams(query || {});
+  const target = `${scheme}://payment-return?${q.toString()}`;
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Returning to app</title>
+<meta http-equiv="refresh" content="0;url=${target.replace(/"/g, '&quot;')}">
+<script>window.location.replace(${JSON.stringify(target)});</script></head>
+<body><p>Returning to the app…</p></body></html>`;
+}
+
+// GET /payments/gateway — the hosted checkout the installed app should open.
+// The app reads this on checkout, so flipping the admin setting changes every
+// install that includes this build. No further store upload is required.
+app.get('/payments/gateway', requireAuth, (req, res) => {
+  const payload = checkoutGatewayPayload();
+  return res.json({
+    gateway: payload.gateway,
+    preferred: payload.preferred,
+    backup: payload.backup,
+    usingBackup: payload.usingBackup,
+    label: payload.label,
+    subtitle: payload.subtitle,
+    configured: payload.configured,
+  });
+});
+
+const _smilePayReconcileTracker = new Map();
+
+// POST /payments/smilepay/start — ZB Smile & Pay hosted checkout for an order.
+app.post('/payments/smilepay/start', requireAuth, async (req, res) => {
+  try {
+    const { orderId, amount } = req.body || {};
+    if (!orderId) return res.status(400).json({ error: 'Missing orderId' });
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: 'Invalid amount', details: 'amount must be > 0' });
+    }
+    const { data: ord, error: ordErr } = await supabase
+      .from('orders')
+      .select('id, customer_id, order_number, status, payment_method, payment_status, total_amount')
+      .eq('id', orderId)
+      .maybeSingle();
+    if (ordErr || !ord) return res.status(404).json({ error: 'Order not found' });
+    if (ord.customer_id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    if (ord.payment_method !== 'smilepay' || ord.status !== 'awaiting_payment') {
+      return res.status(400).json({ error: 'Order is not awaiting Smile Cash payment' });
+    }
+    if (['paid', 'completed'].includes(String(ord.payment_status || '').toLowerCase())) {
+      return res.status(409).json({ error: 'Order already paid', alreadyPaid: true });
+    }
+    const expected = Number(ord.total_amount);
+    if (!Number.isFinite(expected) || Math.abs(expected - Number(amount)) > 0.02) {
+      return res.status(400).json({ error: 'Amount mismatch', details: 'amount must match the order total' });
+    }
+
+    const callbackBase = publicPaymentApiBase();
+    if (!callbackBase) {
+      return res.status(400).json({
+        error: 'Invalid payment callback URL',
+        details: 'Set PUBLIC_API_BASE_URL to the public HTTPS URL of this backend so Smile Cash can reach /payments/smilepay/callback.',
+      });
+    }
+
+    const profile = await getProfile(req.userId);
+    const customer = {
+      phoneNumber: profile?.phone || '',
+      email: profile?.email || '',
+      name: profile?.full_name || 'Customer',
+    };
+    const reference = `DOT-${ord.order_number || orderId.slice(0, 8)}-${Date.now()}`;
+
+    if (getSmilePayConfig().configured) {
+      try {
+        const result = await createSmilePayCheckout({
+          userId: req.userId,
+          orderId: ord.id,
+          amount: Number(amount),
+          currencyCode: 'USD',
+          orderReference: reference,
+          itemName: `DOT order ${ord.order_number || orderId}`,
+          resultUrl: `${callbackBase}/payments/smilepay/callback`,
+          returnUrl: `${callbackBase}/payments/smilepay/return?orderId=${encodeURIComponent(orderId)}`,
+          customer,
+        });
+        if (result.alreadyPaid) {
+          return res.status(409).json({ error: 'Order already paid', alreadyPaid: true });
+        }
+        return res.json({
+          gateway: 'smilepay',
+          fellBack: false,
+          paymentUrl: result.paymentUrl,
+          orderReference: result.orderReference,
+        });
+      } catch (smileError) {
+        console.warn('[SmilePay] start failed, trying Pesepay backup:', smileError?.message || smileError);
+      }
+    } else {
+      console.warn('[SmilePay] not configured, using Pesepay backup');
+    }
+
+    const pesepay = getPesepayConfig();
+    if (!pesepay.integrationKey || !pesepay.encryptionKey) {
+      return res.status(503).json({
+        error: 'No payment gateway available',
+        details: 'Smile Cash did not start and Pesepay is not configured.',
+      });
+    }
+
+    const { error: switchError } = await supabase
+      .from('orders')
+      .update({ payment_method: 'pesepay' })
+      .eq('id', ord.id)
+      .eq('customer_id', req.userId);
+    if (switchError) throw new Error(switchError.message || 'Failed to switch this order to Pesepay');
+
+    const fallback = await createPesepayTransaction({
+      userId: req.userId,
+      orderId: ord.id,
+      amount: Number(amount),
+      currencyCode: 'USD',
+      reasonForPayment: `DOT order ${ord.order_number || orderId} payment`,
+      merchantReference: reference,
+      resultUrl: `${callbackBase}/payments/pesepay/callback`,
+      returnUrl: `${callbackBase}/payments/pesepay/return?orderId=${encodeURIComponent(orderId)}`,
+      customer,
+    });
+    return res.json({
+      gateway: 'pesepay',
+      fellBack: true,
+      paymentUrl: fallback.redirectUrl,
+      referenceNumber: fallback.referenceNumber,
+      reference,
+    });
+  } catch (error) {
+    console.error('Smile Cash start error:', error);
+    const providerStatus = Number(error?.status) || 500;
+    return res.status(providerStatus >= 400 && providerStatus < 500 ? 502 : 500).json({
+      error: 'Failed to start payment',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// GET /payments/smilepay/status?orderId=... — confirm a Smile Cash order.
+app.get('/payments/smilepay/status', requireAuth, async (req, res) => {
+  try {
+    const { orderId } = req.query || {};
+    if (!orderId) return res.status(400).json({ error: 'Missing orderId' });
+
+    const { data: order, error: orderErr } = await supabase
+      .from('orders')
+      .select('id, customer_id, status, payment_method, payment_status, order_number')
+      .eq('id', orderId)
+      .maybeSingle();
+    if (orderErr || !order) return res.status(404).json({ error: 'Order not found' });
+    if (order.customer_id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+
+    const isSmilePay = String(order.payment_method || '').toLowerCase() === 'smilepay';
+    let paymentStatus = String(order.payment_status || '').toLowerCase();
+    const alreadyTerminal = ['paid', 'completed', 'failed', 'cancelled'].includes(paymentStatus);
+
+    if (isSmilePay && !alreadyTerminal && getSmilePayConfig().configured) {
+      const tracker = _smilePayReconcileTracker.get(orderId) || {};
+      const now = Date.now();
+      if (!tracker.inFlight && (!tracker.lastChecked || now - tracker.lastChecked > 8000)) {
+        _smilePayReconcileTracker.set(orderId, { inFlight: true, lastChecked: now });
+        try {
+          const reconciled = await Promise.race([
+            reconcileSmilePayOrder(orderId),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Smile Cash reconcile timeout')), 6000)),
+          ]);
+          const live = String(reconciled?.paymentStatus || '').toLowerCase();
+          const orderLive = String(reconciled?.order?.payment_status || '').toLowerCase();
+          if (live === 'completed' || orderLive === 'paid' || orderLive === 'completed') {
+            paymentStatus = 'paid';
+          } else if (live === 'failed' || orderLive === 'failed' || orderLive === 'cancelled') {
+            paymentStatus = 'failed';
+          }
+        } catch (error) {
+          console.warn(`[SmilePay] reconcile for order ${orderId}:`, error?.message || error);
+        } finally {
+          _smilePayReconcileTracker.set(orderId, { inFlight: false, lastChecked: Date.now() });
+        }
+      }
+    }
+
+    const paid = isSmilePay && ['paid', 'completed'].includes(paymentStatus);
+    const failed = isSmilePay && ['failed', 'cancelled', 'canceled'].includes(paymentStatus);
+    return res.json({
+      orderId: order.id,
+      orderNumber: order.order_number || null,
+      paymentMethod: order.payment_method,
+      paymentStatus,
+      orderStatus: order.status,
+      confirmed: paid,
+      failed,
+    });
+  } catch (error) {
+    console.error('get /payments/smilepay/status error:', error);
+    return res.status(500).json({
+      error: 'Failed to load payment status',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+// GET /payments/smilepay/return — browser redirect after the ZB hosted page.
+app.get('/payments/smilepay/return', async (req, res) => {
+  const orderId = req.query?.orderId;
+  if (orderId) {
+    try {
+      await reconcileSmilePayOrder(orderId);
+    } catch (error) {
+      console.warn(`[SmilePay] return reconcile for order ${orderId}:`, error?.message || error);
+    }
+  }
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  return res.status(200).send(paymentReturnHtml(req.query || {}));
+});
+
+// POST /payments/smilepay/callback — unsigned hint from ZB. Status is re-checked
+// with the API key before an order is marked paid.
+app.post('/payments/smilepay/callback', async (req, res) => {
+  try {
+    const orderReference = req.body?.orderReference || req.body?.reference || req.body?.order_reference;
+    if (!orderReference) {
+      return res.status(400).json({ error: 'Missing orderReference' });
+    }
+    await applySmilePayStatus(orderReference);
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error('Smile Cash callback error:', error);
+    return res.status(500).json({
+      error: 'Failed to process Smile Cash callback',
       details: error.message || 'Please try again later',
     });
   }
