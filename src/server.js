@@ -1424,6 +1424,56 @@ async function backfillStoreCategories(rows) {
   }
 }
 
+const BUSINESS_TYPE_UUID = /^[0-9a-f]{8}-[0-9a-f-]{27}$/i;
+const GENERIC_CATEGORY_WORDS = new Set(['store', 'stores', 'shop', 'shops', 'retail', 'services', 'service', 'general']);
+
+function matchBusinessType(raw, types) {
+  const value = String(raw || '').trim();
+  if (!value) return null;
+  const lower = value.toLowerCase();
+  const byId = types.find((type) => String(type.id).toLowerCase() === lower);
+  if (byId) return byId;
+  const byName = types.find((type) => String(type.name || '').toLowerCase() === lower);
+  if (byName) return byName;
+  return (
+    types.find((type) =>
+      String(type.name || '')
+        .toLowerCase()
+        .split(/[\s/,&]+/)
+        .some((word) => word.length > 3 && !GENERIC_CATEGORY_WORDS.has(word) && lower.includes(word)),
+    ) || null
+  );
+}
+
+function presentCategory(type) {
+  if (!type?.name) return null;
+  return isCartoonIcon(type.icon) ? type : { ...type, icon: fallbackCategoryImage(type.name) };
+}
+
+/** Distinct categories on the stores this caller is allowed to see. */
+function categoriesForStores(storeRows, types) {
+  const chosen = new Map();
+  for (const store of storeRows || []) {
+    const merchants = Array.isArray(store.merchants) ? store.merchants[0] : store.merchants;
+    const raw =
+      store.business_type ||
+      inferStrongStoreCategory(store.store_name, store.description) ||
+      store.category_override ||
+      merchants?.business_type ||
+      '';
+    const match = matchBusinessType(raw, types);
+    if (match) {
+      const shown = presentCategory(match);
+      if (shown) chosen.set(String(shown.id), shown);
+      continue;
+    }
+    const label = String(raw || '').trim();
+    if (!label || BUSINESS_TYPE_UUID.test(label)) continue;
+    chosen.set(label.toLowerCase(), presentCategory({ id: label, name: label, icon: null }));
+  }
+  return [...chosen.values()].sort((a, b) => String(a.name).localeCompare(String(b.name)));
+}
+
 // ─── Public Stores ───────────────────────────────────────────────────────────
 
 // Public stores listing & search (no auth required; uses public RLS policies).
@@ -1615,30 +1665,63 @@ app.get('/stores', optionalAuth, async (req, res) => {
     }
 
     // Paginate AFTER the filters above so limit/offset reflect the actually-
-    // eligible set rather than the raw unfiltered fetch.
+    // eligible set rather than the raw unfiltered fetch. Categories are taken
+    // from the full eligible set, before that page cut, so a logged-in user
+    // sees every category they can order from — not only the first page.
+    const eligibleStores = stores;
     if (needsPostFilterPagination) {
-      stores = stores.slice(offset, offset + limit);
+      stores = eligibleStores.slice(offset, offset + limit);
     }
 
     // Flatten merchants.business_type → top-level business_type, preferring the
     // AI-verified category_override (catches a merchant's wrong self-pick) so
     // customers never see a miscategorized store; remove the nested object.
-    stores = stores.map(({ merchants, category_override, ...rest }) => ({
+    const flattenListingStore = ({ merchants, category_override, ...rest }) => ({
       ...rest,
       business_type:
         inferStrongStoreCategory(rest.store_name, rest.description) ||
         category_override ||
         merchants?.business_type ||
         null,
-    }));
+    });
 
+    let categories;
+    if (String(req.query.include_categories || '') === 'true') {
+      let categorySource = needsPostFilterPagination ? eligibleStores : null;
+      if (!categorySource) {
+        const { data: wide, error: wideError } = await supabasePublic
+          .from('stores')
+          .select(
+            `
+              id,
+              store_name,
+              description,
+              category_override,
+              merchants!inner ( business_type, is_active, approval_status )
+            `,
+          )
+          .eq('is_active', true)
+          .eq('merchants.is_active', true)
+          .eq('merchants.approval_status', 'approved')
+          .limit(500);
+        if (wideError) console.warn('store categories lookup:', wideError.message);
+        categorySource = wide || eligibleStores;
+      }
+      const { data: types, error: typesError } = await supabasePublic
+        .from('business_types')
+        .select('id, name, icon');
+      if (typesError) console.warn('business types for categories:', typesError.message);
+      categories = categoriesForStores(categorySource, types || []);
+    }
+
+    stores = stores.map(flattenListingStore);
     stores = stores.map((s) => enrichStoreForCustomerListing(s));
 
     // Serve immediately; verify any not-yet-checked stores in the background
     // so a wrong merchant-picked category self-heals without a redeploy.
     backfillStoreCategories(data);
 
-    return res.json({ stores });
+    return res.json(categories ? { stores, categories } : { stores });
   } catch (error) {
     console.error('get /stores error:', error);
     return res.status(500).json({
@@ -12269,6 +12352,8 @@ app.use((err, req, res, next) => {
   });
 });
 
+registerSupportChatRoutes(app, { requireAuth, requireAdmin, supabase: supabaseAdmin });
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({
@@ -12379,8 +12464,6 @@ async function expireUnmatchedCourierJobs() {
     console.error('expireUnmatchedCourierJobs error:', err);
   }
 }
-
-registerSupportChatRoutes(app, { requireAuth, requireAdmin, supabase: supabaseAdmin });
 
 app.listen(PORT, () => {
   console.log('✅ DOT Backend API started successfully');
