@@ -196,13 +196,20 @@ export function registerSupportChatRoutes(app, { requireAuth, requireAdmin, supa
 
       if (!withAgent) {
         const history = await messagesFor(supabase, conversation.id);
-        const lastBot = [...history].reverse().find((row) => row.sender_type === 'bot');
+        const prior = history.slice(0, -1);
+        const lastBot = [...prior].reverse().find((row) => row.sender_type === 'bot');
         const offered = Boolean(
           lastBot?.body &&
-            /I do not have a specific answer|If that is not what you needed|I could not find|pass this chat to an agent/i.test(lastBot.body),
+            /pass this chat to the team|handing the chat|talk to an agent|connect you/i.test(lastBot.body),
         );
         const orders = await recentOrders(supabase, req.userId, role);
-        const reply = botReply({ text: body, role, orders, lastBotOfferedAgent: offered });
+        const reply = await botReply({
+          text: body,
+          role,
+          orders,
+          history: prior,
+          lastBotOfferedAgent: offered,
+        });
         botText = reply.text;
         const { error: botError } = await supabase.from('support_messages').insert({
           conversation_id: conversation.id,

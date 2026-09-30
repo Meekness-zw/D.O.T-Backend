@@ -1,11 +1,21 @@
 /**
  * DOT support assistant.
- * Answers from a role-aware knowledge base and the caller's recent orders.
- * Escalates when the person asks for a human, or when the bot has no answer.
+ * Answers the question that was asked, using app facts and the caller's
+ * orders. A person on the team is brought in only when the user asks for
+ * one, or the question needs an action the assistant cannot take.
  */
+import Anthropic from '@anthropic-ai/sdk';
+
+let anthropicClient = null;
+
+function getAnthropicClient() {
+  if (!process.env.ANTHROPIC_API_KEY) return null;
+  if (!anthropicClient) anthropicClient = new Anthropic();
+  return anthropicClient;
+}
 
 const ESCALATE_RE =
-  /\b(talk to|speak to|chat with|connect me|human|real person|live agent|customer service|representative|escalate|an agent|the agent|support team|someone from)\b/i;
+  /\b(talk to (an |a )?(agent|human|person|someone)|speak to (an |a )?(agent|human|person)|chat with (an |a )?(agent|human|person)|real person|live agent|customer service|representative|escalate|connect me to|support team)\b/i;
 const AFFIRM_RE = /^(yes|yeah|yep|yup|please|ok|okay|sure|connect me|do that|go ahead)\b/i;
 const ORDER_CODE_RE = /DOT-[A-Z0-9]+/i;
 
@@ -274,57 +284,131 @@ function summarizeOrders(orders, role) {
   return lines.join('\n\n');
 }
 
+const HANDOFF_TEXT =
+  'I have passed this chat to the Delivery On Time team. An admin, marketer, or accountant will reply in this same conversation. You can keep sending details while you wait.';
+
+const REPLY_SCHEMA = {
+  type: 'object',
+  properties: {
+    reply: {
+      type: 'string',
+      description: 'A direct answer to the user, in plain sentences, under 120 words.',
+    },
+    escalate: {
+      type: 'boolean',
+      description: 'True only when a human must take over. False for any question you can answer.',
+    },
+  },
+  required: ['reply', 'escalate'],
+  additionalProperties: false,
+};
+
+function factsFor(role) {
+  return ARTICLES.filter((article) => article.roles.includes(role))
+    .map((article) => article.answer)
+    .join('\n');
+}
+
+function orderFacts(orders, role) {
+  if (!orders.length) return 'No recent orders are on this account.';
+  return orders.map((order) => describeOrder(order, role)).join('\n');
+}
+
+function transcript(history) {
+  return (history || [])
+    .slice(-8)
+    .map((message) => {
+      const who = message.sender_type === 'user' ? 'User' : message.sender_type === 'agent' ? 'Team' : 'Assistant';
+      return `${who}: ${message.body}`;
+    })
+    .join('\n');
+}
+
+function localFallback({ text, role, orders }) {
+  const code = String(text).match(ORDER_CODE_RE);
+  if (code) {
+    const match = orders.find((order) => String(order.order_number || '').toLowerCase() === code[0].toLowerCase());
+    if (match) return { text: describeOrder(match, role), escalate: false };
+    return {
+      text: `I could not find ${code[0]} on this account. Check the number under Orders. If it still looks wrong, ask me to talk to an agent.`,
+      escalate: false,
+    };
+  }
+  const article = bestArticle(text, role);
+  if (article) return { text: article.answer, escalate: false };
+  if (/\b(my orders|recent orders|order status|where is my|track my)\b/i.test(text)) {
+    return { text: summarizeOrders(orders, role), escalate: false };
+  }
+  return {
+    text: 'I could not reach the assistant just now. Ask that again in a moment, or say “talk to an agent” and I will pass this chat to the team.',
+    escalate: false,
+  };
+}
+
+async function answerWithModel({ text, role, orders, history }) {
+  const client = getAnthropicClient();
+  if (!client) return null;
+
+  const response = await client.messages.create({
+    model: 'claude-opus-4-8',
+    max_tokens: 600,
+    system:
+      'You are the support assistant for Delivery On Time, a delivery app in Harare, Zimbabwe. ' +
+      `The person you are talking to is a ${role}. ` +
+      'Answer the question they actually asked. Use the facts and their orders, and reason from those facts when the question is not a saved FAQ. ' +
+      'Do not paste a script that ignores what they asked. Do not invent order numbers, balances, refunds, fees, or policies that are not in the facts. ' +
+      'If a detail is missing, say what you do know and what is missing. ' +
+      'Set escalate to true only when a person must act: they asked for an agent, a charge or refund must be changed, an order already out for delivery must be changed, or answering would require guessing about their account. ' +
+      'Leave escalate false for how-to questions, explanations, and anything you can answer from the facts. ' +
+      'When escalate is true, the reply must say you are handing the chat to the team.',
+    messages: [
+      {
+        role: 'user',
+        content:
+          `Facts about the app:\n${factsFor(role)}\n\n` +
+          `This account's recent orders:\n${orderFacts(orders, role)}\n\n` +
+          `Conversation so far:\n${transcript(history) || '(just started)'}\n\n` +
+          `Their latest message:\n${text}`,
+      },
+    ],
+    output_config: {
+      format: { type: 'json_schema', schema: REPLY_SCHEMA },
+    },
+  });
+
+  if (response.stop_reason === 'refusal') return null;
+  const textBlock = response.content.find((block) => block.type === 'text');
+  if (!textBlock?.text) return null;
+  const parsed = JSON.parse(textBlock.text);
+  const reply = String(parsed.reply || '').trim();
+  if (!reply) return null;
+  return { text: reply.slice(0, 1200), escalate: parsed.escalate === true };
+}
+
 /**
- * @returns {{ text: string, escalate: boolean, offerAgent: boolean }}
+ * @returns {Promise<{ text: string, escalate: boolean }>}
  */
-export function botReply({ text, role, orders = [], lastBotOfferedAgent = false }) {
+export async function botReply({ text, role, orders = [], history = [], lastBotOfferedAgent = false }) {
   const q = String(text || '').trim();
   const safeRole = ['customer', 'merchant', 'courier'].includes(role) ? role : 'customer';
 
   if (ESCALATE_RE.test(q) || (lastBotOfferedAgent && AFFIRM_RE.test(q))) {
-    return {
-      escalate: true,
-      offerAgent: false,
-      text: 'I have passed this chat to the Delivery On Time team. An admin, marketer, or accountant will reply in this same conversation. You can keep sending details while you wait.',
-    };
+    return { escalate: true, text: HANDOFF_TEXT };
   }
 
-  const code = q.match(ORDER_CODE_RE);
-  if (code) {
-    const wanted = code[0].toLowerCase();
-    const match = orders.find((order) => String(order.order_number || '').toLowerCase() === wanted);
-    if (match) {
-      return { escalate: false, offerAgent: false, text: describeOrder(match, safeRole) };
+  try {
+    const generated = await answerWithModel({ text: q, role: safeRole, orders, history });
+    if (generated) {
+      if (generated.escalate && !/team|agent/i.test(generated.text)) {
+        return { escalate: true, text: `${generated.text}\n\n${HANDOFF_TEXT}` };
+      }
+      return generated;
     }
-    return {
-      escalate: false,
-      offerAgent: true,
-      text: `I could not find ${code[0]} on this account. Check the number in Orders, or say “talk to an agent” and the team will look it up.`,
-    };
+  } catch (error) {
+    console.warn('support bot model error:', error?.message || error);
   }
 
-  if (/\b(my orders|recent orders|order status|where is my|track my)\b/i.test(q)) {
-    return { escalate: false, offerAgent: false, text: summarizeOrders(orders, safeRole) };
-  }
-
-  const article = bestArticle(q, safeRole);
-  if (article) {
-    return { escalate: false, offerAgent: false, text: article.answer };
-  }
-
-  if (/\b(order|delivery|payment|wallet|refund)\b/i.test(q) && orders.length) {
-    return {
-      escalate: false,
-      offerAgent: true,
-      text: `Here is the latest I can see:\n\n${summarizeOrders(orders, safeRole)}\n\nIf that is not what you needed, say “talk to an agent”.`,
-    };
-  }
-
-  return {
-    escalate: false,
-    offerAgent: true,
-    text: 'I do not have a specific answer for that. I can help with orders, payments, the wallet, deliveries, store menus, payouts, and account access. Say “talk to an agent” and I will hand this chat to the team.',
-  };
+  return localFallback({ text: q, role: safeRole, orders });
 }
 
 export function greetingFor(role) {
