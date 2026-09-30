@@ -73,6 +73,7 @@ import {
 import { supabaseAdmin as publicSupabase } from './supabaseAdminClient.js';
 import { enrichStoreForCustomerListing, assertStoreAcceptingOrders } from './storeHours.js';
 import { getMerchantHelpPayload } from './merchantHelpContent.js';
+import { registerSupportChatRoutes } from './supportChatRoutes.js';
 import {
   insertUserNotification,
   notifyCustomerMerchantOrderStatus,
@@ -1103,6 +1104,8 @@ function dashboardRoleForKey(headerKey) {
 
 function dashboardRoleCanAccess(role, method, path) {
   if (role === 'admin' || path === '/admin/session') return true;
+  // Support inbox is shared by admin, marketing, and accounting.
+  if (path.startsWith('/admin/support')) return true;
   const readOnly = method === 'GET';
   if (role === 'accountant') {
     // Accountant manages the QuickBooks connection (connect/disconnect/mappings/backfill) in
@@ -12376,6 +12379,8 @@ async function expireUnmatchedCourierJobs() {
     console.error('expireUnmatchedCourierJobs error:', err);
   }
 }
+
+registerSupportChatRoutes(app, { requireAuth, requireAdmin, supabase: supabaseAdmin });
 
 app.listen(PORT, () => {
   console.log('✅ DOT Backend API started successfully');
