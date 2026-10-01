@@ -50,19 +50,39 @@ export function twilioSmsConfigured() {
   return twilioSettings().missing.length === 0;
 }
 
-export async function sendTwilioSms({ to, body }) {
-  const { accountSid, authToken, messagingServiceSid, from } = twilioSettings();
-  if (!accountSid || !authToken || (!messagingServiceSid && !from)) {
-    const error = new Error('SMS OTP is not configured');
-    error.code = 'not_configured';
+function isFraudBlock(data) {
+  const code = Number(data?.error_code || data?.code || 0);
+  return code === 30453 || code === 30450;
+}
+
+async function addToSafeList(accountSid, authToken, phone) {
+  const params = new URLSearchParams();
+  params.set('PhoneNumber', phone);
+  try {
+    await axios.post(
+      'https://accounts.twilio.com/v1/SafeList/Numbers',
+      params.toString(),
+      {
+        auth: { username: accountSid, password: authToken },
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        timeout: 15000,
+      },
+    );
+    console.log('[Twilio] destination added to the safe list');
+  } catch (error) {
+    const code = Number(error?.response?.data?.code || 0);
+    if (code === 60411) return;
+    console.warn('[Twilio] safe list add failed:', error?.response?.data?.message || error?.message);
     throw error;
   }
+}
 
+async function createAndConfirmSms({ accountSid, authToken, to, body, messagingServiceSid, from }) {
   const params = new URLSearchParams();
   params.set('To', to);
   params.set('Body', body);
-  // Verification texts are expected. Twilio error 30453 is its fraud check
-  // blocking a real destination; skip that check for these messages.
+  // Verification texts are expected. Skip Twilio's fraud check, which was
+  // returning 30453 for real customers.
   params.set('RiskCheck', 'disable');
   if (messagingServiceSid) params.set('MessagingServiceSid', messagingServiceSid);
   else params.set('From', from);
@@ -95,6 +115,12 @@ export async function sendTwilioSms({ to, body }) {
   const status = String(current.status || '').toLowerCase();
   const errorCode = current.error_code || null;
   console.log('[Twilio] SMS status', { sid: sid || null, status: status || 'unknown', errorCode });
+  return current;
+}
+
+function rejectUndelivered(current) {
+  const status = String(current?.status || '').toLowerCase();
+  const errorCode = current?.error_code || null;
   if (status === 'failed' || status === 'undelivered' || errorCode) {
     const error = new Error(current.error_message || 'SMS was not delivered');
     error.response = {
@@ -108,6 +134,25 @@ export async function sendTwilioSms({ to, body }) {
     error.response = { status: 400, data: current };
     throw error;
   }
+}
 
+export async function sendTwilioSms({ to, body }) {
+  const { accountSid, authToken, messagingServiceSid, from } = twilioSettings();
+  if (!accountSid || !authToken || (!messagingServiceSid && !from)) {
+    const error = new Error('SMS OTP is not configured');
+    error.code = 'not_configured';
+    throw error;
+  }
+
+  const attempt = () => createAndConfirmSms({
+    accountSid, authToken, to, body, messagingServiceSid, from,
+  });
+
+  let current = await attempt();
+  if (isFraudBlock(current)) {
+    await addToSafeList(accountSid, authToken, to);
+    current = await attempt();
+  }
+  rejectUndelivered(current);
   return current;
 }
