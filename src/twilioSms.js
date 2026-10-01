@@ -61,6 +61,9 @@ export async function sendTwilioSms({ to, body }) {
   const params = new URLSearchParams();
   params.set('To', to);
   params.set('Body', body);
+  // Verification texts are expected. Twilio error 30453 is its fraud check
+  // blocking a real destination; skip that check for these messages.
+  params.set('RiskCheck', 'disable');
   if (messagingServiceSid) params.set('MessagingServiceSid', messagingServiceSid);
   else params.set('From', from);
 

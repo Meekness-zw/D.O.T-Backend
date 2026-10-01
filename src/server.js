@@ -677,6 +677,9 @@ function friendlySmsError(smsErr) {
   const data = smsErr?.response?.data || {};
   const code = Number(data.code || data.error_code || 0);
   const detail = `${data.message || ''} ${data.error_message || ''} ${smsErr?.message || ''}`;
+  if (code === 30453 || code === 30450) {
+    return 'Twilio blocked this text as suspicious. Wait a few hours and try again.';
+  }
   if (code === 21608 || /unverified/i.test(detail)) {
     return 'Twilio is on a trial account, so it only texts numbers you verify in the Twilio console. Verify this phone there, or upgrade the account.';
   }
