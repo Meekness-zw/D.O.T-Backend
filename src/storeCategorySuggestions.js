@@ -39,7 +39,7 @@ const LIQUOR_HINTS = [
   ' pub ',
 ];
 
-function looksLiquor(businessType, businessName) {
+export function looksLiquor(businessType, businessName) {
   const t = `${norm(businessType)} ${norm(businessName)}`.replace(/\s+/g, ' ');
   if (!t.trim()) return false;
   if (t.includes('liquor')) return true;

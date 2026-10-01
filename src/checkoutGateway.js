@@ -8,13 +8,13 @@ const DEFAULT_OVERRIDE_PATH = path.join(__dirname, '..', 'data', 'checkout-gatew
 export const CHECKOUT_GATEWAYS = {
   pesepay: {
     id: 'pesepay',
-    label: 'Pay with Pesepay',
-    subtitle: 'EcoCash or card via Pesepay',
+    label: 'Pay with card',
+    subtitle: 'Debit or credit card',
   },
   smilepay: {
     id: 'smilepay',
-    label: 'Pay with Smile Cash',
-    subtitle: 'Smile Cash, EcoCash, InnBucks, or card via ZB',
+    label: 'Pay with card',
+    subtitle: 'Debit or credit card',
   },
 };
 

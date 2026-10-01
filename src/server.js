@@ -29,6 +29,7 @@ import {
   resolveCheckoutGateway,
   setActiveCheckoutGateway,
 } from './checkoutGateway.js';
+import { orderRequiresIdCheck, saveCustomerIdPhoto } from './alcoholCheck.js';
 import {
   applySmilePayStatus,
   createSmilePayCheckout,
@@ -4832,6 +4833,13 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
         (await resolveCourierProfilePhotoUrl(order.courier_id)) || cp?.profile_photo || null;
     }
 
+    let requires_id_check = false;
+    try {
+      requires_id_check = await orderRequiresIdCheck(supabase, order.id);
+    } catch (idCheckError) {
+      console.error('order alcohol check error:', idCheckError);
+    }
+
     let courier_vehicle_type = null;
     if (order.courier_id) {
       const { data: vehicle } = await supabase
@@ -4852,6 +4860,7 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
         courier_vehicle_type,
         courier_phone,
         courier_profile_photo_url,
+        requires_id_check,
       },
     });
   } catch (error) {
@@ -6165,16 +6174,54 @@ app.post('/courier/orders/:id/complete', requireAuth, requireApprovedCourier, as
       });
     }
 
-    const { data: completed, error: updateError } = await supabase
+    const requiresIdCheck = await orderRequiresIdCheck(supabase, id);
+    let customerIdPhotoUrl = null;
+    if (requiresIdCheck) {
+      try {
+        customerIdPhotoUrl = await saveCustomerIdPhoto(supabase, {
+          orderId: id,
+          dataUrl: req.body?.customer_id_photo,
+        });
+      } catch (photoError) {
+        const status = photoError.status || 400;
+        return res.status(status).json({
+          error: status === 400 ? 'Customer ID required' : 'Could not save ID photo',
+          details: photoError.message || 'Photograph the customer ID before completing this delivery.',
+        });
+      }
+    }
+
+    const deliveredPatch = {
+      status: 'delivered',
+      actual_delivery_time: new Date().toISOString(),
+    };
+    if (customerIdPhotoUrl) deliveredPatch.customer_id_photo_url = customerIdPhotoUrl;
+
+    let { data: completed, error: updateError } = await supabase
       .from('orders')
-      .update({
-        status: 'delivered',
-        actual_delivery_time: new Date().toISOString(),
-      })
+      .update(deliveredPatch)
       .eq('id', id)
       .in('status', allowedBeforeDelivered)
       .select('id, order_number, status, delivery_fee, actual_delivery_time')
       .maybeSingle();
+
+    let idPhotoSavedOnOrder = Boolean(customerIdPhotoUrl);
+    if (updateError && customerIdPhotoUrl && /customer_id_photo_url/i.test(updateError.message || '')) {
+      console.warn('orders.customer_id_photo_url is missing. Run supabase_migration_alcohol_id_check.sql');
+      idPhotoSavedOnOrder = false;
+      const retry = await supabase
+        .from('orders')
+        .update({
+          status: 'delivered',
+          actual_delivery_time: deliveredPatch.actual_delivery_time,
+        })
+        .eq('id', id)
+        .in('status', allowedBeforeDelivered)
+        .select('id, order_number, status, delivery_fee, actual_delivery_time')
+        .maybeSingle();
+      completed = retry.data;
+      updateError = retry.error;
+    }
 
     if (updateError) {
       console.error('courier complete update error:', updateError);
@@ -6183,10 +6230,15 @@ app.post('/courier/orders/:id/complete', requireAuth, requireApprovedCourier, as
     if (!completed) return res.status(409).json({ error: 'Order status changed', details: 'Refresh the order and try again.' });
     deliveryCodeAttempts.delete(attemptKey);
 
+    const completionNotes = customerIdPhotoUrl
+      ? idPhotoSavedOnOrder
+        ? 'Courier completed delivery using customer handoff code. Customer ID photo collected for the alcohol age check.'
+        : `Courier completed delivery using customer handoff code. Customer ID photo: ${customerIdPhotoUrl}`
+      : 'Courier completed delivery using customer handoff code';
     const { error: historyError } = await supabase.from('order_status_history').insert({
       order_id: id,
       status: 'delivered',
-      notes: 'Courier completed delivery using customer handoff code',
+      notes: completionNotes,
       changed_by: req.userId,
     });
     if (historyError) {
