@@ -2903,7 +2903,9 @@ app.get('/merchant/help', requireAuth, async (req, res) => {
     const phone =
       envPhone && envPhone !== '+263771234567' ? envPhone : '+263788014717';
     const email =
-      envEmail && !envEmail.includes('example.com') ? envEmail : 'Contact@deliveryontime.co.zw';
+      envEmail && !envEmail.includes('example.com') && !/^contact@/i.test(envEmail)
+        ? envEmail
+        : 'support@deliveryontime.co.zw';
     return res.json({
       contact: {
         phone,
