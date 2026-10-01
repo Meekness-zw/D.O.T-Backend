@@ -116,7 +116,7 @@ import { hashPassword } from './passwordHash.js';
 import { assertStrongPassword } from './passwordPolicy.js';
 import { sendOtpEmail } from './resendClient.js';
 import { guardSms, recordSmsSent, recordSmsFailure } from './smsGuard.js';
-import { twilioSmsConfigured, sendTwilioSms } from './twilioSms.js';
+import { twilioSmsConfigured, twilioConfigStatus, sendTwilioSms } from './twilioSms.js';
 import { getWalletBalance } from './walletLedger.js';
 import { createRequireApprovedCourier } from './courierApproval.js';
 import { createRequireApprovedMerchant } from './merchantApproval.js';
@@ -973,7 +973,14 @@ app.post('/auth/forgot-password', smsRequestIpLimiter, passwordResetRequestLimit
 
     if (!twilioSmsConfigured()) {
       await recordSmsFailure({ ...smsOutcome, reason: 'service_not_configured' });
-      return res.status(503).json({ error: 'SMS service not configured' });
+      const { missing, present } = twilioConfigStatus();
+      console.error('[Twilio] reset SMS blocked. Missing:', missing.join(', ') || '(none)', 'Present keys:', present.join(', ') || '(none)');
+      return res.status(503).json({
+        error: 'SMS service not configured',
+        details: missing.length
+          ? `The live server cannot see ${missing.join(', ')}.`
+          : 'The live server cannot see the Twilio settings.',
+      });
     }
 
     try {
@@ -12535,6 +12542,12 @@ app.listen(PORT, () => {
   console.log('✅ DOT Backend API started successfully');
   console.log(`📍 Server: http://localhost:${PORT}`);
   console.log(`🌍 Environment: ${NODE_ENV}`);
+  const twilioStatus = twilioConfigStatus();
+  console.log('[ENV CHECK] Twilio SMS:', {
+    configured: twilioStatus.configured,
+    missing: twilioStatus.missing,
+    presentKeys: twilioStatus.present,
+  });
   console.log('[ENV CHECK] Pesepay vars present at startup:', {
     PAYMENT_INTEGRATION_ID:    !!process.env.PAYMENT_INTEGRATION_ID,
     PAYMENT_ENCRYPTION_KEY:    !!process.env.PAYMENT_ENCRYPTION_KEY,

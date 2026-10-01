@@ -8,16 +8,50 @@ import axios from 'axios';
  *   TWILIO_FROM_NUMBER            a Twilio number in E.164, e.g. +14155552671
  *   TWILIO_MESSAGING_SERVICE_SID  optional; used instead of TWILIO_FROM_NUMBER when set
  */
+function envValue(name) {
+  const direct = process.env[name];
+  if (direct != null && String(direct).trim()) return cleanEnv(direct);
+  const match = Object.keys(process.env).find((key) => key.trim().toUpperCase() === name);
+  if (!match) return '';
+  return cleanEnv(process.env[match]);
+}
+
+function cleanEnv(value) {
+  let text = String(value || '').trim();
+  if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+    text = text.slice(1, -1).trim();
+  }
+  return text;
+}
+
+function twilioSettings() {
+  const accountSid = envValue('TWILIO_ACCOUNT_SID');
+  const authToken = envValue('TWILIO_AUTH_TOKEN');
+  const messagingServiceSid = envValue('TWILIO_MESSAGING_SERVICE_SID');
+  const from = envValue('TWILIO_FROM_NUMBER')
+    || envValue('TWILIO_PHONE_NUMBER')
+    || envValue('TWILIO_PHONE');
+  const missing = [];
+  if (!accountSid) missing.push('TWILIO_ACCOUNT_SID');
+  if (!authToken) missing.push('TWILIO_AUTH_TOKEN');
+  if (!messagingServiceSid && !from) missing.push('TWILIO_FROM_NUMBER');
+  return { accountSid, authToken, messagingServiceSid, from, missing };
+}
+
+export function twilioConfigStatus() {
+  const { missing } = twilioSettings();
+  const present = Object.keys(process.env)
+    .map((key) => key.trim())
+    .filter((key) => /^TWILIO_/i.test(key));
+  return { configured: missing.length === 0, missing, present };
+}
+
 export function twilioSmsConfigured() {
-  const hasSender = Boolean(process.env.TWILIO_MESSAGING_SERVICE_SID || process.env.TWILIO_FROM_NUMBER);
-  return Boolean(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && hasSender);
+  return twilioSettings().missing.length === 0;
 }
 
 export async function sendTwilioSms({ to, body }) {
-  const accountSid = process.env.TWILIO_ACCOUNT_SID;
-  const authToken = process.env.TWILIO_AUTH_TOKEN;
-  const messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID;
-  const from = process.env.TWILIO_FROM_NUMBER;
+  const { accountSid, authToken, messagingServiceSid, from } = twilioSettings();
   if (!accountSid || !authToken || (!messagingServiceSid && !from)) {
     const error = new Error('SMS OTP is not configured');
     error.code = 'not_configured';
