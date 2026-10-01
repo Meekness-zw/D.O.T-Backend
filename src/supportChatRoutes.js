@@ -386,4 +386,40 @@ export function registerSupportChatRoutes(app, { requireAuth, requireAdmin, supa
       return res.status(500).json({ error: 'Failed to send reply', details: error.message });
     }
   });
+
+  app.post('/support/chat/end', requireAuth, async (req, res) => {
+    try {
+      if (!supabase) throw new Error('Server not configured');
+      const role = cleanRole(req.body?.role);
+      if (!role) return res.status(400).json({ error: 'role must be customer, merchant, or courier' });
+
+      const conversation = await openConversation(supabase, req.userId, role);
+      if (!conversation) return res.json({ ended: true });
+
+      const now = new Date().toISOString();
+      const closing = 'This chat has ended. Open the chat again whenever you need help.';
+      await supabase.from('support_messages').insert({
+        conversation_id: conversation.id,
+        sender_type: 'bot',
+        sender_role: 'bot',
+        body: closing,
+      });
+      await supabase
+        .from('support_conversations')
+        .update({
+          status: 'closed',
+          last_message_at: now,
+          last_message_preview: 'Chat ended',
+          unread_for_staff: 0,
+          unread_for_user: 0,
+          updated_at: now,
+        })
+        .eq('id', conversation.id);
+
+      return res.json({ ended: true });
+    } catch (error) {
+      console.error('POST /support/chat/end error:', error);
+      return res.status(500).json({ error: 'Failed to end chat', details: error.message });
+    }
+  });
 }

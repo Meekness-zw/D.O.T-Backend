@@ -76,6 +76,7 @@ export async function upsertCourierProfile({
   if (!nationalId || !String(nationalId).trim()) throw new Error('nationalId is required');
   if (!dateOfBirth || !String(dateOfBirth).trim()) throw new Error('dateOfBirth is required');
   if (!profilePhotoBase64) throw new Error('A profile photo is required');
+  if (!nationalIdPhotoBase64) throw new Error('A national ID or passport photo is required');
 
   // Expect date in DD/MM/YYYY from UI; convert to YYYY-MM-DD if possible
   const dobRaw = String(dateOfBirth).trim();
@@ -176,6 +177,8 @@ export async function saveCourierVehicle({
   if (!brand || !String(brand).trim()) throw new Error('vehicle brand is required');
   if (!model || !String(model).trim()) throw new Error('vehicle model is required');
   if (!licensePlate || !String(licensePlate).trim()) throw new Error('license plate is required');
+  if (!vehiclePhotoBase64) throw new Error('A vehicle photo is required');
+  if (!registrationCertificateBase64) throw new Error('A vehicle registration certificate is required');
 
   // Ensure courier row exists
   const { error: ensureCourierError } = await supabase.from('couriers').upsert(
@@ -215,6 +218,12 @@ export async function saveCourierVehicle({
     });
     uploads.vehicle_photo_url = url;
     await supabase.from('courier_vehicles').update({ vehicle_photo_url: url }).eq('id', vehicle.id);
+    await supabase.from('courier_documents').upsert({
+      courier_id: userId,
+      document_type: 'vehicle_photo',
+      document_url: url,
+      status: 'pending',
+    }, { onConflict: 'courier_id,document_type' });
   }
 
   if (registrationCertificateBase64) {

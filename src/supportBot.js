@@ -256,24 +256,6 @@ export function describeOrder(order, role) {
   return bits.join(' ');
 }
 
-function bestArticle(text, role) {
-  const hay = text.toLowerCase();
-  let best = null;
-  let bestScore = 0;
-  for (const article of ARTICLES) {
-    if (!article.roles.includes(role)) continue;
-    let score = 0;
-    for (const keyword of article.keywords) {
-      if (hay.includes(keyword)) score += keyword.includes(' ') ? 3 : 2;
-    }
-    if (score > bestScore) {
-      best = article;
-      bestScore = score;
-    }
-  }
-  return bestScore >= 2 ? best : null;
-}
-
 function summarizeOrders(orders, role) {
   if (!orders.length) {
     if (role === 'merchant') return 'I cannot see any recent orders for your store.';
@@ -287,26 +269,16 @@ function summarizeOrders(orders, role) {
 const HANDOFF_TEXT =
   'I have passed this chat to the Delivery On Time team. An admin, marketer, or accountant will reply in this same conversation. You can keep sending details while you wait.';
 
-const REPLY_SCHEMA = {
-  type: 'object',
-  properties: {
-    reply: {
-      type: 'string',
-      description: 'A direct answer to the user, in plain sentences, under 120 words.',
-    },
-    escalate: {
-      type: 'boolean',
-      description: 'True only when a human must take over. False for any question you can answer.',
-    },
-  },
-  required: ['reply', 'escalate'],
-  additionalProperties: false,
-};
-
 function factsFor(role) {
   return ARTICLES.filter((article) => article.roles.includes(role))
-    .map((article) => article.answer)
+    .map((article) => `- ${article.answer}`)
     .join('\n');
+}
+
+function isSavedAnswer(reply, role) {
+  const norm = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const text = norm(reply);
+  return ARTICLES.some((article) => article.roles.includes(role) && norm(article.answer) === text);
 }
 
 function orderFacts(orders, role) {
@@ -330,24 +302,34 @@ function localFallback({ text, role, orders }) {
     const match = orders.find((order) => String(order.order_number || '').toLowerCase() === code[0].toLowerCase());
     if (match) return { text: describeOrder(match, role), escalate: false };
     return {
-      text: `I could not find ${code[0]} on this account. Check the number under Orders. If it still looks wrong, ask me to talk to an agent.`,
+      text: `I could not find ${code[0]} on this account. Check the number under Orders.`,
       escalate: false,
     };
   }
-  const article = bestArticle(text, role);
-  if (article) return { text: article.answer, escalate: false };
-  if (/\b(my orders|recent orders|order status|where is my|track my)\b/i.test(text)) {
+  if (/\b(my orders|recent orders|order status|where is my|track my)\b/i.test(text) && orders.length) {
     return { text: summarizeOrders(orders, role), escalate: false };
   }
   return {
-    text: 'I could not reach the assistant just now. Ask that again in a moment, or say “talk to an agent” and I will pass this chat to the team.',
+    text: 'I could not answer that just now. Please ask it again in a moment.',
     escalate: false,
   };
 }
 
+function parseModelReply(raw, role) {
+  const body = String(raw || '').trim();
+  if (!body) return null;
+  const escalate = /ESCALATE:\s*yes\b/i.test(body);
+  const reply = body.replace(/\n*ESCALATE:\s*(yes|no)\s*$/i, '').trim();
+  if (!reply || isSavedAnswer(reply, role)) return null;
+  return { text: reply.slice(0, 1200), escalate };
+}
+
 async function answerWithModel({ text, role, orders, history }) {
   const client = getAnthropicClient();
-  if (!client) return null;
+  if (!client) {
+    console.warn('support bot: ANTHROPIC_API_KEY is not set');
+    return null;
+  }
 
   const response = await client.messages.create({
     model: 'claude-opus-4-8',
@@ -355,34 +337,27 @@ async function answerWithModel({ text, role, orders, history }) {
     system:
       'You are the support assistant for Delivery On Time, a delivery app in Harare, Zimbabwe. ' +
       `The person you are talking to is a ${role}. ` +
-      'Answer the question they actually asked. Use the facts and their orders, and reason from those facts when the question is not a saved FAQ. ' +
-      'Do not paste a script that ignores what they asked. Do not invent order numbers, balances, refunds, fees, or policies that are not in the facts. ' +
-      'If a detail is missing, say what you do know and what is missing. ' +
-      'Set escalate to true only when a person must act: they asked for an agent, a charge or refund must be changed, an order already out for delivery must be changed, or answering would require guessing about their account. ' +
-      'Leave escalate false for how-to questions, explanations, and anything you can answer from the facts. ' +
-      'When escalate is true, the reply must say you are handing the chat to the team.',
+      'Answer the exact question they asked, in your own words, as if you were texting them. ' +
+      'Background notes are private context. Never copy a note back as your reply, even if their question is similar. ' +
+      'Use their orders when the question is about an order. Do not invent order numbers, balances, refunds, or fees. ' +
+      'If you do not have a fact, say what you do know and what is missing. ' +
+      'Only ask for a human when they want one, or a person must change a charge, a refund, or an order already out for delivery. ' +
+      'On the last line write exactly ESCALATE: yes or ESCALATE: no.',
     messages: [
       {
         role: 'user',
         content:
-          `Facts about the app:\n${factsFor(role)}\n\n` +
+          `Background notes, not scripts:\n${factsFor(role)}\n\n` +
           `This account's recent orders:\n${orderFacts(orders, role)}\n\n` +
           `Conversation so far:\n${transcript(history) || '(just started)'}\n\n` +
-          `Their latest message:\n${text}`,
+          `Answer this message:\n${text}`,
       },
     ],
-    output_config: {
-      format: { type: 'json_schema', schema: REPLY_SCHEMA },
-    },
   });
 
   if (response.stop_reason === 'refusal') return null;
   const textBlock = response.content.find((block) => block.type === 'text');
-  if (!textBlock?.text) return null;
-  const parsed = JSON.parse(textBlock.text);
-  const reply = String(parsed.reply || '').trim();
-  if (!reply) return null;
-  return { text: reply.slice(0, 1200), escalate: parsed.escalate === true };
+  return parseModelReply(textBlock?.text, role);
 }
 
 /**

@@ -115,6 +115,7 @@ import { hashPassword } from './passwordHash.js';
 import { assertStrongPassword } from './passwordPolicy.js';
 import { sendOtpEmail } from './resendClient.js';
 import { guardSms, recordSmsSent, recordSmsFailure } from './smsGuard.js';
+import { twilioSmsConfigured, sendTwilioSms } from './twilioSms.js';
 import { getWalletBalance } from './walletLedger.js';
 import { createRequireApprovedCourier } from './courierApproval.js';
 import { createRequireApprovedMerchant } from './merchantApproval.js';
@@ -487,20 +488,20 @@ async function replaceProductOptionGroups(productId, optionGroups) {
   }
 }
 
-// Environment validation (Dexatel + Supabase for phone auth)
+// Environment validation. WhatsApp OTP uses INFOBIP_API_KEY and
+// INFOBIP_BASE_URL, checked when a code is sent so a missing key does not
+// take the rest of the API down.
 const requiredEnvVars = [
   'SUPABASE_URL',
   'SUPABASE_ANON_KEY',
   'SUPABASE_SERVICE_ROLE_KEY',
   'SUPABASE_JWT_SECRET',
-  'DEXATEL_API_KEY',
-  'DEXATEL_SENDER',
 ];
 const missingEnvVars = requiredEnvVars.filter((varName) => !process.env[varName]);
 
 if (missingEnvVars.length > 0) {
   console.error('❌ Missing required environment variables:', missingEnvVars.join(', '));
-  console.error('Copy backend/.env.example to backend/.env and fill in your Dexatel and Supabase values.');
+  console.error('Set the Supabase values in the server environment.');
   process.exit(1);
 }
 
@@ -671,16 +672,15 @@ function normalizeE164(phone) {
   return cleaned;
 }
 
-// Translate raw Dexatel errors into something a user can act on.
 function friendlySmsError(smsErr) {
   const detail = JSON.stringify(smsErr?.response?.data ?? smsErr?.message ?? '');
-  if (/invalid recipient/i.test(detail)) {
+  if (/invalid|not a valid|unverified/i.test(detail)) {
     return 'This phone number cannot receive our SMS. Double-check the number and country code.';
   }
-  if (/sender/i.test(detail)) {
+  if (/permission|geo|region|not enabled/i.test(detail)) {
     return 'SMS delivery is not yet enabled for this country. Please contact support.';
   }
-  if (/balance|credit/i.test(detail)) {
+  if (/balance|credit|authenticate/i.test(detail)) {
     return 'SMS delivery is temporarily unavailable. Please try again later.';
   }
   return 'We could not send the SMS. Please check the number and try again.';
@@ -756,31 +756,28 @@ app.post('/auth/send-otp', smsRequestIpLimiter, otpRequestLimiter, async (req, r
     }
     const smsOutcome = { ...smsRequest, reservationId: smsVerdict.reservationId };
 
-    const dexatelApiKey = process.env.DEXATEL_API_KEY;
-    const dexatelSender = process.env.DEXATEL_SENDER;
-    if (!dexatelApiKey || !dexatelSender) {
+    if (!twilioSmsConfigured()) {
       await recordSmsFailure({ ...smsOutcome, reason: 'service_not_configured' });
       return res.status(503).json({ error: 'OTP service not configured' });
     }
 
     try {
-      await axios.post(
-        'https://api.dexatel.com/v1/messages',
-        { data: { from: dexatelSender, to: [phone], text: `Your Delivery On Time verification code is: ${code}`, channel: 'sms' } },
-        { headers: { 'Content-Type': 'application/json', 'X-Dexatel-Key': dexatelApiKey }, timeout: 15000 }
-      );
+      await sendTwilioSms({
+        to: phone,
+        body: `Your Delivery On Time verification code is: ${code}`,
+      });
     } catch (smsErr) {
       await recordSmsFailure({ ...smsOutcome, reason: 'provider_failed' });
       const status = smsErr.response?.status;
       const detail = JSON.stringify(smsErr.response?.data ?? smsErr.message);
-      console.error(`Dexatel error [${status}] to ${phone}:`, detail);
+      console.error(`Twilio SMS error [${status}] to ${phone}:`, detail);
       return res.status(502).json({
         error: 'Failed to send verification code',
         details: friendlySmsError(smsErr),
       });
     }
 
-    // Do not replace a previously delivered code unless Dexatel accepted the
+    // Do not replace a previously delivered code unless Twilio accepted the
     // new message. A blocked/failed resend must leave the old code valid.
     otpStore.set(phone, { code, expiresAt, name, role, password, email, failedAttempts: 0 });
     await recordSmsSent(smsOutcome);
@@ -973,19 +970,16 @@ app.post('/auth/forgot-password', smsRequestIpLimiter, passwordResetRequestLimit
     }
     const smsOutcome = { ...smsRequest, reservationId: smsVerdict.reservationId };
 
-    const dexatelApiKey = process.env.DEXATEL_API_KEY;
-    const dexatelSender = process.env.DEXATEL_SENDER;
-    if (!dexatelApiKey || !dexatelSender) {
+    if (!twilioSmsConfigured()) {
       await recordSmsFailure({ ...smsOutcome, reason: 'service_not_configured' });
       return res.status(503).json({ error: 'SMS service not configured' });
     }
 
     try {
-      await axios.post(
-        'https://api.dexatel.com/v1/messages',
-        { data: { from: dexatelSender, to: [normalised], text: `Your Delivery On Time password reset code is: ${code}`, channel: 'sms' } },
-        { headers: { 'Content-Type': 'application/json', 'X-Dexatel-Key': dexatelApiKey }, timeout: 15000 }
-      );
+      await sendTwilioSms({
+        to: normalised,
+        body: `Your Delivery On Time password reset code is: ${code}`,
+      });
     } catch (smsErr) {
       await recordSmsFailure({ ...smsOutcome, reason: 'provider_failed' });
       const detail = JSON.stringify(smsErr.response?.data ?? smsErr.message);
@@ -7076,6 +7070,22 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
       !!courier &&
       !!courier.drivers_license_number;
 
+    const REQUIRED_COURIER_DOCUMENTS = ['profile_photo', 'national_id', 'vehicle_photo', 'vehicle_registration', 'id_drivers_license'];
+    let uploadedDocumentTypes = [];
+    if (courier) {
+      const { data: documents, error: documentsError } = await supabase
+        .from('courier_documents')
+        .select('document_type')
+        .eq('courier_id', req.userId);
+      if (documentsError) {
+        console.error('courier status documents error:', documentsError);
+        throw new Error(documentsError.message || 'Failed to load courier documents');
+      }
+      uploadedDocumentTypes = (documents || []).map((doc) => doc.document_type);
+    }
+    const missingDocuments = REQUIRED_COURIER_DOCUMENTS.filter((type) => !uploadedDocumentTypes.includes(type));
+    const hasRequiredDocuments = missingDocuments.length === 0;
+
     let hasPayoutMethod = false;
     if (courier) {
       const { data: payoutMethods, error: payoutError } = await supabase
@@ -7094,7 +7104,7 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
 
     const verificationStatus = courier?.verification_status || 'pending';
     const onboardingComplete =
-      hasProfile && hasVehicle && hasDriverLicense && hasPayoutMethod;
+      hasProfile && hasVehicle && hasDriverLicense && hasPayoutMethod && hasRequiredDocuments;
     const isApproved = verificationStatus === 'approved';
     const isRejected = verificationStatus === 'rejected';
     const rejectedReason = courier?.rejected_reason || null;
@@ -7104,6 +7114,8 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
       hasVehicle,
       hasDriverLicense,
       hasPayoutMethod,
+      hasRequiredDocuments,
+      missingDocuments,
       verificationStatus,
       onboardingComplete,
       isApproved,
