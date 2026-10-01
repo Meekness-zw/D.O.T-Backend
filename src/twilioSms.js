@@ -74,12 +74,37 @@ export async function sendTwilioSms({ to, body }) {
     },
   );
 
-  const status = String(response.data?.status || '').toLowerCase();
+  let current = response.data || {};
+  const sid = current.sid;
+  if (sid && ['queued', 'accepted', 'sending'].includes(String(current.status || '').toLowerCase())) {
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    try {
+      const followUp = await axios.get(
+        `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages/${sid}.json`,
+        { auth: { username: accountSid, password: authToken }, timeout: 10000 },
+      );
+      current = followUp.data || current;
+    } catch (followErr) {
+      console.warn('[Twilio] could not confirm SMS status:', followErr?.message);
+    }
+  }
+
+  const status = String(current.status || '').toLowerCase();
+  const errorCode = current.error_code || null;
+  console.log('[Twilio] SMS status', { sid: sid || null, status: status || 'unknown', errorCode });
+  if (status === 'failed' || status === 'undelivered' || errorCode) {
+    const error = new Error(current.error_message || 'SMS was not delivered');
+    error.response = {
+      status: 400,
+      data: { code: errorCode, message: current.error_message, status },
+    };
+    throw error;
+  }
   if (status && !['queued', 'accepted', 'sending', 'sent', 'delivered'].includes(status)) {
-    const error = new Error(response.data?.error_message || 'SMS was not accepted');
-    error.response = { status: 400, data: response.data };
+    const error = new Error(current.error_message || 'SMS was not accepted');
+    error.response = { status: 400, data: current };
     throw error;
   }
 
-  return response.data;
+  return current;
 }

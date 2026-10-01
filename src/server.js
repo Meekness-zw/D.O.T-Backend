@@ -674,8 +674,16 @@ function normalizeE164(phone) {
 }
 
 function friendlySmsError(smsErr) {
-  const detail = JSON.stringify(smsErr?.response?.data ?? smsErr?.message ?? '');
-  if (/invalid|not a valid|unverified/i.test(detail)) {
+  const data = smsErr?.response?.data || {};
+  const code = Number(data.code || data.error_code || 0);
+  const detail = `${data.message || ''} ${data.error_message || ''} ${smsErr?.message || ''}`;
+  if (code === 21608 || /unverified/i.test(detail)) {
+    return 'Twilio is on a trial account, so it only texts numbers you verify in the Twilio console. Verify this phone there, or upgrade the account.';
+  }
+  if (code === 21408 || /permission to send|geo permission/i.test(detail)) {
+    return 'Twilio is not allowed to text Zimbabwe yet. In the Twilio console, open Messaging, then Geo permissions, and turn Zimbabwe on.';
+  }
+  if (/invalid|not a valid/i.test(detail)) {
     return 'This phone number cannot receive our SMS. Double-check the number and country code.';
   }
   if (/permission|geo|region|not enabled/i.test(detail)) {
