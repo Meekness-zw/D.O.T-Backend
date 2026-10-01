@@ -50,11 +50,6 @@ export function twilioSmsConfigured() {
   return twilioSettings().missing.length === 0;
 }
 
-function isFraudBlock(data) {
-  const code = Number(data?.error_code || data?.code || 0);
-  return code === 30453 || code === 30450;
-}
-
 async function addToSafeList(accountSid, authToken, phone) {
   const params = new URLSearchParams();
   params.set('PhoneNumber', phone);
@@ -144,15 +139,10 @@ export async function sendTwilioSms({ to, body }) {
     throw error;
   }
 
-  const attempt = () => createAndConfirmSms({
+  await addToSafeList(accountSid, authToken, to);
+  const current = await createAndConfirmSms({
     accountSid, authToken, to, body, messagingServiceSid, from,
   });
-
-  let current = await attempt();
-  if (isFraudBlock(current)) {
-    await addToSafeList(accountSid, authToken, to);
-    current = await attempt();
-  }
   rejectUndelivered(current);
   return current;
 }
