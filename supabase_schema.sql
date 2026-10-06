@@ -281,7 +281,7 @@ CREATE TABLE IF NOT EXISTS merchant_documents (
   document_url TEXT NOT NULL,
   status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
   verified_at TIMESTAMP WITH TIME ZONE,
-  verified_by UUID REFERENCES user_profiles(id),
+  verified_by UUID REFERENCES user_profiles(id) ON DELETE SET NULL,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -312,7 +312,7 @@ CREATE TABLE IF NOT EXISTS courier_documents (
   document_url TEXT NOT NULL,
   status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
   verified_at TIMESTAMP WITH TIME ZONE,
-  verified_by UUID REFERENCES user_profiles(id),
+  verified_by UUID REFERENCES user_profiles(id) ON DELETE SET NULL,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -422,7 +422,7 @@ CREATE TABLE IF NOT EXISTS order_status_history (
   order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
   status TEXT NOT NULL,
   notes TEXT,
-  changed_by UUID REFERENCES user_profiles(id),
+  changed_by UUID REFERENCES user_profiles(id) ON DELETE SET NULL,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 

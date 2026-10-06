@@ -705,20 +705,29 @@ function smsRetryAfterSeconds(reason) {
 // In-memory OTP store: phone -> { code, expiresAt, name, role, password }
 const otpStore = new Map();
 
-// POST /auth/send-otp { phone, name, role, password }
-app.post('/auth/send-otp', smsRequestIpLimiter, otpRequestLimiter, async (req, res) => {
+// POST /auth/send-otp { phone, name, email, role, password }
+// Signup verification is email for now. SMS and WhatsApp stay available to
+// switch back to once those channels are reliable.
+app.post('/auth/send-otp', otpRequestLimiter, async (req, res) => {
   try {
-    const { name, role, password } = req.body;
+    const role = req.body?.role;
+    const password = req.body?.password;
+    const name = String(req.body?.name || '').trim();
     const email = String(req.body?.email || '').trim().toLowerCase();
     const phone = normalizeE164(req.body?.phone);
-    if (!phone || !role || !password || !email) {
+    if (!phone || !role || !password || !email || !name) {
       if (req.body?.phone && !phone) {
         return res.status(400).json({
           error: 'Invalid phone number',
           details: 'Enter the number with its country code, e.g. +263 77 123 4567 or +44 7911 123456.',
         });
       }
-      const missing = ['phone', 'email', 'role', 'password'].filter(f => !(f === 'email' ? email : req.body[f]));
+      const missing = ['phone', 'name', 'email', 'role', 'password'].filter((field) => {
+        if (field === 'email') return !email;
+        if (field === 'name') return !name;
+        if (field === 'phone') return !phone;
+        return !req.body?.[field];
+      });
       return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
     }
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -751,49 +760,23 @@ app.post('/auth/send-otp', smsRequestIpLimiter, otpRequestLimiter, async (req, r
     const code = String(crypto.randomInt(100000, 1000000));
     const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
 
-    // Durable spend caps. The express-rate-limit guard above keys on IP+phone
-    // and so cannot stop one address walking many numbers, which is how an SMS
-    // pumping attack runs up a bill.
-    const smsRequest = { phone, ip: clientIpForSms(req), purpose: 'signup_otp' };
-    const smsVerdict = await guardSms(smsRequest);
-    if (!smsVerdict.allowed) {
-      const status = smsVerdict.reason === 'country_not_allowed' ? 400 : 429;
-      const retryAfterSeconds = status === 429 ? smsRetryAfterSeconds(smsVerdict.reason) : undefined;
-      if (retryAfterSeconds) res.set('Retry-After', String(retryAfterSeconds));
-      return res.status(status).json({
-        error: status === 429 ? 'Too many requests' : 'Unsupported phone number',
-        details: smsVerdict.message,
-        ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
-      });
-    }
-    const smsOutcome = { ...smsRequest, reservationId: smsVerdict.reservationId };
-
-    if (!twilioSmsConfigured()) {
-      await recordSmsFailure({ ...smsOutcome, reason: 'service_not_configured' });
-      return res.status(503).json({ error: 'OTP service not configured' });
-    }
-
     try {
-      await sendTwilioSms({
-        to: phone,
-        body: `Your Delivery On Time verification code is: ${code}`,
-      });
-    } catch (smsErr) {
-      await recordSmsFailure({ ...smsOutcome, reason: 'provider_failed' });
-      const status = smsErr.response?.status;
-      const detail = JSON.stringify(smsErr.response?.data ?? smsErr.message);
-      console.error(`Twilio SMS error [${status}] to ${phone}:`, detail);
-      return res.status(502).json({
-        error: 'Failed to send verification code',
-        details: friendlySmsError(smsErr),
+      await sendOtpEmail({ to: email, code, name });
+    } catch (emailErr) {
+      console.error('send-otp email error:', emailErr.message);
+      const notConfigured = /not configured/i.test(emailErr.message || '');
+      return res.status(notConfigured ? 503 : 502).json({
+        error: notConfigured ? 'Email verification is not configured' : 'Failed to send verification code',
+        details: notConfigured
+          ? 'The email service is not set up yet. Please try again later.'
+          : 'Please try again shortly.',
       });
     }
 
-    // Do not replace a previously delivered code unless Twilio accepted the
-    // new message. A blocked/failed resend must leave the old code valid.
+    // Store the code only after the email is accepted, so a failed send
+    // leaves any earlier code still valid.
     otpStore.set(phone, { code, expiresAt, name, role, password, email, failedAttempts: 0 });
-    await recordSmsSent(smsOutcome);
-    return res.status(200).json({ success: true });
+    return res.status(200).json({ success: true, channel: 'email' });
   } catch (error) {
     console.error('send-otp error:', error.message);
     return res.status(500).json({
@@ -895,11 +878,8 @@ app.post('/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
   }
 });
 
-// POST /auth/resend-otp-email { phone } — used by the "Resend code" action on
-// the signup verification screen. The first code always goes by SMS
-// (/auth/send-otp above); resending switches to email instead, using the
-// address collected at signup. Requires a still-pending signup entry (i.e.
-// /auth/send-otp must have been called first) — this never re-sends by SMS.
+// POST /auth/resend-otp-email { phone } — another email code for a signup
+// that is still waiting to be verified. Requires /auth/send-otp first.
 app.post('/auth/resend-otp-email', otpRequestLimiter, async (req, res) => {
   try {
     const phone = normalizeE164(req.body?.phone) || req.body?.phone;
@@ -933,7 +913,7 @@ app.post('/auth/resend-otp-email', otpRequestLimiter, async (req, res) => {
       console.error('resend-otp-email error:', emailErr.message);
       return res.status(502).json({
         error: 'Failed to send verification email',
-        details: 'Please try again shortly, or use the original code sent by SMS.',
+        details: 'Please try again shortly, or use the code already sent to your email.',
       });
     }
 
@@ -951,8 +931,15 @@ app.post('/auth/resend-otp-email', otpRequestLimiter, async (req, res) => {
 // Separate OTP store for password resets (keeps signup and reset flows independent)
 const resetOtpStore = new Map();
 
+function maskEmailAddress(email) {
+  const [local, domain] = String(email || '').split('@');
+  if (!local || !domain) return 'your email';
+  return `${local.slice(0, 1)}***@${domain}`;
+}
+
 // POST /auth/forgot-password { phone }
-app.post('/auth/forgot-password', smsRequestIpLimiter, passwordResetRequestLimiter, async (req, res) => {
+// Reset codes go to the email saved on the account, same as signup verification.
+app.post('/auth/forgot-password', passwordResetRequestLimiter, async (req, res) => {
   try {
     const { phone } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone number is required' });
@@ -965,50 +952,37 @@ app.post('/auth/forgot-password', smsRequestIpLimiter, passwordResetRequestLimit
       return res.status(404).json({ error: 'No account found with this phone number.' });
     }
 
+    const { data: profile } = await supabaseAdmin
+      .from('user_profiles')
+      .select('email, full_name')
+      .eq('id', existing.userId)
+      .maybeSingle();
+    const email = String(profile?.email || '').trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({
+        error: 'No email on this account',
+        details: 'Password reset codes are sent by email. Contact support so we can add an email to this account.',
+      });
+    }
+
     const code = String(crypto.randomInt(100000, 1000000));
     const expiresAt = Date.now() + 10 * 60 * 1000;
 
-    const smsRequest = { phone: normalised, ip: clientIpForSms(req), purpose: 'password_reset' };
-    const smsVerdict = await guardSms(smsRequest);
-    if (!smsVerdict.allowed) {
-      const status = smsVerdict.reason === 'country_not_allowed' ? 400 : 429;
-      const retryAfterSeconds = status === 429 ? smsRetryAfterSeconds(smsVerdict.reason) : undefined;
-      if (retryAfterSeconds) res.set('Retry-After', String(retryAfterSeconds));
-      return res.status(status).json({
-        error: status === 429 ? 'Too many requests' : 'Unsupported phone number',
-        details: smsVerdict.message,
-        ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
-      });
-    }
-    const smsOutcome = { ...smsRequest, reservationId: smsVerdict.reservationId };
-
-    if (!twilioSmsConfigured()) {
-      await recordSmsFailure({ ...smsOutcome, reason: 'service_not_configured' });
-      const { missing, present } = twilioConfigStatus();
-      console.error('[Twilio] reset SMS blocked. Missing:', missing.join(', ') || '(none)', 'Present keys:', present.join(', ') || '(none)');
-      return res.status(503).json({
-        error: 'SMS service not configured',
-        details: missing.length
-          ? `The live server cannot see ${missing.join(', ')}.`
-          : 'The live server cannot see the Twilio settings.',
-      });
-    }
-
     try {
-      await sendTwilioSms({
-        to: normalised,
-        body: `Your Delivery On Time password reset code is: ${code}`,
+      await sendOtpEmail({ to: email, code, name: profile?.full_name || '', purpose: 'reset' });
+    } catch (emailErr) {
+      console.error('forgot-password email error:', emailErr.message);
+      const notConfigured = /not configured/i.test(emailErr.message || '');
+      return res.status(notConfigured ? 503 : 502).json({
+        error: notConfigured ? 'Email verification is not configured' : 'Failed to send reset code',
+        details: notConfigured
+          ? 'The email service is not set up yet. Please try again later.'
+          : 'Please try again shortly.',
       });
-    } catch (smsErr) {
-      await recordSmsFailure({ ...smsOutcome, reason: 'provider_failed' });
-      const detail = JSON.stringify(smsErr.response?.data ?? smsErr.message);
-      console.error('forgot-password SMS error:', detail);
-      return res.status(502).json({ error: 'Failed to send reset code', details: friendlySmsError(smsErr) });
     }
 
     resetOtpStore.set(normalised, { code, expiresAt, failedAttempts: 0 });
-    await recordSmsSent(smsOutcome);
-    return res.status(200).json({ success: true });
+    return res.status(200).json({ success: true, channel: 'email', sentTo: maskEmailAddress(email) });
   } catch (error) {
     console.error('forgot-password error:', error);
     return res.status(500).json({
