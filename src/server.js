@@ -937,32 +937,25 @@ function maskEmailAddress(email) {
   return `${local.slice(0, 1)}***@${domain}`;
 }
 
-// POST /auth/forgot-password { phone }
-// Reset codes go to the email saved on the account, same as signup verification.
+// POST /auth/forgot-password { email }
+// The person identifies the account by email, and the code is sent there.
 app.post('/auth/forgot-password', passwordResetRequestLimiter, async (req, res) => {
   try {
-    const { phone } = req.body;
-    if (!phone) return res.status(400).json({ error: 'Phone number is required' });
-
-    const normalised = normalizeE164(phone) || phone.replace(/[\s\-().]/g, '');
-
-    // Only send a code if the account actually exists
-    const existing = await checkPhoneRegistered(normalised);
-    if (!existing.registered) {
-      return res.status(404).json({ error: 'No account found with this phone number.' });
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    if (!email) return res.status(400).json({ error: 'Email address is required' });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: 'Invalid email address', details: 'Enter a valid email address, e.g. you@example.com.' });
     }
 
-    const { data: profile } = await supabaseAdmin
+    const { data: matches, error: lookupError } = await supabaseAdmin
       .from('user_profiles')
-      .select('email, full_name')
-      .eq('id', existing.userId)
-      .maybeSingle();
-    const email = String(profile?.email || '').trim().toLowerCase();
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(400).json({
-        error: 'No email on this account',
-        details: 'Password reset codes are sent by email. Contact support so we can add an email to this account.',
-      });
+      .select('id, email, full_name')
+      .ilike('email', email)
+      .limit(1);
+    if (lookupError) throw lookupError;
+    const profile = matches?.[0];
+    if (!profile) {
+      return res.status(404).json({ error: 'No account found with this email address.' });
     }
 
     const code = String(crypto.randomInt(100000, 1000000));
@@ -981,7 +974,7 @@ app.post('/auth/forgot-password', passwordResetRequestLimiter, async (req, res) 
       });
     }
 
-    resetOtpStore.set(normalised, { code, expiresAt, failedAttempts: 0 });
+    resetOtpStore.set(email, { code, expiresAt, failedAttempts: 0, verified: false, userId: profile.id });
     return res.status(200).json({ success: true, channel: 'email', sentTo: maskEmailAddress(email) });
   } catch (error) {
     console.error('forgot-password error:', error);
@@ -992,47 +985,90 @@ app.post('/auth/forgot-password', passwordResetRequestLimiter, async (req, res) 
   }
 });
 
-// POST /auth/reset-password { phone, code, newPassword }
+function readResetEntry(email) {
+  const entry = resetOtpStore.get(email);
+  if (!entry) return { error: 'No reset code found. Please request a new one.', status: 400 };
+  if (Date.now() > entry.expiresAt) {
+    resetOtpStore.delete(email);
+    return { error: 'Reset code has expired. Please request a new one.', status: 400 };
+  }
+  return { entry };
+}
+
+function rejectResetCode(email, entry) {
+  entry.failedAttempts = (entry.failedAttempts || 0) + 1;
+  if (entry.failedAttempts >= 5) {
+    resetOtpStore.delete(email);
+    return {
+      status: 429,
+      body: {
+        error: 'Too many incorrect reset codes.',
+        details: 'Request a new code and try again.',
+      },
+    };
+  }
+  return { status: 400, body: { error: 'Incorrect reset code.' } };
+}
+
+// POST /auth/verify-reset-code { email, code }
+// Confirms the emailed code before the new password is accepted.
+app.post('/auth/verify-reset-code', passwordResetVerifyLimiter, async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const code = String(req.body?.code || '').trim();
+    if (!email || !code) {
+      return res.status(400).json({ error: 'email and code are required' });
+    }
+    const lookedUp = readResetEntry(email);
+    if (lookedUp.error) return res.status(lookedUp.status).json({ error: lookedUp.error });
+    if (lookedUp.entry.code !== code) {
+      const rejected = rejectResetCode(email, lookedUp.entry);
+      return res.status(rejected.status).json(rejected.body);
+    }
+    lookedUp.entry.verified = true;
+    lookedUp.entry.failedAttempts = 0;
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    console.error('verify-reset-code error:', error);
+    return res.status(500).json({ error: 'Failed to verify reset code' });
+  }
+});
+
+// POST /auth/reset-password { email, code, newPassword }
 app.post('/auth/reset-password', passwordResetVerifyLimiter, async (req, res) => {
   try {
-    const { phone, code, newPassword } = req.body;
-    if (!phone || !code || !newPassword) {
-      return res.status(400).json({ error: 'phone, code, and newPassword are required' });
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const { code, newPassword } = req.body;
+    if (!email || !code || !newPassword) {
+      return res.status(400).json({ error: 'email, code, and newPassword are required' });
     }
     const passwordCheck = await assertStrongPassword(newPassword);
     if (!passwordCheck.valid) {
       return res.status(400).json({ error: passwordCheck.error });
     }
 
-    const normalised = normalizeE164(phone) || phone.replace(/[\s\-().]/g, '');
-
-    const entry = resetOtpStore.get(normalised);
-    if (!entry) {
-      return res.status(400).json({ error: 'No reset code found. Please request a new one.' });
-    }
-    if (Date.now() > entry.expiresAt) {
-      resetOtpStore.delete(normalised);
-      return res.status(400).json({ error: 'Reset code has expired. Please request a new one.' });
-    }
+    const lookedUp = readResetEntry(email);
+    if (lookedUp.error) return res.status(lookedUp.status).json({ error: lookedUp.error });
+    const entry = lookedUp.entry;
     if (entry.code !== String(code)) {
-      entry.failedAttempts = (entry.failedAttempts || 0) + 1;
-      if (entry.failedAttempts >= 5) {
-        resetOtpStore.delete(normalised);
-        return res.status(429).json({
-          error: 'Too many incorrect reset codes.',
-          details: 'Request a new code and try again.',
-        });
-      }
-      return res.status(400).json({ error: 'Incorrect reset code.' });
+      const rejected = rejectResetCode(email, entry);
+      return res.status(rejected.status).json(rejected.body);
+    }
+    if (!entry.verified) {
+      return res.status(400).json({ error: 'Enter the code we sent to your email before choosing a new password.' });
     }
 
-    resetOtpStore.delete(normalised);
+    resetOtpStore.delete(email);
 
-    // Fetch the user's ID from user_profiles
+    const userId = entry.userId;
+    if (!userId) {
+      return res.status(404).json({ error: 'Account not found.' });
+    }
+
     const { data: profile, error: profileError } = await supabaseAdmin
       .from('user_profiles')
       .select('id')
-      .eq('phone', normalised)
+      .eq('id', userId)
       .single();
 
     if (profileError || !profile) {
