@@ -6,6 +6,24 @@ import Anthropic from '@anthropic-ai/sdk';
 // Requires ANTHROPIC_API_KEY in the environment.
 
 let anthropicClient = null;
+let creditsPausedUntil = 0;
+
+export function anthropicCreditsPaused() {
+  return Date.now() < creditsPausedUntil;
+}
+
+function noteAnthropicError(err) {
+  const message = String(err?.message || err || '');
+  if (!/credit balance is too low|plans & billing/i.test(message)) return false;
+  const alreadyPaused = Date.now() < creditsPausedUntil;
+  creditsPausedUntil = Date.now() + 12 * 60 * 60 * 1000;
+  if (!alreadyPaused) {
+    console.warn(
+      '[CategoryVerify] Anthropic credits are exhausted. Automatic category checks are paused for 12 hours. Stores keep their current categories.',
+    );
+  }
+  return true;
+}
 
 /** Immediate corrections for unmistakable specialist stores. */
 export function inferStrongStoreCategory(storeName, description) {
@@ -66,6 +84,7 @@ const CATEGORIZATION_SCHEMA = {
 export async function categorizeStoreWithAI({ storeName, description, businessTypes }) {
   const client = getAnthropicClient();
   if (!client) throw new Error('AI categorization not configured (ANTHROPIC_API_KEY missing)');
+  if (anthropicCreditsPaused()) throw new Error('AI categorization paused: Anthropic credits are exhausted');
 
   const typeList = (businessTypes || [])
     .map((t) => `- id: "${t.id}" — ${t.name}`)
@@ -144,7 +163,7 @@ export async function verifyStoreCategory({ storeName, description, declaredType
   }
 
   const client = getAnthropicClient();
-  if (!client) return null;
+  if (!client || anthropicCreditsPaused()) return null;
   try {
     const response = await client.messages.create({
       model: 'claude-haiku-4-5-20251001',
@@ -172,7 +191,9 @@ export async function verifyStoreCategory({ storeName, description, declaredType
     const text = response.content.find((b) => b.type === 'text')?.text?.trim() || '';
     return names.find((n) => n.toLowerCase() === text.toLowerCase()) || null;
   } catch (err) {
-    console.warn('[CategoryVerify] failed for', storeName, '-', err?.message);
+    if (!noteAnthropicError(err)) {
+      console.warn('[CategoryVerify] failed for', storeName, '-', err?.message);
+    }
     return null;
   }
 }
@@ -240,7 +261,7 @@ export function fallbackCategoryImage(name) {
  */
 export async function pickCategoryImage(name) {
   const client = getAnthropicClient();
-  if (!client) return fallbackCategoryImage(name);
+  if (!client || anthropicCreditsPaused()) return fallbackCategoryImage(name);
   try {
     const keys = CATEGORY_ICON_KEYS.filter((k) => k !== 'all');
     const response = await client.messages.create({
@@ -256,7 +277,9 @@ export async function pickCategoryImage(name) {
     const key = CATEGORY_ICON_KEYS.find((k) => text === k || text.includes(k));
     return key ? 'dot:' + key : fallbackCategoryImage(name);
   } catch (err) {
-    console.warn('[CategoryImage] AI pick failed for', name, '-', err?.message);
+    if (!noteAnthropicError(err)) {
+      console.warn('[CategoryImage] AI pick failed for', name, '-', err?.message);
+    }
     return fallbackCategoryImage(name);
   }
 }
