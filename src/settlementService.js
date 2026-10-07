@@ -22,6 +22,7 @@ import { supabaseAdmin } from './supabaseAdminClient.js';
 import {
   computeCourierDeliveryPayoutUsd,
   computeSubtotalSplit,
+  courierPayoutFlags,
   resolveCourierPayoutDestination,
 } from './orderPaymentSplit.js';
 import { resolveCheckoutGateway } from './checkoutGateway.js';
@@ -130,6 +131,21 @@ export function settlementForOrder(order) {
  * overstates the distribution by exactly the discount, which is what an
  * earlier version of this function did.
  */
+/**
+ * An internal DOT rider is not paid from the order. Their delivery-fee share
+ * stays with DOT, and the breakdown still reconciles to what the customer paid.
+ */
+export function applyDotPaidCourier(settlement) {
+  const share = money(settlement.courier.amount_due);
+  settlement.courier.paid_by_dot = true;
+  settlement.courier.amount_due = 0;
+  settlement.courier.dot_delivery_cut = money((settlement.courier.dot_delivery_cut || 0) + share);
+  settlement.dot.delivery_cut = money(settlement.dot.delivery_cut + share);
+  settlement.dot.net = money(settlement.dot.net + share);
+  settlement.reconciliation = reconcile(settlement);
+  return settlement;
+}
+
 export function reconcile(s) {
   const out = money(s.store.amount_due + s.courier.amount_due + s.dot.net + s.lines.tax);
   return { balanced: Math.abs(out - s.customer_paid) < 0.02, distributed: out, charged: s.customer_paid };
@@ -165,6 +181,7 @@ export async function listSettlements({ from, to, storeId, courierId, limit = 50
 
   const orders = (data || []).map((o) => ({ ...o, store: o.stores }));
   const orderIds = orders.map((o) => o.id);
+  const payoutFlags = await courierPayoutFlags(orders.map((o) => o.courier_id));
 
   // Which of these has already been paid out, and to whom.
   const paidKeys = new Set();
@@ -179,11 +196,12 @@ export async function listSettlements({ from, to, storeId, courierId, limit = 50
 
   return orders.map((o) => {
     const s = settlementForOrder(o);
+    if (payoutFlags.get(o.courier_id) === false) applyDotPaidCourier(s);
+    else s.reconciliation = reconcile(s);
     s.paid = {
       merchant: paidKeys.has(`${o.id}:merchant`),
       courier: paidKeys.has(`${o.id}:courier`),
     };
-    s.reconciliation = reconcile(s);
     return s;
   });
 }
@@ -205,7 +223,9 @@ export async function settlementDetail(orderId) {
   }
 
   const s = settlementForOrder({ ...order, store: order.stores });
-  s.reconciliation = reconcile(s);
+  const payoutFlags = await courierPayoutFlags([order.courier_id]);
+  if (payoutFlags.get(order.courier_id) === false) applyDotPaidCourier(s);
+  else s.reconciliation = reconcile(s);
 
   const { data: items } = await supabase
     .from('order_items')
@@ -250,6 +270,9 @@ export async function recordDisbursement({ orderId, recipientType, actor, note }
 
   if (recipientType === 'courier') {
     if (!s.courier.courier_id) fail(400, 'No courier on this order');
+    if (s.courier.paid_by_dot) {
+      fail(409, 'Paid by DOT', 'This rider is on the DOT payroll, so this job is not paid out.');
+    }
     if (s.courier.amount_due <= 0) fail(400, 'Nothing owed to the courier');
   } else if (!s.store.merchant_id) {
     fail(400, 'No merchant on this order');
@@ -259,6 +282,9 @@ export async function recordDisbursement({ orderId, recipientType, actor, note }
 
   const dest = recipientType === 'courier' ? s.destinations.courier : s.destinations.merchant;
   if (recipientType === 'courier') {
+    if (dest?.kind === 'internal') {
+      fail(409, 'Paid by DOT', 'This rider is on the DOT payroll, so this job is not paid out.');
+    }
     if (!dest || dest.kind === 'blocked') {
       fail(409, 'No payout destination', {
         no_payout_method: 'This courier has no default payout method on file.',

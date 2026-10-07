@@ -264,6 +264,8 @@ CREATE TABLE IF NOT EXISTS couriers (
   drivers_license_expiry DATE,
   is_online BOOLEAN DEFAULT FALSE,
   is_verified BOOLEAN DEFAULT FALSE,
+  -- FALSE for internal DOT riders. They are paid by DOT, not per job.
+  payouts_enabled BOOLEAN NOT NULL DEFAULT TRUE,
   verification_status TEXT DEFAULT 'pending' CHECK (verification_status IN ('pending', 'approved', 'rejected')),
   rating DECIMAL(3, 2) DEFAULT 0.00,
   total_deliveries INTEGER DEFAULT 0,

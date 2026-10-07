@@ -12,7 +12,8 @@
 
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { getWalletBalance } from './walletLedger.js';
-import { settlementForOrder, reconcile } from './settlementService.js';
+import { settlementForOrder, reconcile, applyDotPaidCourier } from './settlementService.js';
+import { courierPayoutFlags } from './orderPaymentSplit.js';
 
 const supabase = supabaseAdmin;
 const money = (n) => Math.round((Number(n) || 0) * 100) / 100;
@@ -159,6 +160,8 @@ export async function getCourierOversight(courierId, { period = 'daily', from, t
     .maybeSingle();
   if (cErr) throw new Error(cErr.message || 'Failed to load courier');
   if (!courier) { const e = new Error('Courier not found'); e.status = 404; throw e; }
+  const payoutFlags = await courierPayoutFlags([courierId]);
+  if (payoutFlags.has(courierId)) courier.payouts_enabled = payoutFlags.get(courierId);
 
   const [{ data: company }, { data: vehicles }, { data: payoutMethods }, balance] = await Promise.all([
     courier.company_id
@@ -187,8 +190,11 @@ export async function getCourierOversight(courierId, { period = 'daily', from, t
     : { data: [] };
   const storeById = new Map((storeRows || []).map((s) => [s.id, s]));
 
-  const settlements = (orders || []).map((o) =>
-    settlementForOrder({ ...o, store: storeById.get(o.store_id) || null }));
+  const settlements = (orders || []).map((o) => {
+    const settlement = settlementForOrder({ ...o, store: storeById.get(o.store_id) || null });
+    if (courier.payouts_enabled === false) applyDotPaidCourier(settlement);
+    return settlement;
+  });
   const delivered = settlements.filter((s) => s.status === 'delivered');
 
   // Routes the courier actually runs. Keyed on pickup → drop-off suburb
@@ -223,7 +229,7 @@ export async function getCourierOversight(courierId, { period = 'daily', from, t
     payout_methods: payoutMethods || [],
     // Where money for this courier actually goes, so the dashboard does not
     // have to re-derive the company rule and get it subtly different.
-    pays_to: company ? 'company' : 'courier',
+    pays_to: courier.payouts_enabled === false ? 'dot' : (company ? 'company' : 'courier'),
     balance: money(balance),
     period,
     earnings: summarise(delivered, period, (s) => s.courier.amount_due),
@@ -388,6 +394,9 @@ export async function getOrderDetail(orderId) {
   }
 
   const settlement = settlementForOrder({ ...order, store: order.stores });
+  const payoutFlags = await courierPayoutFlags([order.courier_id]);
+  const paidByDot = payoutFlags.get(order.courier_id) === false;
+  if (paidByDot) applyDotPaidCourier(settlement);
 
   // Line totals are recomputed from price × quantity and compared with the
   // stored subtotal. A mismatch means the row was written wrong or a price
@@ -430,7 +439,7 @@ export async function getOrderDetail(orderId) {
           company,
           // Where money for this delivery goes, said plainly so the
           // accountant does not have to re-derive the company rule.
-          pays_to: company ? 'company' : 'courier',
+          pays_to: paidByDot ? 'dot' : (company ? 'company' : 'courier'),
           last_position: order.courier_latitude != null
             ? {
                 lat: Number(order.courier_latitude),

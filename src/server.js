@@ -88,7 +88,9 @@ import {
   computeCourierDeliveryPayoutUsd,
   getOtdPlatformServiceChargeUsd,
   applyPlatformMarkup,
+  courierPayoutsEnabled,
 } from './orderPaymentSplit.js';
+import { createInternalCourier } from './internalCourierService.js';
 import {
   listSettlements,
   settlementDetail,
@@ -108,6 +110,7 @@ import {
   isCartoonIcon,
   verifyStoreCategory,
   inferStrongStoreCategory,
+  anthropicCreditsPaused,
 } from './storeCategorizationAI.js';
 import crypto from 'crypto';
 import { isIP } from 'node:net';
@@ -1167,6 +1170,7 @@ function dashboardRoleCanAccess(role, method, path) {
     // acceptance lives on /orders/:id and /merchant/orders/*, both gated by
     // the merchant's own session token, never reachable via requireAdmin).
     if (method === 'POST' && /^\/admin\/merchants\/[^/]+\/onboarding$/.test(path)) return true;
+    if (method === 'POST' && path === '/admin/couriers/internal') return true;
     if (method === 'PATCH' && /^\/admin\/stores\/[^/]+$/.test(path)) return true;
     if (method === 'POST' && /^\/admin\/stores\/[^/]+\/upload-(logo|banner)$/.test(path)) return true;
     if (/^\/admin\/stores\/[^/]+\/promotions(\/upload-image)?$/.test(path)) return true;
@@ -1419,16 +1423,19 @@ app.post('/business-types/suggest', requireAuth, async (req, res) => {
 // as the business_types icon backfill above).
 let storeCategoryBackfillRunning = false;
 async function backfillStoreCategories(rows) {
-  if (storeCategoryBackfillRunning) return;
-  // Re-check existing overrides too. Earlier versions cached the first answer
-  // forever, which meant a bad Grocery assignment could never self-heal.
-  const candidates = (rows || []).slice(0, 25);
+  if (storeCategoryBackfillRunning || anthropicCreditsPaused()) return;
+  // Only stores that have never been verified. A saved category_override is
+  // kept, so opening the store list does not call Anthropic again.
+  const candidates = (rows || [])
+    .filter((row) => !String(row.category_override || '').trim())
+    .slice(0, 25);
   if (candidates.length === 0) return;
   storeCategoryBackfillRunning = true;
   try {
     const { data: types } = await supabase.from('business_types').select('name');
     const categoryNames = (types || []).map((t) => t.name);
     for (const row of candidates) {
+      if (anthropicCreditsPaused()) break;
       const verified = await verifyStoreCategory({
         storeName: row.store_name,
         description: row.description || '',
@@ -1915,6 +1922,12 @@ app.post('/couriers/onboarding/driver-license', requireAuth, async (req, res) =>
 // POST /couriers/onboarding/payout-method
 app.post('/couriers/onboarding/payout-method', requireAuth, async (req, res) => {
   try {
+    if (!(await courierPayoutsEnabled(req.userId))) {
+      return res.status(403).json({
+        error: 'Payouts are off for this account',
+        details: 'DOT pays this rider directly, so a payout account is not used.',
+      });
+    }
     const { methodType, provider, providerCode, accountNumber, accountName, detectionMethod, secondary } = req.body || {};
     const data = await saveCourierPayoutMethod({
       userId: req.userId,
@@ -2020,6 +2033,10 @@ app.get('/courier/payout-method', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
 
+    if (!(await courierPayoutsEnabled(req.userId))) {
+      return res.json({ payoutsEnabled: false, payoutMethod: null });
+    }
+
     const { data, error } = await supabase
       .from('courier_payout_methods')
       .select('id, method_type, provider, account_number, account_name, is_default')
@@ -2034,7 +2051,7 @@ app.get('/courier/payout-method', requireAuth, async (req, res) => {
       throw new Error(error.message || 'Failed to load payout method');
     }
 
-    return res.json({ payoutMethod: data || null });
+    return res.json({ payoutsEnabled: true, payoutMethod: data || null });
   } catch (error) {
     console.error('get /courier/payout-method error:', error);
     return res.status(500).json({
@@ -7152,6 +7169,8 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
       !!courier &&
       !!courier.drivers_license_number;
 
+    const payoutsEnabled = await courierPayoutsEnabled(req.userId);
+
     const REQUIRED_COURIER_DOCUMENTS = ['profile_photo', 'national_id', 'vehicle_photo', 'vehicle_registration', 'id_drivers_license'];
     let uploadedDocumentTypes = [];
     if (courier) {
@@ -7168,8 +7187,8 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
     const missingDocuments = REQUIRED_COURIER_DOCUMENTS.filter((type) => !uploadedDocumentTypes.includes(type));
     const hasRequiredDocuments = missingDocuments.length === 0;
 
-    let hasPayoutMethod = false;
-    if (courier) {
+    let hasPayoutMethod = !payoutsEnabled ? true : false;
+    if (courier && payoutsEnabled) {
       const { data: payoutMethods, error: payoutError } = await supabase
         .from('courier_payout_methods')
         .select('id')
@@ -7196,6 +7215,7 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
       hasVehicle,
       hasDriverLicense,
       hasPayoutMethod,
+      payoutsEnabled,
       hasRequiredDocuments,
       missingDocuments,
       verificationStatus,
@@ -7492,6 +7512,12 @@ app.post('/wallet/withdraw', requireAuth, async (req, res) => {
     const amt = Math.round(Number(amount) * 100) / 100;
     if (!Number.isFinite(amt) || amt <= 0) {
       return res.status(400).json({ error: 'Invalid amount', details: 'amount must be > 0' });
+    }
+    if (requestedRole === 'courier' && !(await courierPayoutsEnabled(req.userId))) {
+      return res.status(403).json({
+        error: 'Payouts are off',
+        details: 'DOT pays this rider directly. Job earnings are not withdrawn from the app.',
+      });
     }
 
     const { data: pendingExisting } = await supabase
@@ -9571,6 +9597,21 @@ app.patch('/admin/merchants/:id', requireAdmin, async (req, res) => {
   } catch (error) {
     console.error('PATCH admin/merchants error:', error);
     return res.status(500).json({ error: error.message || 'Failed to update merchant' });
+  }
+});
+
+// POST /admin/couriers/internal — DOT staff create a rider account themselves.
+// The rider logs in with the phone and password given here. Job payouts stay
+// off because DOT pays them, not each delivery.
+app.post('/admin/couriers/internal', requireAdmin, async (req, res) => {
+  try {
+    const courier = await createInternalCourier(req.body || {});
+    return res.status(201).json({ courier });
+  } catch (error) {
+    console.error('admin/couriers/internal error:', error);
+    return res.status(error.status || 500).json({
+      error: error.message || 'Failed to create internal rider',
+    });
   }
 });
 

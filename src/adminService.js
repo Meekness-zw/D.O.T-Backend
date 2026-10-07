@@ -5,6 +5,7 @@
 
 import axios from 'axios';
 import { supabaseAdmin } from './supabaseAdminClient.js';
+import { courierPayoutFlags } from './orderPaymentSplit.js';
 
 /** Send a push notification via Expo Push API. Silently ignores missing or invalid tokens. */
 async function sendExpoPush(
@@ -582,7 +583,12 @@ export async function getAdminCouriers(options = {}) {
     .range(offset, offset + limit - 1);
 
   if (error) throw new Error(error.message || 'Failed to fetch couriers');
-  return { couriers: data || [], total: count ?? 0 };
+  const flags = await courierPayoutFlags((data || []).map((courier) => courier.id));
+  const couriers = (data || []).map((courier) => ({
+    ...courier,
+    payouts_enabled: flags.has(courier.id) ? flags.get(courier.id) : true,
+  }));
+  return { couriers, total: count ?? 0 };
 }
 
 export async function getAdminPendingDocuments(options = {}) {

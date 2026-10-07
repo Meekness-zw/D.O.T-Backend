@@ -156,8 +156,41 @@ export async function recordMerchantEarningsForOrderPayment({
 }
 
 /**
+ * Whether this courier is paid per job.
+ *
+ * An empty result means the column is not on this database yet, and callers
+ * must keep the existing per-job behavior. `false` means an internal DOT rider.
+ */
+export async function courierPayoutFlags(courierIds) {
+  const ids = [...new Set((courierIds || []).filter(Boolean))];
+  const flags = new Map();
+  if (!supabase || ids.length === 0) return flags;
+
+  const { data, error } = await supabase
+    .from('couriers')
+    .select('id, payouts_enabled')
+    .in('id', ids);
+
+  if (error) {
+    if (!/payouts_enabled/i.test(error.message || '')) {
+      console.error('[orderPaymentSplit] payouts_enabled lookup failed:', error.message);
+    }
+    return flags;
+  }
+
+  for (const row of data || []) flags.set(row.id, row.payouts_enabled !== false);
+  return flags;
+}
+
+export async function courierPayoutsEnabled(courierId) {
+  const flags = await courierPayoutFlags([courierId]);
+  return flags.get(courierId) !== false;
+}
+
+/**
  * Credit courier when an order is marked delivered — amount is computed (see computeCourierDeliveryPayoutUsd).
  * Idempotent per order (reference_id = order id). Updates wallet_transactions + couriers.account_balance.
+ * Internal DOT riders get a delivery count only; the fee stays with DOT.
  */
 export async function recordCourierDeliveryEarnings({ courierId, orderId, amount, orderNumber }) {
   if (!supabase || !courierId || !orderId || amount == null) return null;
@@ -177,6 +210,37 @@ export async function recordCourierDeliveryEarnings({ courierId, orderId, amount
 
   if (existing?.id) {
     return { skipped: true, reason: 'already_recorded' };
+  }
+
+  if (!(await courierPayoutsEnabled(courierId))) {
+    const { data: courierRow } = await supabase
+      .from('couriers')
+      .select('total_deliveries, account_balance')
+      .eq('id', courierId)
+      .maybeSingle();
+    const balance = Math.round(Number(courierRow?.account_balance || 0) * 100) / 100;
+    const { error: markerError } = await supabase.from('wallet_transactions').insert({
+      user_id: courierId,
+      user_type: 'courier',
+      transaction_type: 'earnings',
+      amount: 0,
+      balance_after: balance,
+      description: `DOT payroll — no job payout for order ${orderNumber || String(orderId).slice(0, 8)}`,
+      reference_id: orderId,
+      status: 'completed',
+    });
+    if (markerError) {
+      console.error('[orderPaymentSplit] internal rider earnings marker error:', markerError);
+      return null;
+    }
+    const { error: deliveryCountError } = await supabase
+      .from('couriers')
+      .update({ total_deliveries: (courierRow?.total_deliveries || 0) + 1 })
+      .eq('id', courierId);
+    if (deliveryCountError) {
+      console.error('[orderPaymentSplit] internal rider delivery count error:', deliveryCountError);
+    }
+    return { skipped: true, reason: 'paid_by_dot' };
   }
 
   const prevBalance = await getWalletBalance(courierId, 'courier');
@@ -242,6 +306,10 @@ export async function recordCourierDeliveryEarnings({ courierId, orderId, amount
  */
 export async function resolveCourierPayoutDestination(courierId) {
   if (!supabase || !courierId) return null;
+
+  if (!(await courierPayoutsEnabled(courierId))) {
+    return { kind: 'internal', reason: 'paid_by_dot' };
+  }
 
   const { data: courier } = await supabase
     .from('couriers')
