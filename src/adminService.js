@@ -199,9 +199,38 @@ export async function getAdminUsers(options = {}) {
       list.sort((a, b) => ROLE_ORDER.indexOf(a) - ROLE_ORDER.indexOf(b));
       u.roles = list;
     });
+
+    await attachWalletBalances(users);
   }
 
   return { users, total: count ?? 0 };
+}
+
+const WALLET_TYPES = ['customer', 'merchant', 'courier'];
+
+/** Latest balance for each wallet role on this page. Missing function leaves
+ *  wallets null so the dashboard does not show a fake $0.00. */
+async function attachWalletBalances(users) {
+  const ids = users.map((u) => u.id);
+  const { data, error } = await supabase.rpc('admin_wallet_balances', { p_user_ids: ids });
+  if (error) {
+    console.error('wallet balances unavailable:', error.message || error);
+    users.forEach((u) => { u.wallets = null; });
+    return;
+  }
+  const byUser = new Map();
+  for (const row of data || []) {
+    if (!byUser.has(row.user_id)) byUser.set(row.user_id, {});
+    byUser.get(row.user_id)[row.user_type] = Number(row.balance_after) || 0;
+  }
+  users.forEach((u) => {
+    const found = byUser.get(u.id) || {};
+    const wallets = {};
+    for (const role of u.roles || []) {
+      if (WALLET_TYPES.includes(role)) wallets[role] = Number(found[role]) || 0;
+    }
+    u.wallets = wallets;
+  });
 }
 
 /**
@@ -439,6 +468,87 @@ export async function creditCustomerWallet({ userId, amount, reason, max = PROMO
   return {
     transaction: row,
     amount: value,
+    note,
+    newBalance: Number(row?.balance_after) || 0,
+    customer: { id: user.id, name: user.full_name, phone: user.phone },
+  };
+}
+
+/**
+ * Removes balance from one wallet. Cannot take the wallet below zero.
+ * wallet is customer, merchant, or courier.
+ */
+export async function debitUserWallet({ userId, amount, reason, wallet }) {
+  if (!supabase) throw new Error('Server not configured');
+
+  const fail = (status, message, details) => {
+    const err = new Error(message);
+    err.status = status;
+    err.details = details;
+    throw err;
+  };
+
+  const walletType = String(wallet || '').toLowerCase();
+  if (!WALLET_TYPES.includes(walletType)) {
+    fail(400, 'Invalid wallet', 'Choose a customer, merchant, or courier wallet.');
+  }
+
+  const value = Math.round(Number(amount) * 100) / 100;
+  if (!Number.isFinite(value) || value <= 0) {
+    fail(400, 'Invalid amount', 'Enter an amount greater than zero.');
+  }
+
+  const { data: user, error: userError } = await supabase
+    .from('user_profiles')
+    .select('id, full_name, phone, role')
+    .eq('id', userId)
+    .maybeSingle();
+  if (userError) throw new Error(userError.message || 'Failed to load user');
+  if (!user) fail(404, 'User not found', 'That account no longer exists.');
+
+  const [{ data: customerRow }, { data: merchantRow }, { data: courierRow }, { data: roleRows }] = await Promise.all([
+    supabase.from('customers').select('id').eq('id', userId).maybeSingle(),
+    supabase.from('merchants').select('id').eq('id', userId).maybeSingle(),
+    supabase.from('couriers').select('id').eq('id', userId).maybeSingle(),
+    supabase.from('user_roles').select('role').eq('user_id', userId),
+  ]);
+  const roles = new Set(
+    (roleRows || []).map((r) => String(r.role).toLowerCase()),
+  );
+  if (customerRow) roles.add('customer');
+  if (merchantRow) roles.add('merchant');
+  if (courierRow) roles.add('courier');
+  if (roles.size === 0 && user.role) roles.add(String(user.role).toLowerCase());
+  if (!roles.has(walletType)) {
+    fail(400, 'No wallet', `This account does not have a ${walletType} wallet.`);
+  }
+
+  const note = String(reason || '').trim().slice(0, 200);
+  const description = note ? `Deducted by DOT: ${note}` : 'Deducted by Delivery On Time';
+
+  const { data, error } = await supabase.rpc('debit_wallet', {
+    p_user_id: userId,
+    p_user_type: walletType,
+    p_amount: value,
+    p_description: description,
+    p_reference_id: null,
+  });
+  if (error) {
+    if (/could not find|does not exist/i.test(error.message || '')) {
+      throw new Error('Wallet deduct is not set up on this database yet — run migrations/2026-10-13-wallet-admin-debit.sql');
+    }
+    const short = /insufficient balance:\s*([0-9.]+)/i.exec(error.message || '');
+    if (short) {
+      fail(400, 'Not enough balance', `This ${walletType} wallet only has $${Number(short[1]).toFixed(2)}.`);
+    }
+    throw new Error(error.message || 'Failed to deduct from wallet');
+  }
+
+  const row = Array.isArray(data) ? data[0] : data;
+  return {
+    transaction: row,
+    amount: value,
+    wallet: walletType,
     note,
     newBalance: Number(row?.balance_after) || 0,
     customer: { id: user.id, name: user.full_name, phone: user.phone },

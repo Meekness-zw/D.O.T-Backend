@@ -53,6 +53,7 @@ import {
   getAdminStatsCharts,
   getAdminUsers,
   creditCustomerWallet,
+  debitUserWallet,
   getAdminOrders,
   getAdminOrdersForExport,
   ordersToCsv,
@@ -567,6 +568,7 @@ async function requireAuth(req, res, next) {
     const decoded = verifyAccessToken(token, process.env.SUPABASE_JWT_SECRET);
     if (decoded?.sub) {
       req.userId = decoded.sub;
+      if (await isAccountFrozen(req.userId)) return frozenAccount(res);
       return next();
     }
 
@@ -576,9 +578,37 @@ async function requireAuth(req, res, next) {
       return res.status(401).json({ error: 'Unauthorized', details: 'Invalid or expired token' });
     }
     req.userId = data.user.id;
+    if (await isAccountFrozen(req.userId)) return frozenAccount(res);
     next();
   } catch (err) {
     return res.status(401).json({ error: 'Unauthorized', details: err.message });
+  }
+}
+
+function frozenAccount(res) {
+  return res.status(403).json({
+    error: 'Account frozen',
+    details: 'Your account has been frozen. Please contact support.',
+  });
+}
+
+/** A frozen account keeps its session token, so signed-in requests re-check
+ *  the flag. A lookup failure does not lock the whole app out. */
+async function isAccountFrozen(userId) {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('user_profiles')
+      .select('is_suspended')
+      .eq('id', userId)
+      .maybeSingle();
+    if (error) {
+      console.error('freeze check failed:', error.message || error);
+      return false;
+    }
+    return !!data?.is_suspended;
+  } catch (err) {
+    console.error('freeze check failed:', err?.message || err);
+    return false;
   }
 }
 
@@ -592,11 +622,11 @@ async function optionalAuth(req, res, next) {
   try {
     const decoded = verifyAccessToken(token, process.env.SUPABASE_JWT_SECRET);
     if (decoded?.sub) {
-      req.userId = decoded.sub;
+      if (!(await isAccountFrozen(decoded.sub))) req.userId = decoded.sub;
       return next();
     }
     const { data } = await supabaseAdmin.auth.getUser(token);
-    if (data?.user?.id) req.userId = data.user.id;
+    if (data?.user?.id && !(await isAccountFrozen(data.user.id))) req.userId = data.user.id;
   } catch (_) {
     // Invalid/expired token on a public endpoint — just proceed unauthenticated.
   }
@@ -836,7 +866,7 @@ app.post('/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
         .eq('id', userId)
         .single();
       if (profile?.is_suspended) {
-        return res.status(403).json({ error: 'Your account has been suspended. Please contact support.' });
+        return res.status(403).json({ error: 'Your account has been frozen. Please contact support.' });
       }
     } else {
       const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
@@ -9360,6 +9390,56 @@ app.post('/admin/users/:id/wallet-credit', requireAdmin, async (req, res) => {
     console.error('post /admin/users/:id/wallet-credit error:', error);
     return res.status(500).json({
       error: 'Failed to credit wallet',
+      details: error.message || 'Please try again later',
+    });
+  }
+});
+
+/**
+ * POST /admin/users/:id/wallet-debit — take balance out of one wallet.
+ *
+ * Body: { amount, reason?, wallet } where wallet is customer, merchant, or courier.
+ * Refuses an amount larger than the current balance.
+ */
+app.post('/admin/users/:id/wallet-debit', requireAdmin, async (req, res) => {
+  try {
+    const { amount, reason, wallet } = req.body || {};
+    const result = await debitUserWallet({ userId: req.params.id, amount, reason, wallet });
+
+    try {
+      await insertUserNotification(supabase, {
+        userId: req.params.id,
+        title: 'Amount deducted from your wallet',
+        message: `$${result.amount.toFixed(2)} was deducted from your ${result.wallet} wallet.${result.note ? ` ${result.note}` : ''}`,
+        type: 'payment',
+        audience: result.wallet,
+        data: { type: 'admin_debit', amount: result.amount, wallet: result.wallet },
+      });
+    } catch (notifyErr) {
+      console.error('wallet debit notification failed (non-fatal):', notifyErr);
+    }
+
+    console.log('[wallet-debit] %s', JSON.stringify({
+      at: new Date().toISOString(),
+      by_role: req.dashboardRole || 'unknown',
+      ip: req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || null,
+      user_id: req.params.id,
+      user: result.customer.name || result.customer.phone || null,
+      wallet: result.wallet,
+      amount: result.amount,
+      reason: result.note || null,
+      balance_after: result.newBalance,
+      transaction_id: result.transaction?.id || null,
+    }));
+
+    return res.json(result);
+  } catch (error) {
+    if (error.status) {
+      return res.status(error.status).json({ error: error.message, details: error.details });
+    }
+    console.error('post /admin/users/:id/wallet-debit error:', error);
+    return res.status(500).json({
+      error: 'Failed to deduct from wallet',
       details: error.message || 'Please try again later',
     });
   }

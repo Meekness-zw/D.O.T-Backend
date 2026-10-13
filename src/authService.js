@@ -59,7 +59,7 @@ export async function loginWithPassword({ phone, password }) {
   }
 
   if (profile.is_suspended) {
-    throw new Error('Your account has been suspended. Please contact support.');
+    throw new Error('Your account has been frozen. Please contact support.');
   }
 
   const { valid, needsRehash } = verifyPassword(password, profile.password_hash);
