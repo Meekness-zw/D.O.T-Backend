@@ -22,6 +22,16 @@ function parseDataUrl(dataUrl) {
   return { mime: match[1], base64: match[2] };
 }
 
+// Matches courier_vehicles.vehicle_type CHECK (bike, car, motorcycle).
+// The app labels bike as Scooter.
+function canonicalVehicleType(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  if (raw === 'car') return 'car';
+  if (raw === 'motorcycle' || raw === 'motorbike') return 'motorcycle';
+  if (raw === 'scooter' || raw === 'bike' || raw === 'bicycle') return 'bike';
+  return null;
+}
+
 function extForMime(mime) {
   if (!mime) return 'bin';
   if (mime.includes('png')) return 'png';
@@ -173,7 +183,8 @@ export async function saveCourierVehicle({
 }) {
   requireSupabase();
   if (!userId) throw new Error('userId is required');
-  if (!vehicleType) throw new Error('vehicleType is required');
+  const storedVehicleType = canonicalVehicleType(vehicleType);
+  if (!storedVehicleType) throw new Error('Vehicle type must be car, motorcycle, or scooter');
   if (!brand || !String(brand).trim()) throw new Error('vehicle brand is required');
   if (!model || !String(model).trim()) throw new Error('vehicle model is required');
   if (!licensePlate || !String(licensePlate).trim()) throw new Error('license plate is required');
@@ -192,7 +203,7 @@ export async function saveCourierVehicle({
 
   const insert = {
     courier_id: userId,
-    vehicle_type: vehicleType,
+    vehicle_type: storedVehicleType,
     brand: String(brand).trim(),
     model: String(model).trim(),
     year: year ? Number(year) : null,
