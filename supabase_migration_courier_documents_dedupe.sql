@@ -32,4 +32,4 @@ ALTER TABLE courier_documents
 ALTER TABLE courier_documents DROP CONSTRAINT IF EXISTS courier_documents_document_type_check;
 ALTER TABLE courier_documents
   ADD CONSTRAINT courier_documents_document_type_check
-  CHECK (document_type IN ('id_drivers_license', 'national_id', 'vehicle_registration', 'insurance', 'profile_photo'));
+  CHECK (document_type IN ('id_drivers_license', 'national_id', 'vehicle_registration', 'vehicle_photo', 'insurance', 'profile_photo'));

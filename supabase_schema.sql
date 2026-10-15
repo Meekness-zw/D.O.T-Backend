@@ -310,7 +310,7 @@ CREATE TABLE IF NOT EXISTS courier_vehicles (
 CREATE TABLE IF NOT EXISTS courier_documents (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   courier_id UUID NOT NULL REFERENCES couriers(id) ON DELETE CASCADE,
-  document_type TEXT NOT NULL CHECK (document_type IN ('id_drivers_license', 'vehicle_registration', 'insurance', 'profile_photo')),
+  document_type TEXT NOT NULL CHECK (document_type IN ('id_drivers_license', 'national_id', 'vehicle_registration', 'vehicle_photo', 'insurance', 'profile_photo')),
   document_url TEXT NOT NULL,
   status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
   verified_at TIMESTAMP WITH TIME ZONE,

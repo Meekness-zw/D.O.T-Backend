@@ -103,7 +103,12 @@ export async function saveCourierDocument({ userId, documentType, documentUrl, s
     document_url: documentUrl,
     status,
   });
-  if (error) throw new Error(error.message || 'Failed to save document');
+  if (error) {
+    if (/document_type_check/i.test(error.message || '')) {
+      throw new Error('This file could not be saved. The account database still needs the document-type update.');
+    }
+    throw new Error(error.message || 'Failed to save document');
+  }
 }
 
 async function courierDocumentUrl(userId, documentType) {
@@ -140,9 +145,24 @@ export async function upsertCourierProfile({
 }) {
   requireSupabase();
   if (!userId) throw new Error('userId is required');
-  if (!fullName || !String(fullName).trim()) throw new Error('fullName is required');
-  if (!nationalId || !String(nationalId).trim()) throw new Error('nationalId is required');
-  if (!dateOfBirth || !String(dateOfBirth).trim()) throw new Error('dateOfBirth is required');
+
+  let name = String(fullName || '').trim();
+  let idNumber = String(nationalId || '').trim();
+  let dobRaw = String(dateOfBirth || '').trim();
+  let cityValue = city ? String(city).trim() : '';
+  if (!name || !idNumber || !dobRaw || !cityValue) {
+    const [{ data: profile }, { data: existingCourier }] = await Promise.all([
+      supabase.from('user_profiles').select('full_name').eq('id', userId).maybeSingle(),
+      supabase.from('couriers').select('national_id, date_of_birth, city').eq('id', userId).maybeSingle(),
+    ]);
+    if (!name) name = String(profile?.full_name || '').trim();
+    if (!idNumber) idNumber = String(existingCourier?.national_id || '').trim();
+    if (!dobRaw && existingCourier?.date_of_birth) dobRaw = String(existingCourier.date_of_birth).slice(0, 10);
+    if (!cityValue) cityValue = String(existingCourier?.city || '').trim();
+  }
+  if (!name) throw new Error('fullName is required');
+  if (!idNumber) throw new Error('nationalId is required');
+  if (!dobRaw) throw new Error('dateOfBirth is required');
   if (!profilePhotoBase64 && !(await courierDocumentUrl(userId, 'profile_photo'))) {
     throw new Error('A profile photo is required');
   }
@@ -151,7 +171,6 @@ export async function upsertCourierProfile({
   }
 
   // Expect date in DD/MM/YYYY from UI; convert to YYYY-MM-DD if possible
-  const dobRaw = String(dateOfBirth).trim();
   let dobIso = dobRaw;
   const dobMatch = dobRaw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
   if (dobMatch) {
@@ -176,7 +195,7 @@ export async function upsertCourierProfile({
   // Update display name only; role is determined by table membership, email is never overwritten
   const { error: profileError } = await supabase
     .from('user_profiles')
-    .update({ full_name: String(fullName).trim() })
+    .update({ full_name: name })
     .eq('id', userId);
   if (profileError) throw new Error(profileError.message || 'Failed to update user profile');
 
@@ -184,9 +203,9 @@ export async function upsertCourierProfile({
   const { error: courierError } = await supabase.from('couriers').upsert(
     {
       id: userId,
-      national_id: String(nationalId).trim(),
+      national_id: idNumber,
       date_of_birth: dobIso,
-      city: city ? String(city).trim() : null,
+      city: cityValue || null,
       ...verification,
     },
     { onConflict: 'id' },
@@ -373,7 +392,16 @@ export async function saveCourierDriverLicense({
 }) {
   requireSupabase();
   if (!userId) throw new Error('userId is required');
-  if (!licenseNumber || !String(licenseNumber).trim()) throw new Error('licenseNumber is required');
+  let license = String(licenseNumber || '').trim();
+  if (!license) {
+    const { data: existingCourier } = await supabase
+      .from('couriers')
+      .select('drivers_license_number')
+      .eq('id', userId)
+      .maybeSingle();
+    license = String(existingCourier?.drivers_license_number || '').trim();
+  }
+  if (!license) throw new Error('licenseNumber is required');
   const existingLicenseUrl = await courierDocumentUrl(userId, 'id_drivers_license');
   if ((!frontBase64 || !backBase64) && !existingLicenseUrl) {
     throw new Error('Front and back license photos are required');
@@ -383,7 +411,7 @@ export async function saveCourierDriverLicense({
   const { error: courierUpdateError } = await supabase.from('couriers').upsert(
     {
       id: userId,
-      drivers_license_number: String(licenseNumber).trim(),
+      drivers_license_number: license,
       ...licenseVerification,
     },
     { onConflict: 'id' },

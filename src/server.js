@@ -7116,9 +7116,23 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
 });
 
 // GET /courier/map — stores with coordinates + active courier positions for the live map
-app.get('/courier/map', requireAuth, requireApprovedCourier, async (req, res) => {
+app.get('/courier/map', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
+
+    const { data: courier, error: courierError } = await supabase
+      .from('couriers')
+      .select('verification_status, is_verified')
+      .eq('id', req.userId)
+      .maybeSingle();
+    if (courierError) throw courierError;
+    const canViewMap = courier?.verification_status === 'approved' || courier?.is_verified === true;
+    if (!canViewMap) {
+      return res.status(403).json({
+        error: 'Courier approval required',
+        details: 'Your courier account must be approved before you can view the live map.',
+      });
+    }
 
     const [storesResult, couriersResult] = await Promise.all([
       supabase
