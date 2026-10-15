@@ -76,6 +76,36 @@ async function verificationFieldsForSave(userId) {
   };
 }
 
+export async function saveCourierDocument({ userId, documentType, documentUrl, status = 'pending' }) {
+  if (!userId || !documentType || !documentUrl) {
+    throw new Error('Could not save the document');
+  }
+  const { data: rows, error: readError } = await supabase
+    .from('courier_documents')
+    .select('id')
+    .eq('courier_id', userId)
+    .eq('document_type', documentType)
+    .limit(1);
+  if (readError) throw new Error(readError.message || 'Failed to save document');
+
+  if (rows?.[0]?.id) {
+    const { error } = await supabase
+      .from('courier_documents')
+      .update({ document_url: documentUrl, status })
+      .eq('id', rows[0].id);
+    if (error) throw new Error(error.message || 'Failed to save document');
+    return;
+  }
+
+  const { error } = await supabase.from('courier_documents').insert({
+    courier_id: userId,
+    document_type: documentType,
+    document_url: documentUrl,
+    status,
+  });
+  if (error) throw new Error(error.message || 'Failed to save document');
+}
+
 async function courierDocumentUrl(userId, documentType) {
   const { data, error } = await supabase
     .from('courier_documents')
@@ -172,13 +202,7 @@ export async function upsertCourierProfile({
       dataUrl: profilePhotoBase64,
     });
     uploads.profile_photo_url = url;
-
-    await supabase.from('courier_documents').upsert({
-      courier_id: userId,
-      document_type: 'profile_photo',
-      document_url: url,
-      status: 'pending',
-    }, { onConflict: 'courier_id,document_type' });
+    await saveCourierDocument({ userId, documentType: 'profile_photo', documentUrl: url });
   }
 
   if (nationalIdPhotoBase64) {
@@ -189,13 +213,7 @@ export async function upsertCourierProfile({
       dataUrl: nationalIdPhotoBase64,
     });
     uploads.national_id_url = url;
-
-    await supabase.from('courier_documents').upsert({
-      courier_id: userId,
-      document_type: 'national_id',
-      document_url: url,
-      status: 'pending',
-    }, { onConflict: 'courier_id,document_type' });
+    await saveCourierDocument({ userId, documentType: 'national_id', documentUrl: url });
   }
 
   return { success: true, uploads };
@@ -319,13 +337,12 @@ export async function saveCourierVehicle({
       dataUrl: vehiclePhotoBase64,
     });
     uploads.vehicle_photo_url = url;
-    await supabase.from('courier_vehicles').update({ vehicle_photo_url: url }).eq('id', vehicle.id);
-    await supabase.from('courier_documents').upsert({
-      courier_id: userId,
-      document_type: 'vehicle_photo',
-      document_url: url,
-      status: 'pending',
-    }, { onConflict: 'courier_id,document_type' });
+    const { error: photoUpdateError } = await supabase
+      .from('courier_vehicles')
+      .update({ vehicle_photo_url: url })
+      .eq('id', vehicle.id);
+    if (photoUpdateError) throw new Error(photoUpdateError.message || 'Failed to save vehicle photo');
+    await saveCourierDocument({ userId, documentType: 'vehicle_photo', documentUrl: url });
   }
 
   if (registrationCertificateBase64) {
@@ -336,17 +353,12 @@ export async function saveCourierVehicle({
       dataUrl: registrationCertificateBase64,
     });
     uploads.registration_certificate_url = url;
-    await supabase
+    const { error: certUpdateError } = await supabase
       .from('courier_vehicles')
       .update({ registration_certificate_url: url })
       .eq('id', vehicle.id);
-
-    await supabase.from('courier_documents').upsert({
-      courier_id: userId,
-      document_type: 'vehicle_registration',
-      document_url: url,
-      status: 'pending',
-    }, { onConflict: 'courier_id,document_type' });
+    if (certUpdateError) throw new Error(certUpdateError.message || 'Failed to save registration certificate');
+    await saveCourierDocument({ userId, documentType: 'vehicle_registration', documentUrl: url });
   }
 
   return { success: true, vehicleId: vehicle.id, uploads };
@@ -403,12 +415,11 @@ export async function saveCourierDriverLicense({
   // kept in storage, but courier_documents gets a single row so the Documents
   // screen shows one "Driver's License" entry, not a duplicate per side.
   if (frontBase64 && frontUrl) {
-    await supabase.from('courier_documents').upsert({
-      courier_id: userId,
-      document_type: 'id_drivers_license',
-      document_url: frontUrl,
-      status: 'pending',
-    }, { onConflict: 'courier_id,document_type' });
+    await saveCourierDocument({
+      userId,
+      documentType: 'id_drivers_license',
+      documentUrl: frontUrl,
+    });
   }
 
   return { success: true, uploads };

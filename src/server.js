@@ -41,6 +41,7 @@ import { supabaseAdmin } from './supabaseAdminClient.js';
 import {
   upsertCourierProfile,
   saveCourierVehicle,
+  saveCourierDocument,
   saveCourierDriverLicense,
   saveCourierPayoutMethod,
   saveMerchantPayoutMethod,
@@ -7205,8 +7206,32 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
         console.error('courier status documents error:', documentsError);
         throw new Error(documentsError.message || 'Failed to load courier documents');
       }
-      uploadedDocumentTypes = (documents || []).map((doc) => doc.document_type);
+      uploadedDocumentTypes = (documents || []).map((doc) => String(doc.document_type || '').trim().toLowerCase());
     }
+
+    if (courier) {
+      const { data: vehicleFiles } = await supabase
+        .from('courier_vehicles')
+        .select('vehicle_photo_url, registration_certificate_url')
+        .eq('courier_id', req.userId)
+        .order('is_active', { ascending: false })
+        .order('created_at', { ascending: false })
+        .limit(1);
+      const savedFiles = [
+        ['vehicle_photo', vehicleFiles?.[0]?.vehicle_photo_url],
+        ['vehicle_registration', vehicleFiles?.[0]?.registration_certificate_url],
+      ];
+      for (const [documentType, documentUrl] of savedFiles) {
+        if (!documentUrl || uploadedDocumentTypes.includes(documentType)) continue;
+        try {
+          await saveCourierDocument({ userId: req.userId, documentType, documentUrl });
+        } catch (docError) {
+          console.error('courier status document backfill error:', docError);
+        }
+        uploadedDocumentTypes.push(documentType);
+      }
+    }
+
     const missingDocuments = REQUIRED_COURIER_DOCUMENTS.filter((type) => !uploadedDocumentTypes.includes(type));
     const hasRequiredDocuments = missingDocuments.length === 0;
 
