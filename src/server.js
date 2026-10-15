@@ -7157,7 +7157,7 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
     const { data: courier, error: courierError } = await supabase
       .from('couriers')
       .select(
-        'id, city, national_id, date_of_birth, drivers_license_number, verification_status, rejected_reason',
+        'id, city, national_id, date_of_birth, drivers_license_number, verification_status, is_verified, rejected_reason',
       )
       .eq('id', req.userId)
       .maybeSingle();
@@ -7229,7 +7229,7 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
     const verificationStatus = courier?.verification_status || 'pending';
     const onboardingComplete =
       hasProfile && hasVehicle && hasDriverLicense && hasPayoutMethod && hasRequiredDocuments;
-    const isApproved = verificationStatus === 'approved';
+    const isApproved = verificationStatus === 'approved' || courier?.is_verified === true;
     const isRejected = verificationStatus === 'rejected';
     const rejectedReason = courier?.rejected_reason || null;
 
@@ -7244,6 +7244,7 @@ app.get('/courier/onboarding-status', requireAuth, async (req, res) => {
       verificationStatus,
       onboardingComplete,
       isApproved,
+      isVerified: isApproved,
       isRejected,
       rejectedReason,
     });

@@ -59,6 +59,23 @@ async function uploadToBucket({ bucket, path, dataUrl }) {
   return urlData?.publicUrl || null;
 }
 
+async function verificationFieldsForSave(userId) {
+  const fresh = { verification_status: 'pending', is_verified: false, is_online: false };
+  const { data, error } = await supabase
+    .from('couriers')
+    .select('verification_status, is_verified, is_online')
+    .eq('id', userId)
+    .maybeSingle();
+  if (error || !data) return fresh;
+  const verified = data.verification_status === 'approved' || data.is_verified === true;
+  if (!verified) return fresh;
+  return {
+    verification_status: data.verification_status || 'approved',
+    is_verified: true,
+    is_online: data.is_online === true,
+  };
+}
+
 async function courierDocumentUrl(userId, documentType) {
   const { data, error } = await supabase
     .from('courier_documents')
@@ -133,15 +150,14 @@ export async function upsertCourierProfile({
     .eq('id', userId);
   if (profileError) throw new Error(profileError.message || 'Failed to update user profile');
 
+  const verification = await verificationFieldsForSave(userId);
   const { error: courierError } = await supabase.from('couriers').upsert(
     {
       id: userId,
       national_id: String(nationalId).trim(),
       date_of_birth: dobIso,
       city: city ? String(city).trim() : null,
-      verification_status: 'pending',
-      is_verified: false,
-      is_online: false,
+      ...verification,
     },
     { onConflict: 'id' },
   );
@@ -213,8 +229,9 @@ export async function saveCourierVehicle({
   }
 
   // Ensure courier row exists
+  const vehicleVerification = await verificationFieldsForSave(userId);
   const { error: ensureCourierError } = await supabase.from('couriers').upsert(
-    { id: userId, verification_status: 'pending', is_verified: false, is_online: false },
+    { id: userId, ...vehicleVerification },
     { onConflict: 'id' },
   );
   if (ensureCourierError) throw new Error(ensureCourierError.message || 'Failed to ensure courier');
@@ -299,13 +316,12 @@ export async function saveCourierDriverLicense({
     throw new Error('Front and back license photos are required');
   }
 
+  const licenseVerification = await verificationFieldsForSave(userId);
   const { error: courierUpdateError } = await supabase.from('couriers').upsert(
     {
       id: userId,
       drivers_license_number: String(licenseNumber).trim(),
-      verification_status: 'pending',
-      is_verified: false,
-      is_online: false,
+      ...licenseVerification,
     },
     { onConflict: 'id' },
   );
