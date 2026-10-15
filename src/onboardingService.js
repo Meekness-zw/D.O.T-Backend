@@ -214,19 +214,10 @@ export async function saveCourierVehicle({
 }) {
   requireSupabase();
   if (!userId) throw new Error('userId is required');
-  const storedVehicleType = canonicalVehicleType(vehicleType);
-  if (!storedVehicleType) throw new Error('Vehicle type must be car, motorcycle, or scooter');
-  if (!brand || !String(brand).trim()) throw new Error('vehicle brand is required');
-  if (!model || !String(model).trim()) throw new Error('vehicle model is required');
-  if (!licensePlate || !String(licensePlate).trim()) throw new Error('license plate is required');
   const existingPhotoUrl = vehiclePhotoBase64 ? null : await courierDocumentUrl(userId, 'vehicle_photo');
   const existingCertUrl = registrationCertificateBase64
     ? null
     : await courierDocumentUrl(userId, 'vehicle_registration');
-  if (!vehiclePhotoBase64 && !existingPhotoUrl) throw new Error('A vehicle photo is required');
-  if (!registrationCertificateBase64 && !existingCertUrl) {
-    throw new Error('A vehicle registration certificate is required');
-  }
 
   // Ensure courier row exists
   const vehicleVerification = await verificationFieldsForSave(userId);
@@ -236,28 +227,88 @@ export async function saveCourierVehicle({
   );
   if (ensureCourierError) throw new Error(ensureCourierError.message || 'Failed to ensure courier');
 
-  // Deactivate previous vehicles
-  await supabase.from('courier_vehicles').update({ is_active: false }).eq('courier_id', userId);
+  const { data: ownVehicles, error: ownVehiclesError } = await supabase
+    .from('courier_vehicles')
+    .select('id, vehicle_type, brand, model, year, color, license_plate, is_active, vehicle_photo_url, registration_certificate_url, created_at')
+    .eq('courier_id', userId);
+  if (ownVehiclesError) throw new Error(ownVehiclesError.message || 'Failed to load vehicle');
 
-  const insert = {
-    courier_id: userId,
+  const plateIncoming = String(licensePlate || '').trim().toUpperCase();
+  const samePlate = plateIncoming
+    ? (ownVehicles || []).find(
+      (row) => String(row.license_plate || '').trim().toUpperCase() === plateIncoming,
+    )
+    : null;
+  const activeVehicle = (ownVehicles || []).find((row) => row.is_active);
+  const newestVehicle = [...(ownVehicles || [])].sort(
+    (a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0),
+  )[0];
+  // The plate is unique across every vehicle row, including inactive ones.
+  // Update the row that already has it instead of inserting a second copy.
+  const target = samePlate || activeVehicle || newestVehicle || null;
+
+  const storedVehicleType = canonicalVehicleType(vehicleType) || canonicalVehicleType(target?.vehicle_type);
+  const plate = plateIncoming || String(target?.license_plate || '').trim().toUpperCase();
+  const keptBrand = String(brand || '').trim() || target?.brand || '';
+  const keptModel = String(model || '').trim() || target?.model || '';
+  if (!storedVehicleType) throw new Error('Vehicle type must be car, motorcycle, or scooter');
+  if (!target && (!keptBrand || !keptModel || !plate)) {
+    throw new Error('vehicle brand, model, and license plate are required');
+  }
+  const photoOnFile = existingPhotoUrl || target?.vehicle_photo_url;
+  const certOnFile = existingCertUrl || target?.registration_certificate_url;
+  if (!vehiclePhotoBase64 && !photoOnFile) throw new Error('A vehicle photo is required');
+  if (!registrationCertificateBase64 && !certOnFile) {
+    throw new Error('A vehicle registration certificate is required');
+  }
+
+  const fields = {
     vehicle_type: storedVehicleType,
-    brand: String(brand).trim(),
-    model: String(model).trim(),
-    year: year ? Number(year) : null,
-    color: color ? String(color).trim() : null,
-    license_plate: String(licensePlate).trim().toUpperCase(),
-    vehicle_photo_url: existingPhotoUrl,
-    registration_certificate_url: existingCertUrl,
+    brand: keptBrand,
+    model: keptModel,
+    year: year ? Number(year) : (target?.year ?? null),
+    color: String(color || '').trim() || target?.color || null,
+    license_plate: plate,
+    vehicle_photo_url: existingPhotoUrl || target?.vehicle_photo_url || null,
+    registration_certificate_url: existingCertUrl || target?.registration_certificate_url || null,
     is_active: true,
   };
 
-  const { data: vehicle, error } = await supabase
+  let vehicle;
+  if (target) {
+    const { data, error } = await supabase
+      .from('courier_vehicles')
+      .update(fields)
+      .eq('id', target.id)
+      .select('*')
+      .single();
+    if (error) {
+      if (/license_plate/i.test(error.message || '')) {
+        throw new Error('That license plate is already registered to another vehicle.');
+      }
+      throw new Error(error.message || 'Failed to save vehicle');
+    }
+    vehicle = data;
+  } else {
+    const { data, error } = await supabase
+      .from('courier_vehicles')
+      .insert({ courier_id: userId, ...fields })
+      .select('*')
+      .single();
+    if (error) {
+      if (/license_plate/i.test(error.message || '')) {
+        throw new Error('That license plate is already registered to another vehicle.');
+      }
+      throw new Error(error.message || 'Failed to save vehicle');
+    }
+    vehicle = data;
+  }
+
+  await supabase
     .from('courier_vehicles')
-    .insert(insert)
-    .select('*')
-    .single();
-  if (error) throw new Error(error.message || 'Failed to save vehicle');
+    .update({ is_active: false })
+    .eq('courier_id', userId)
+    .neq('id', vehicle.id);
 
   const uploads = {};
   if (vehiclePhotoBase64) {

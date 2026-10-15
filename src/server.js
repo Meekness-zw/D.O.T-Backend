@@ -1868,7 +1868,7 @@ app.get('/courier/vehicle', requireAuth, async (req, res) => {
         'id, courier_id, vehicle_type, brand, model, year, color, license_plate, delivery_bag_available, vehicle_photo_url, registration_certificate_url, is_active, created_at, updated_at',
       )
       .eq('courier_id', req.userId)
-      .eq('is_active', true)
+      .order('is_active', { ascending: false })
       .order('created_at', { ascending: false })
       .limit(1);
 
