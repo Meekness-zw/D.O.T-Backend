@@ -59,6 +59,17 @@ async function uploadToBucket({ bucket, path, dataUrl }) {
   return urlData?.publicUrl || null;
 }
 
+async function courierDocumentUrl(userId, documentType) {
+  const { data, error } = await supabase
+    .from('courier_documents')
+    .select('document_url')
+    .eq('courier_id', userId)
+    .eq('document_type', documentType)
+    .maybeSingle();
+  if (error) return null;
+  return data?.document_url || null;
+}
+
 function cityFromAddress(address) {
   const value = String(address || '').trim();
   if (!value) return 'Harare';
@@ -85,8 +96,12 @@ export async function upsertCourierProfile({
   if (!fullName || !String(fullName).trim()) throw new Error('fullName is required');
   if (!nationalId || !String(nationalId).trim()) throw new Error('nationalId is required');
   if (!dateOfBirth || !String(dateOfBirth).trim()) throw new Error('dateOfBirth is required');
-  if (!profilePhotoBase64) throw new Error('A profile photo is required');
-  if (!nationalIdPhotoBase64) throw new Error('A national ID or passport photo is required');
+  if (!profilePhotoBase64 && !(await courierDocumentUrl(userId, 'profile_photo'))) {
+    throw new Error('A profile photo is required');
+  }
+  if (!nationalIdPhotoBase64 && !(await courierDocumentUrl(userId, 'national_id'))) {
+    throw new Error('A national ID or passport photo is required');
+  }
 
   // Expect date in DD/MM/YYYY from UI; convert to YYYY-MM-DD if possible
   const dobRaw = String(dateOfBirth).trim();
@@ -188,8 +203,14 @@ export async function saveCourierVehicle({
   if (!brand || !String(brand).trim()) throw new Error('vehicle brand is required');
   if (!model || !String(model).trim()) throw new Error('vehicle model is required');
   if (!licensePlate || !String(licensePlate).trim()) throw new Error('license plate is required');
-  if (!vehiclePhotoBase64) throw new Error('A vehicle photo is required');
-  if (!registrationCertificateBase64) throw new Error('A vehicle registration certificate is required');
+  const existingPhotoUrl = vehiclePhotoBase64 ? null : await courierDocumentUrl(userId, 'vehicle_photo');
+  const existingCertUrl = registrationCertificateBase64
+    ? null
+    : await courierDocumentUrl(userId, 'vehicle_registration');
+  if (!vehiclePhotoBase64 && !existingPhotoUrl) throw new Error('A vehicle photo is required');
+  if (!registrationCertificateBase64 && !existingCertUrl) {
+    throw new Error('A vehicle registration certificate is required');
+  }
 
   // Ensure courier row exists
   const { error: ensureCourierError } = await supabase.from('couriers').upsert(
@@ -209,6 +230,8 @@ export async function saveCourierVehicle({
     year: year ? Number(year) : null,
     color: color ? String(color).trim() : null,
     license_plate: String(licensePlate).trim().toUpperCase(),
+    vehicle_photo_url: existingPhotoUrl,
+    registration_certificate_url: existingCertUrl,
     is_active: true,
   };
 
@@ -271,7 +294,10 @@ export async function saveCourierDriverLicense({
   requireSupabase();
   if (!userId) throw new Error('userId is required');
   if (!licenseNumber || !String(licenseNumber).trim()) throw new Error('licenseNumber is required');
-  if (!frontBase64 || !backBase64) throw new Error('Front and back license photos are required');
+  const existingLicenseUrl = await courierDocumentUrl(userId, 'id_drivers_license');
+  if ((!frontBase64 || !backBase64) && !existingLicenseUrl) {
+    throw new Error('Front and back license photos are required');
+  }
 
   const { error: courierUpdateError } = await supabase.from('couriers').upsert(
     {
@@ -287,30 +313,36 @@ export async function saveCourierDriverLicense({
     throw new Error(courierUpdateError.message || 'Failed to save license details');
 
   const uploads = {};
+  let frontUrl = existingLicenseUrl;
 
-  const frontUrl = await uploadToBucket({
-    bucket: COURIER_BUCKET,
-    path: `couriers/${userId}/driver_license/front.${extForMime(parseDataUrl(frontBase64)?.mime)}`,
-    dataUrl: frontBase64,
-  });
-  uploads.front = frontUrl;
+  if (frontBase64) {
+    frontUrl = await uploadToBucket({
+      bucket: COURIER_BUCKET,
+      path: `couriers/${userId}/driver_license/front.${extForMime(parseDataUrl(frontBase64)?.mime)}`,
+      dataUrl: frontBase64,
+    });
+    uploads.front = frontUrl;
+  }
 
-  const backUrl = await uploadToBucket({
-    bucket: COURIER_BUCKET,
-    path: `couriers/${userId}/driver_license/back.${extForMime(parseDataUrl(backBase64)?.mime)}`,
-    dataUrl: backBase64,
-  });
-  uploads.back = backUrl;
+  if (backBase64) {
+    uploads.back = await uploadToBucket({
+      bucket: COURIER_BUCKET,
+      path: `couriers/${userId}/driver_license/back.${extForMime(parseDataUrl(backBase64)?.mime)}`,
+      dataUrl: backBase64,
+    });
+  }
 
   // Front and back are one document (the license), not two — both photos are
   // kept in storage, but courier_documents gets a single row so the Documents
   // screen shows one "Driver's License" entry, not a duplicate per side.
-  await supabase.from('courier_documents').upsert({
-    courier_id: userId,
-    document_type: 'id_drivers_license',
-    document_url: frontUrl,
-    status: 'pending',
-  }, { onConflict: 'courier_id,document_type' });
+  if (frontBase64 && frontUrl) {
+    await supabase.from('courier_documents').upsert({
+      courier_id: userId,
+      document_type: 'id_drivers_license',
+      document_url: frontUrl,
+      status: 'pending',
+    }, { onConflict: 'courier_id,document_type' });
+  }
 
   return { success: true, uploads };
 }

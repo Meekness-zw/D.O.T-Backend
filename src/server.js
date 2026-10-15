@@ -1807,13 +1807,6 @@ app.post('/couriers/onboarding/profile', requireAuth, async (req, res) => {
       nationalIdPhotoBase64,
     } = req.body || {};
 
-    if (!profilePhotoBase64) {
-      return res.status(400).json({
-        error: 'Profile photo is required',
-        details: 'Upload a clear front-facing photo before continuing.',
-      });
-    }
-
     const data = await upsertCourierProfile({
       userId: req.userId,
       fullName,
@@ -2069,7 +2062,7 @@ app.get('/courier/payout-method', requireAuth, async (req, res) => {
 
     const { data, error } = await supabase
       .from('courier_payout_methods')
-      .select('id, method_type, provider, account_number, account_name, is_default')
+      .select('id, method_type, provider, provider_code, account_number, account_name, is_default')
       .eq('courier_id', req.userId)
       .order('is_default', { ascending: false })
       .order('created_at', { ascending: true })

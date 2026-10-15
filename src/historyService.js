@@ -341,16 +341,25 @@ export async function getFullUserMe(userId) {
       .eq('id', userId)
       .single();
     result.merchant = merchant || null;
-    const { data: store } = await supabase
+    const storeSelect =
+      'id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country, latitude, longitude, is_open, is_active, operating_hours, delivery_radius_km';
+    let storeResult = await supabase
       .from('stores')
-      .select(
-        'id, store_name, logo, banner_url, description, phone, email, address_line1, address_line2, city, state_province, postal_code, country, latitude, longitude, is_open, is_active, operating_hours, delivery_radius_km',
-      )
+      .select(storeSelect)
       .eq('merchant_id', userId)
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
-    result.store = store || null;
+    if (storeResult.error) {
+      storeResult = await supabase
+        .from('stores')
+        .select('id, store_name, logo, is_open, is_active, operating_hours, city, address_line1')
+        .eq('merchant_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+    }
+    result.store = storeResult.data || null;
   }
   if (result.roles.includes('courier')) {
     const { data: courierRow } = await supabase.from('couriers').select('*').eq('id', userId).single();
