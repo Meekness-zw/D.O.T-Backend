@@ -82,18 +82,27 @@ export async function saveCourierDocument({ userId, documentType, documentUrl, s
   }
   const { data: rows, error: readError } = await supabase
     .from('courier_documents')
-    .select('id')
+    .select('id, document_url, status')
     .eq('courier_id', userId)
     .eq('document_type', documentType)
     .limit(1);
   if (readError) throw new Error(readError.message || 'Failed to save document');
 
   if (rows?.[0]?.id) {
+    const existing = rows[0];
+    const replaced = existing.document_url !== documentUrl;
+    const nextStatus = replaced ? status : (existing.status || status);
     const { error } = await supabase
       .from('courier_documents')
-      .update({ document_url: documentUrl, status })
-      .eq('id', rows[0].id);
+      .update({ document_url: documentUrl, status: nextStatus })
+      .eq('id', existing.id);
     if (error) throw new Error(error.message || 'Failed to save document');
+    if (replaced && existing.status === 'approved') {
+      await supabase
+        .from('couriers')
+        .update({ is_verified: false, verification_status: 'pending' })
+        .eq('id', userId);
+    }
     return;
   }
 

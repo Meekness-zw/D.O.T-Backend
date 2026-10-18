@@ -671,6 +671,45 @@ export async function getAdminMerchants(options = {}) {
   };
 }
 
+const REQUIRED_COURIER_DOCS = [
+  'profile_photo',
+  'national_id',
+  'vehicle_photo',
+  'vehicle_registration',
+  'id_drivers_license',
+];
+
+/** What the courier sees on the Documents screen, not the account flag.
+ *  A verified flag can stay true after a document is sent back to pending. */
+function documentReview(docs) {
+  const byType = new Map();
+  for (const doc of docs || []) {
+    const type = String(doc.document_type || '').trim().toLowerCase();
+    if (type) byType.set(type, String(doc.status || 'pending').trim().toLowerCase());
+  }
+  const statuses = REQUIRED_COURIER_DOCS.map((type) => byType.get(type) || 'missing');
+  if (statuses.some((status) => status === 'rejected')) return 'rejected';
+  if (statuses.some((status) => status === 'pending' || status === 'missing')) return 'pending';
+  return 'approved';
+}
+
+async function documentReviewsFor(courierIds) {
+  const reviews = new Map();
+  if (!courierIds.length) return reviews;
+  const { data, error } = await supabase
+    .from('courier_documents')
+    .select('courier_id, document_type, status')
+    .in('courier_id', courierIds);
+  if (error) throw new Error(error.message || 'Failed to load courier documents');
+  const grouped = new Map();
+  for (const doc of data || []) {
+    if (!grouped.has(doc.courier_id)) grouped.set(doc.courier_id, []);
+    grouped.get(doc.courier_id).push(doc);
+  }
+  for (const id of courierIds) reviews.set(id, documentReview(grouped.get(id)));
+  return reviews;
+}
+
 export async function getAdminCouriers(options = {}) {
   if (!supabase) throw new Error('Server not configured');
   const { limit = 50, offset = 0 } = options;
@@ -693,10 +732,13 @@ export async function getAdminCouriers(options = {}) {
     .range(offset, offset + limit - 1);
 
   if (error) throw new Error(error.message || 'Failed to fetch couriers');
-  const flags = await courierPayoutFlags((data || []).map((courier) => courier.id));
-  const couriers = (data || []).map((courier) => ({
+  const rows = data || [];
+  const flags = await courierPayoutFlags(rows.map((courier) => courier.id));
+  const reviews = await documentReviewsFor(rows.map((courier) => courier.id));
+  const couriers = rows.map((courier) => ({
     ...courier,
     payouts_enabled: flags.has(courier.id) ? flags.get(courier.id) : true,
+    document_review: reviews.get(courier.id) || 'pending',
   }));
   return { couriers, total: count ?? 0 };
 }
@@ -813,6 +855,28 @@ export async function getAdminPendingUsers() {
   }
 
   const couriers = couriersRes.data || [];
+  const alreadyListed = new Set(couriers.map((courier) => courier.id));
+  const { data: openDocs, error: openDocsError } = await supabase
+    .from('courier_documents')
+    .select('courier_id')
+    .in('status', ['pending', 'rejected']);
+  if (openDocsError) throw new Error(openDocsError.message || 'Failed to load courier documents');
+  const stillOpen = [...new Set((openDocs || []).map((doc) => doc.courier_id))]
+    .filter((id) => id && !alreadyListed.has(id));
+  if (stillOpen.length) {
+    const { data: flagged, error: flaggedError } = await supabase
+      .from('couriers')
+      .select(`
+        id,
+        is_verified,
+        verification_status,
+        created_at,
+        user_profiles ( full_name, email, phone )
+      `)
+      .in('id', stillOpen);
+    if (flaggedError) throw new Error(flaggedError.message || 'Failed to fetch couriers awaiting document review');
+    couriers.push(...(flagged || []));
+  }
   const merchants = merchantsRes.data || [];
 
   // Group by user ID so a user who registered for multiple roles appears as one entry
@@ -884,12 +948,14 @@ export async function approveCourier(courierId) {
   if (error) throw new Error(error.message || 'Failed to approve courier');
   if (!courier) throw new Error('Courier not found');
 
-  // Mark all their pending documents as approved
-  await supabase
+  // Mark all their pending documents as approved. The app reads these rows,
+  // so leaving them pending makes Documents disagree with this flag.
+  const { error: docsError } = await supabase
     .from('courier_documents')
-    .update({ status: 'approved' })
+    .update({ status: 'approved', verified_at: new Date().toISOString() })
     .eq('courier_id', courierId)
     .eq('status', 'pending');
+  if (docsError) throw new Error(docsError.message || 'Failed to approve courier documents');
 
   // Notify the courier
   await sendExpoPush(courierId, {
