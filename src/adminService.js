@@ -276,7 +276,7 @@ export async function getAdminOrders(options = {}) {
       customer_id,
       courier_id,
       stores ( store_name ),
-      order_items ( product_name, quantity )
+      order_items ( product_name, quantity, unit, weight_kg )
     `, { count: 'exact' })
     .order(column, { ascending })
     // Rows sharing a sort value (same store, same status) would otherwise come
@@ -297,7 +297,11 @@ export async function getAdminOrders(options = {}) {
   const orders = (data || []).map(({ order_items: lines, ...o }) => ({
     ...o,
     store_name: o.stores?.store_name ?? (Array.isArray(o.stores) ? o.stores[0]?.store_name : null),
-    items: (lines || []).map((i) => ({ name: i.product_name || 'Item', quantity: Number(i.quantity) || 0 })),
+    items: (lines || []).map((i) => ({
+      name: i.product_name || 'Item',
+      quantity: Number(i.quantity) || 0,
+      weight_kg: i.unit === 'kg' && i.weight_kg != null ? Number(i.weight_kg) : null,
+    })),
   }));
 
   if (orders.length > 0) {
@@ -366,7 +370,7 @@ export function ordersToCsv(orders) {
     ['Store', (o) => o.store_name],
     ['Customer', (o) => o.customer_name],
     ['Phone', (o) => o.customer_phone],
-    ['Items', (o) => (o.items || []).map((i) => `${i.quantity} x ${i.name}`).join('; ')],
+    ['Items', (o) => (o.items || []).map((i) => (i.weight_kg != null ? `${i.weight_kg} kg ${i.name}` : `${i.quantity} x ${i.name}`)).join('; ')],
     ['Status', (o) => o.status],
     ['Payment status', (o) => o.payment_status],
     ['Payment method', (o) => o.payment_method],

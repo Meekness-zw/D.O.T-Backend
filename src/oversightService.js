@@ -368,9 +368,11 @@ export async function getOrderDetail(orderId) {
   if (error) throw new Error(error.message || 'Failed to load order');
   if (!order) { const e = new Error('Order not found'); e.status = 404; throw e; }
 
-  const [{ data: items }, { data: history }, { data: customer }, { data: courier }] = await Promise.all([
+  const [{ data: items, error: itemsError }, { data: history }, { data: customer }, { data: courier }] = await Promise.all([
     supabase.from('order_items')
-      .select('id, product_id, product_name, product_price, quantity, subtotal, special_instructions')
+      // order_items has no special_instructions column; asking for one fails
+      // the whole query, which used to show every order as having no items.
+      .select('id, product_id, product_name, product_price, quantity, unit, weight_kg, subtotal, selected_options')
       .eq('order_id', orderId),
     supabase.from('order_status_history')
       .select('status, notes, created_at')
@@ -385,6 +387,8 @@ export async function getOrderDetail(orderId) {
           .eq('id', order.courier_id).maybeSingle()
       : Promise.resolve({ data: null }),
   ]);
+
+  if (itemsError) throw new Error(itemsError.message || 'Failed to load order items');
 
   let company = null;
   if (courier?.company_id) {
@@ -402,8 +406,10 @@ export async function getOrderDetail(orderId) {
   // stored subtotal. A mismatch means the row was written wrong or a price
   // moved underneath it, and an admin resolving a billing complaint needs to
   // see that rather than be handed a tidy number that does not add up.
+  // Items sold by weight store quantity 1 and charge price × weight_kg.
   const lines = (items || []).map((i) => {
-    const computed = money(Number(i.product_price) * Number(i.quantity));
+    const amount = i.unit === 'kg' && i.weight_kg != null ? Number(i.weight_kg) : Number(i.quantity);
+    const computed = money(Number(i.product_price) * amount);
     const stored = i.subtotal != null ? money(i.subtotal) : null;
     return {
       ...i,
