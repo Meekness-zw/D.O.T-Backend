@@ -76,7 +76,7 @@ export async function getMerchantOversight(merchantId, { period = 'daily', from,
     .from('merchants')
     .select(`id, business_name, business_type, business_registration_number, tax_id,
              is_verified, is_active, approval_status, created_at,
-             user_profiles ( full_name, email, phone )`)
+             user_profiles ( full_name, email, phone, is_suspended )`)
     .eq('id', merchantId)
     .maybeSingle();
   if (mErr) throw new Error(mErr.message || 'Failed to load merchant');
@@ -155,7 +155,7 @@ export async function getCourierOversight(courierId, { period = 'daily', from, t
     .select(`id, national_id, date_of_birth, city, drivers_license_number, drivers_license_expiry,
              is_online, is_verified, verification_status, rating, total_deliveries, total_earnings,
              account_balance, company_id, created_at,
-             user_profiles ( full_name, email, phone, profile_photo )`)
+             user_profiles ( full_name, email, phone, profile_photo, is_suspended )`)
     .eq('id', courierId)
     .maybeSingle();
   if (cErr) throw new Error(cErr.message || 'Failed to load courier');

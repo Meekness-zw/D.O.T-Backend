@@ -142,17 +142,22 @@ export async function getAdminStatsCharts() {
   };
 }
 
+const USER_ROLE_TABLES = { customer: 'customers', merchant: 'merchants', courier: 'couriers' };
+
 export async function getAdminUsers(options = {}) {
   if (!supabase) throw new Error('Server not configured');
   const { limit = 50, offset = 0, role, search } = options;
 
+  // A role filter matches membership in that role's table, not
+  // user_profiles.role: that column holds the role someone signed up with, so
+  // a customer who later registered as a courier was missing from "Courier".
+  const roleTable = USER_ROLE_TABLES[role];
+  const columns = 'id, email, phone, full_name, role, is_suspended, created_at';
   let query = supabase
     .from('user_profiles')
-    .select('id, email, phone, full_name, role, is_suspended, created_at', { count: 'exact' })
+    .select(roleTable ? `${columns}, ${roleTable}!inner ( id )` : columns, { count: 'exact' })
     .order('created_at', { ascending: false })
     .range(offset, offset + limit - 1);
-
-  if (role) query = query.eq('role', role);
   if (search && search.trim()) {
     const term = `%${search.trim()}%`;
     query = query.or(`full_name.ilike.${term},email.ilike.${term},phone.ilike.${term}`);
@@ -160,7 +165,7 @@ export async function getAdminUsers(options = {}) {
 
   const { data, error, count } = await query;
   if (error) throw new Error(error.message || 'Failed to fetch users');
-  const users = data || [];
+  const users = (data || []).map(({ [roleTable]: _membership, ...u }) => u);
 
   // Roles: same source of truth as app `getRoles` — membership in customers / merchants / couriers,
   // plus optional `user_roles` rows, then fallback to `user_profiles.role`.
