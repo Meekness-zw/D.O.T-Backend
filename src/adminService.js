@@ -275,7 +275,8 @@ export async function getAdminOrders(options = {}) {
       store_id,
       customer_id,
       courier_id,
-      stores ( store_name )
+      stores ( store_name ),
+      order_items ( product_name, quantity )
     `, { count: 'exact' })
     .order(column, { ascending })
     // Rows sharing a sort value (same store, same status) would otherwise come
@@ -293,9 +294,10 @@ export async function getAdminOrders(options = {}) {
   const { data, error, count } = await query;
   if (error) throw new Error(error.message || 'Failed to fetch orders');
 
-  const orders = (data || []).map((o) => ({
+  const orders = (data || []).map(({ order_items: lines, ...o }) => ({
     ...o,
     store_name: o.stores?.store_name ?? (Array.isArray(o.stores) ? o.stores[0]?.store_name : null),
+    items: (lines || []).map((i) => ({ name: i.product_name || 'Item', quantity: Number(i.quantity) || 0 })),
   }));
 
   if (orders.length > 0) {
@@ -364,6 +366,7 @@ export function ordersToCsv(orders) {
     ['Store', (o) => o.store_name],
     ['Customer', (o) => o.customer_name],
     ['Phone', (o) => o.customer_phone],
+    ['Items', (o) => (o.items || []).map((i) => `${i.quantity} x ${i.name}`).join('; ')],
     ['Status', (o) => o.status],
     ['Payment status', (o) => o.payment_status],
     ['Payment method', (o) => o.payment_method],
