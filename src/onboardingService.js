@@ -1,4 +1,5 @@
 import { supabaseAdmin } from './supabaseAdminClient.js';
+import { ensureCourierAccountProfile } from './courierAccountProfile.js';
 import { getSuggestedProductCategoryNames } from './storeCategorySuggestions.js';
 import { verifyStoreCategory } from './storeCategorizationAI.js';
 
@@ -200,6 +201,8 @@ export async function upsertCourierProfile({
   if (age < 18) {
     throw new Error('You must be at least 18 years old to create a courier account');
   }
+
+  await ensureCourierAccountProfile(supabase, userId, name);
 
   // Update display name only; role is determined by table membership, email is never overwritten
   const { error: profileError } = await supabase

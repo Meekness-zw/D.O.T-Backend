@@ -25,6 +25,7 @@ import {
   courierPayoutFlags,
   resolveCourierPayoutDestination,
 } from './orderPaymentSplit.js';
+import { deliveryBreakdownForOrder } from './deliveryFee.js';
 import { resolveCheckoutGateway } from './checkoutGateway.js';
 import { getSmilePayConfig } from './smilePayService.js';
 import { getPesepayConfig } from './pesepayConfig.js';
@@ -104,6 +105,10 @@ export function settlementForOrder(order) {
       weekly_commission_amount: weeklyCommissionAmount,
     },
 
+    // The delivery fee explained: distance, base, distance charge, the cap,
+    // and how it divides between the courier and DOT.
+    delivery: deliveryBreakdownForOrder(order),
+
     courier: {
       courier_id: order.courier_id,
       delivery_fee_share: courierFeeShare,
@@ -138,6 +143,7 @@ export function settlementForOrder(order) {
 export function applyDotPaidCourier(settlement) {
   const share = money(settlement.courier.amount_due);
   settlement.courier.paid_by_dot = true;
+  if (settlement.delivery) settlement.delivery.paid_by_dot = true;
   settlement.courier.amount_due = 0;
   settlement.courier.dot_delivery_cut = money((settlement.courier.dot_delivery_cut || 0) + share);
   settlement.dot.delivery_cut = money(settlement.dot.delivery_cut + share);
@@ -165,6 +171,7 @@ export async function listSettlements({ from, to, storeId, courierId, limit = 50
     .select(`id, order_number, created_at, actual_delivery_time, status, payment_status,
              payment_method, subtotal, delivery_fee, customer_delivery_fee, dot_delivery_subsidy,
              tax, total_amount, store_id, courier_id,
+             pickup_latitude, pickup_longitude, delivery_latitude, delivery_longitude,
              stores!inner ( id, store_name, merchant_id )`)
     .eq('payment_status', 'paid')
     .eq('status', 'delivered')
@@ -214,6 +221,7 @@ export async function settlementDetail(orderId) {
     .select(`id, order_number, created_at, actual_delivery_time, status, payment_status,
              payment_method, subtotal, delivery_fee, customer_delivery_fee, dot_delivery_subsidy,
              tax, total_amount, store_id, courier_id,
+             pickup_latitude, pickup_longitude, delivery_latitude, delivery_longitude,
              stores ( id, store_name, merchant_id, address_line1, city )`)
     .eq('id', orderId)
     .maybeSingle();

@@ -11,6 +11,7 @@ import {
   uploadProfilePhoto,
   recordCourierProfilePhotoDocument,
 } from './userService.js';
+import { calculateDeliveryFee, deliveryFeeQuote, haversineKm } from './deliveryFee.js';
 import { getOrdersForUser, getWalletTransactionsForUser, getPaymentsForUser, getFullUserMe, getMerchantDashboardStats, resolveCourierProfilePhotoUrl } from './historyService.js';
 import {
   createPesepayTransaction,
@@ -286,25 +287,7 @@ async function notifyAvailableCouriers(orderId, orderNumber, storeName) {
 }
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
-// Simple distance + ETA helpers
-function deg2rad(deg) {
-  return (deg * Math.PI) / 180;
-}
-
-function haversineKm(lat1, lon1, lat2, lon2) {
-  const R = 6371; // km
-  const dLat = deg2rad(lat2 - lat1);
-  const dLon = deg2rad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(deg2rad(lat1)) *
-      Math.cos(deg2rad(lat2)) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-}
-
+// Simple ETA helper (distance + delivery fee rules live in deliveryFee.js)
 function estimateEtaMinutes(distanceKm) {
   const speedKmh = 25; // average courier speed
   const minutes = (distanceKm / speedKmh) * 60;
@@ -312,7 +295,6 @@ function estimateEtaMinutes(distanceKm) {
   return Math.round(clamped);
 }
 
-// Delivery fee: $5 base for ≤10 km; beyond that $0.50/km ($0.55 during rush hour).
 // Rush hour = weekdays 7–9 am and 5–7 pm Zimbabwe time (CAT = UTC+2).
 function isRushHour(date = new Date()) {
   const localHour = (date.getUTCHours() + 2) % 24;
@@ -321,22 +303,7 @@ function isRushHour(date = new Date()) {
   return weekday && ((localHour >= 7 && localHour < 9) || (localHour >= 17 && localHour < 19));
 }
 
-/**
- * Delivery fee: $4.99 for any job within 5 km of the pickup, then
- * $0.50 for every kilometer (started) beyond that.
- * The $4.99 base splits $4.00 to the courier and $0.99 to DOT — the
- * platform's ~20% cut on delivery (see computeCourierDeliveryPayoutUsd).
- */
 const ALLOWED_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/jpg', 'image/webp']);
-
-function calculateDeliveryFee(distanceKm) {
-  const BASE = 4.99;
-  const BASE_KM = 5;
-  const d = Number(distanceKm) || 0;
-  if (d <= BASE_KM) return BASE;
-  const extraKm = Math.ceil(d - BASE_KM);
-  return Math.round((BASE + extraKm * 0.5) * 100) / 100;
-}
 
 // ─── Discount codes ─────────────────────────────────────────────────────────
 // Admin-issued codes the customer types in at checkout (distinct from the
@@ -2488,8 +2455,14 @@ app.get('/stores/:storeId/delivery-fee', async (req, res) => {
       .maybeSingle();
     if (error || !store) return res.status(404).json({ error: 'Store not found' });
     const distanceKm = haversineKm(store.latitude, store.longitude, deliveryLat, deliveryLng);
-    const fee = calculateDeliveryFee(distanceKm);
-    return res.json({ delivery_fee: fee, distance_km: Math.round(distanceKm * 10) / 10, is_rush_hour: isRushHour() });
+    const quote = deliveryFeeQuote(distanceKm);
+    return res.json({
+      delivery_fee: quote.fee,
+      distance_km: quote.distance_km,
+      is_capped: quote.capped,
+      max_delivery_fee: quote.cap,
+      is_rush_hour: isRushHour(),
+    });
   } catch (error) {
     return res.status(500).json({ error: 'Failed to calculate delivery fee' });
   }
@@ -4506,7 +4479,7 @@ app.patch('/orders/:id', requireAuth, requireApprovedMerchant, async (req, res) 
   try {
     if (!supabase) throw new Error('Server not configured');
     const { id } = req.params;
-    const { status, prep_time_minutes } = req.body || {};
+    const { status, prep_time_minutes, cancellation_reason } = req.body || {};
     const allowed = ['confirmed', 'preparing', 'ready', 'cancelled'];
     if (!status || !allowed.includes(status)) {
       return res.status(400).json({
@@ -4514,9 +4487,12 @@ app.patch('/orders/:id', requireAuth, requireApprovedMerchant, async (req, res) 
         details: `status must be one of: ${allowed.join(', ')}`,
       });
     }
+    // The customer is told why the store cancelled. The app and dashboard
+    // require a reason; older app builds don't send one, so it stays optional here.
+    const cancelReason = String(cancellation_reason || '').trim().slice(0, 300) || null;
     const { data: order, error: orderError } = await supabase
       .from('orders')
-      .select('id, store_id, status, payment_status, payment_method, customer_id, order_number')
+      .select('id, store_id, status, payment_status, payment_method, customer_id, order_number, total_amount')
       .eq('id', id)
       .maybeSingle();
     if (orderError || !order) return res.status(404).json({ error: 'Order not found' });
@@ -4579,6 +4555,7 @@ app.patch('/orders/:id', requireAuth, requireApprovedMerchant, async (req, res) 
     // order back to 'preparing', which makes it vanish from both the
     // assigned courier's active list and the open job board.
     const ORDER_PATCH_TRANSITIONS = {
+      awaiting_payment: ['cancelled'],
       pending: ['confirmed', 'preparing', 'cancelled'],
       confirmed: ['preparing', 'cancelled'],
       preparing: ['ready', 'cancelled'],
@@ -4595,9 +4572,19 @@ app.patch('/orders/:id', requireAuth, requireApprovedMerchant, async (req, res) 
     // 'preparing' is the moment the order first becomes visible to couriers
     // (see notifyAvailableCouriers below) — start the 45-minute unmatched
     // clock right here so it covers the full time the order sits open.
-    const orderUpdate = status === 'preparing'
-      ? { status, courier_match_started_at: new Date().toISOString(), courier_match_expired_at: null }
-      : { status };
+    const totalAmount = Number(order.total_amount);
+    const refundOnCancel =
+      status === 'cancelled' &&
+      paymentConfirmed &&
+      Number.isFinite(totalAmount) &&
+      totalAmount > 0;
+
+    let orderUpdate = { status };
+    if (status === 'preparing') {
+      orderUpdate = { status, courier_match_started_at: new Date().toISOString(), courier_match_expired_at: null };
+    } else if (refundOnCancel) {
+      orderUpdate = { status, payment_status: 'refunded' };
+    }
 
     const { data: updated, error: updateError } = await supabase
       .from('orders')
@@ -4614,16 +4601,37 @@ app.patch('/orders/:id', requireAuth, requireApprovedMerchant, async (req, res) 
       });
     }
 
+    if (status === 'cancelled') {
+      // The status-guarded update above is the claim, so this refund runs once.
+      if (refundOnCancel) {
+        await refundCancelledOrderToWallet(order, totalAmount);
+      }
+      // Best-effort: the column comes from migrations/2026-10-22-order-cancellation-reason.sql.
+      // The reason is also kept in order_status_history below, so cancelling
+      // still works before that migration has run.
+      if (cancelReason) {
+        const { error: reasonError } = await supabase
+          .from('orders')
+          .update({ cancellation_reason: cancelReason })
+          .eq('id', updated.id);
+        if (reasonError) {
+          console.warn('orders.cancellation_reason not saved:', reasonError.message);
+        }
+      }
+    }
+
     // Record status change in history table. prep_time_minutes (merchant's
     // estimate, picked when accepting into 'preparing') isn't a dedicated
     // order column — it's just recorded here so it's visible on the order's
     // timeline without needing a schema change for what's an informational
     // estimate, not something anything else in the flow depends on.
     const prepMinutes = Number(prep_time_minutes);
-    const notes =
-      status === 'preparing' && Number.isFinite(prepMinutes) && prepMinutes > 0
-        ? `Estimated prep time: ${Math.round(prepMinutes)} min`
-        : null;
+    let notes = null;
+    if (status === 'preparing' && Number.isFinite(prepMinutes) && prepMinutes > 0) {
+      notes = `Estimated prep time: ${Math.round(prepMinutes)} min`;
+    } else if (status === 'cancelled') {
+      notes = cancelReason ? `Cancelled by store: ${cancelReason}` : 'Cancelled by store';
+    }
     const { error: historyError } = await supabase.from('order_status_history').insert({
       order_id: updated.id,
       status,
@@ -4646,6 +4654,8 @@ app.patch('/orders/:id', requireAuth, requireApprovedMerchant, async (req, res) 
       orderNumber: updated.order_number,
       status,
       storeName: storeRow?.store_name,
+      reason: status === 'cancelled' ? cancelReason : null,
+      refunded: refundOnCancel,
     });
 
     // Ping couriers as soon as the merchant accepts (→ preparing) rather than waiting
@@ -4664,6 +4674,42 @@ app.patch('/orders/:id', requireAuth, requireApprovedMerchant, async (req, res) 
     });
   }
 });
+
+// Credits a cancelled, already-paid order back to the customer's in-app
+// wallet. Pesepay/Smile Cash have no refund API, so wallet credit is the only
+// automated way to return the money. Callers must have already claimed the
+// cancellation with a status-guarded update so this runs once per order.
+async function refundCancelledOrderToWallet(order, totalAmount) {
+  const prevBalance = await getWalletBalance(order.customer_id, 'customer');
+  const newBalance = Math.round((prevBalance + totalAmount) * 100) / 100;
+  const methodLabel = order.payment_method === 'pesepay'
+    ? ' (paid via Pesepay)'
+    : order.payment_method === 'smilepay'
+      ? ' (paid via Smile Cash)'
+      : '';
+
+  const { error: refundError } = await supabase.from('wallet_transactions').insert({
+    user_id: order.customer_id,
+    user_type: 'customer',
+    transaction_type: 'refund',
+    amount: totalAmount,
+    balance_after: newBalance,
+    description: `Refund: cancelled order ${order.order_number}${methodLabel}`,
+    reference_id: order.id,
+    status: 'completed',
+  });
+
+  if (refundError) {
+    console.error('cancelled order wallet refund error:', refundError);
+    throw new Error(refundError.message || 'Failed to refund wallet');
+  }
+
+  await supabase
+    .from('payments')
+    .update({ status: 'refunded' })
+    .eq('order_id', order.id)
+    .eq('customer_id', order.customer_id);
+}
 
 // POST /orders/:id/cancel — customer cancels before the store marks the order ready (wallet refunds applied)
 app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
@@ -4741,35 +4787,7 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
     // 'paid' before the merchant accepts, so this only ever fires for
     // wallet/pesepay orders that were actually charged upfront.
     if (wasPaid) {
-      const prevBalance = await getWalletBalance(order.customer_id, 'customer');
-      const newBalance = Math.round((prevBalance + totalAmount) * 100) / 100;
-      const methodLabel = order.payment_method === 'pesepay'
-        ? ' (paid via Pesepay)'
-        : order.payment_method === 'smilepay'
-          ? ' (paid via Smile Cash)'
-          : '';
-
-      const { error: refundError } = await supabase.from('wallet_transactions').insert({
-        user_id: order.customer_id,
-        user_type: 'customer',
-        transaction_type: 'refund',
-        amount: totalAmount,
-        balance_after: newBalance,
-        description: `Refund: cancelled order ${order.order_number}${methodLabel}`,
-        reference_id: order.id,
-        status: 'completed',
-      });
-
-      if (refundError) {
-        console.error('customer cancel wallet refund error:', refundError);
-        throw new Error(refundError.message || 'Failed to refund wallet');
-      }
-
-      await supabase
-        .from('payments')
-        .update({ status: 'refunded' })
-        .eq('order_id', order.id)
-        .eq('customer_id', order.customer_id);
+      await refundCancelledOrderToWallet(order, totalAmount);
     }
 
     const { error: historyError } = await supabase.from('order_status_history').insert({

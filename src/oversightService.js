@@ -63,7 +63,8 @@ function summarise(settlements, period, pick) {
 const ORDER_COLS = `id, order_number, created_at, actual_delivery_time, status, payment_status,
   payment_method, subtotal, delivery_fee, customer_delivery_fee, dot_delivery_subsidy,
   tax, total_amount, store_id, courier_id,
-  pickup_address, delivery_address`;
+  pickup_address, delivery_address,
+  pickup_latitude, pickup_longitude, delivery_latitude, delivery_longitude`;
 
 /**
  * A merchant, end to end: business, stores, opening hours, products, banking,
@@ -360,6 +361,7 @@ export async function getOrderDetail(orderId) {
              subtotal, delivery_fee, customer_delivery_fee, dot_delivery_subsidy,
              tax, total_amount, discount_code, delivery_notes,
              pickup_address, delivery_address, delivery_code,
+             pickup_latitude, pickup_longitude, delivery_latitude, delivery_longitude,
              courier_latitude, courier_longitude, courier_location_updated_at,
              customer_id, courier_id, store_id,
              stores ( id, store_name, merchant_id, phone, address_line1, city )`)

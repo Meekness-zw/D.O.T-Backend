@@ -636,6 +636,60 @@ export async function handlePesepayCallback(callbackBody) {
 }
 
 /**
+ * A payment that completes after its order was cancelled (customer changed
+ * payment method, or the store cancelled while payment was pending) must not
+ * revive the order or pay the merchant. Credit it to the customer's wallet,
+ * the same refund route the cancel endpoints use.
+ */
+async function refundLatePaymentForCancelledOrder(order, payment) {
+  // Status-guarded claim so a webhook and a status poll can't both refund.
+  const { data: claimed } = await supabase
+    .from('orders')
+    .update({ payment_status: 'refunded' })
+    .eq('id', order.id)
+    .eq('status', 'cancelled')
+    .not('payment_status', 'in', '(paid,refunded)')
+    .select('id')
+    .maybeSingle();
+  if (!claimed) return;
+
+  const amount = Number(payment?.amount ?? order.total_amount);
+  if (!Number.isFinite(amount) || amount <= 0) return;
+
+  const prevBalance = await getWalletBalance(order.customer_id, 'customer');
+  const newBalance = Math.round((prevBalance + amount) * 100) / 100;
+  const { error: refundError } = await supabase.from('wallet_transactions').insert({
+    user_id: order.customer_id,
+    user_type: 'customer',
+    transaction_type: 'refund',
+    amount,
+    balance_after: newBalance,
+    description: `Refund: payment received after order ${order.order_number} was cancelled`,
+    reference_id: order.id,
+    status: 'completed',
+  });
+  if (refundError) {
+    console.error('[Pesepay] late payment refund failed:', refundError);
+    throw new Error(refundError.message || 'Failed to refund wallet');
+  }
+
+  await supabase.from('payments').update({ status: 'refunded' }).eq('order_id', order.id);
+
+  try {
+    await insertUserNotification(supabase, {
+      userId: order.customer_id,
+      title: 'Payment refunded',
+      message: `Your payment for cancelled order #${order.order_number} has been refunded to your wallet.`,
+      type: 'payment',
+      referenceId: order.id,
+      audience: 'customer',
+    });
+  } catch (notifyErr) {
+    console.warn('[Pesepay] late refund notification failed (non-fatal):', notifyErr?.message);
+  }
+}
+
+/**
  * After Pesepay confirms a payment linked to an order: mark order paid, apply merchant split.
  */
 // Exported so a synchronous payment method (wallet) can reuse the exact same
@@ -661,6 +715,10 @@ export async function finalizeOrderPaymentFromPesepay({ payment, paymentStatus, 
     if (order.payment_status === 'paid') {
       return { order, walletTransaction: null, skipped: true };
     }
+    if (order.status === 'cancelled') {
+      await refundLatePaymentForCancelledOrder(order, payment);
+      return { order, walletTransaction: null, skipped: true };
+    }
 
     const { platformCommission, merchantEarnings } = computeSubtotalSplit(order.subtotal);
 
@@ -683,12 +741,18 @@ export async function finalizeOrderPaymentFromPesepay({ payment, paymentStatus, 
         merchant_earnings_amount: merchantEarnings,
       })
       .eq('id', order.id)
+      .neq('status', 'cancelled')
       .select('*')
-      .single();
+      .maybeSingle();
 
     if (orderUpdateError) {
       console.error('[Pesepay] Failed to mark order paid:', orderUpdateError);
       throw new Error(orderUpdateError.message || 'Failed to update order');
+    }
+    if (!updatedOrder) {
+      // Cancelled between the load above and this update.
+      await refundLatePaymentForCancelledOrder({ ...order, status: 'cancelled' }, payment);
+      return { order, walletTransaction: null, skipped: true };
     }
 
     if (quickbooksService.isConfigured()) {

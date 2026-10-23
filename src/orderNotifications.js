@@ -89,14 +89,20 @@ export async function notifyCustomerMerchantOrderStatus(supabase, {
   orderNumber,
   status,
   storeName,
+  reason = null,
+  refunded = false,
 }) {
   if (!customerId || !status) return;
   const numLabel = orderNumber ? `#${orderNumber}` : 'your order';
 
+  const cancelledParts = [`${numLabel} was cancelled by the store.`];
+  if (reason) cancelledParts.push(`Reason: ${reason}.`);
+  if (refunded) cancelledParts.push('The amount you paid has been refunded to your wallet.');
+
   const map = {
     cancelled: {
       title: 'Order cancelled',
-      message: `${numLabel} was cancelled by the store.`,
+      message: cancelledParts.join(' '),
     },
   };
 
@@ -110,7 +116,7 @@ export async function notifyCustomerMerchantOrderStatus(supabase, {
     type: 'order',
     referenceId: orderId,
     audience: 'customer',
-    data: { orderId, orderNumber, storeName },
+    data: { orderId, orderNumber, storeName, ...(reason ? { reason } : {}) },
   });
 }
 

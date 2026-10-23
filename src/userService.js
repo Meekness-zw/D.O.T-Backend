@@ -133,10 +133,11 @@ export async function ensureUserProfile({
       { onConflict: 'id' }
     );
   } else if (role === 'courier') {
-    await supabaseAdmin.from('couriers').upsert(
+    const { error: courierError } = await supabaseAdmin.from('couriers').upsert(
       { id: userId },
       { onConflict: 'id' }
     );
+    if (courierError) throw courierError;
   }
 
   return true;
