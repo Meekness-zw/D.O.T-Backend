@@ -151,3 +151,20 @@ test('every role that supervises couriers can see the fleet', () => {
     assert.ok(SECTIONS[role].includes('fleet'), `${role} cannot see the fleet`);
   }
 });
+
+test('the accountant can review and pay withdrawals; marketing cannot touch them', () => {
+  assert.equal(can('accountant', 'GET', '/admin/withdrawals'), true);
+  assert.equal(can('accountant', 'PATCH', '/admin/withdrawals/abc'), true);
+  assert.equal(can('sales_marketing', 'GET', '/admin/withdrawals'), false);
+  assert.equal(can('sales_marketing', 'PATCH', '/admin/withdrawals/abc'), false);
+  assert.ok(SECTIONS.admin.includes('withdrawals'));
+  assert.ok(SECTIONS.accountant.includes('withdrawals'));
+  assert.ok(!SECTIONS.sales_marketing.includes('withdrawals'));
+});
+
+test('staff-login roles match: the accountant can pay withdrawals there too', async () => {
+  const { dashboardRoleCanAccess, DASHBOARD_SECTIONS } = await import('../src/adminAuth.js');
+  assert.equal(dashboardRoleCanAccess('accountant', 'PATCH', '/admin/withdrawals/abc'), true);
+  assert.equal(dashboardRoleCanAccess('sales_marketing', 'PATCH', '/admin/withdrawals/abc'), false);
+  assert.ok(DASHBOARD_SECTIONS.accountant.includes('withdrawals'));
+});

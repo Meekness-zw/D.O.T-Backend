@@ -95,6 +95,12 @@ import {
 } from './orderPaymentSplit.js';
 import { createInternalCourier } from './internalCourierService.js';
 import {
+  MIN_WITHDRAWAL_USD,
+  NO_DESTINATION_DETAILS,
+  payoutDestinationFor,
+  emailStaffAboutWithdrawal,
+} from './withdrawals.js';
+import {
   listSettlements,
   settlementDetail,
   recordDisbursement,
@@ -1113,8 +1119,8 @@ app.use((req, res, next) => {
 });
 
 const DASHBOARD_SECTIONS = {
-  admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals', 'settlements', 'companies', 'fleet', 'quickbooks'],
-  accountant: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'settlements', 'companies', 'fleet', 'quickbooks'],
+  admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals', 'settlements', 'withdrawals', 'companies', 'fleet', 'quickbooks'],
+  accountant: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'settlements', 'withdrawals', 'companies', 'fleet', 'quickbooks'],
   sales_marketing: ['overview', 'users', 'orders', 'merchants', 'couriers', 'stores', 'discounts', 'approvals', 'companies', 'fleet'],
 };
 
@@ -1139,6 +1145,9 @@ function dashboardRoleCanAccess(role, method, path) {
     // Accountant manages the QuickBooks connection (connect/disconnect/mappings/backfill) in
     // addition to the usual read-only financial views.
     if (path.startsWith('/admin/quickbooks')) return true;
+    // Paying out wallet withdrawals (couriers' and merchants' earnings) is the
+    // accountant's job, so they can approve, reject and mark them paid.
+    if (path.startsWith('/admin/withdrawals')) return true;
     // Disbursement is the accountant's core job: they see who is owed what and
     // record each transfer. Scoped to /admin/settlements only — this does not
     // widen anything else they can write.
@@ -7590,11 +7599,10 @@ app.get('/users/me/wallet-balance-24h', requireAuth, async (req, res) => {
   }
 });
 
-// POST /wallet/withdraw — customer/merchant/courier requests a payout of their
-// in-app wallet balance. The amount is debited immediately (so it can't be
-// spent twice while the request sits pending) and an admin reviews/pays it
-// out manually via the admin API below (no in-app admin UI, same pattern as
-// approvals/broadcasts/discount codes).
+// POST /wallet/withdraw — merchant/courier requests a payout of their in-app
+// wallet balance. The amount is debited immediately (so it can't be spent
+// twice while the request sits pending). Admins and accountants are emailed,
+// and pay it to the user's payout account from the dashboard's Withdrawals page.
 app.post('/wallet/withdraw', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
@@ -7617,10 +7625,25 @@ app.post('/wallet/withdraw', requireAuth, async (req, res) => {
     if (!Number.isFinite(amt) || amt <= 0) {
       return res.status(400).json({ error: 'Invalid amount', details: 'amount must be > 0' });
     }
+    if (amt < MIN_WITHDRAWAL_USD) {
+      return res.status(400).json({
+        error: 'Below minimum',
+        details: `The minimum withdrawal is $${MIN_WITHDRAWAL_USD.toFixed(2)}.`,
+      });
+    }
     if (requestedRole === 'courier' && !(await courierPayoutsEnabled(req.userId))) {
       return res.status(403).json({
         error: 'Payouts are off',
-        details: 'DOT pays this rider directly. Job earnings are not withdrawn from the app.',
+        details: NO_DESTINATION_DETAILS.paid_by_dot,
+      });
+    }
+
+    // Staff can only pay a request that says where the money goes.
+    const destination = await payoutDestinationFor(supabase, req.userId, requestedRole);
+    if (!destination || destination.kind === 'blocked') {
+      return res.status(400).json({
+        error: 'No payout account',
+        details: NO_DESTINATION_DETAILS[destination?.reason] || NO_DESTINATION_DETAILS.no_payout_method,
       });
     }
 
@@ -7669,6 +7692,16 @@ app.post('/wallet/withdraw', requireAuth, async (req, res) => {
       await supabase.from('withdrawal_requests').delete().eq('id', request.id);
       throw new Error(debitError.message || 'Failed to debit wallet');
     }
+
+    supabase
+      .from('user_profiles')
+      .select('full_name')
+      .eq('id', req.userId)
+      .maybeSingle()
+      .then(({ data: profile }) =>
+        emailStaffAboutWithdrawal(supabase, { request, requesterName: profile?.full_name, destination }),
+      )
+      .catch((err) => console.error('withdrawal staff email failed (non-fatal):', err.message));
 
     return res.status(201).json({ request });
   } catch (error) {
@@ -10066,7 +10099,21 @@ app.get('/admin/withdrawals', requireAdmin, async (req, res) => {
     if (status) query = query.eq('status', status);
     const { data, error } = await query;
     if (error) throw new Error(error.message || 'Failed to load withdrawal requests');
-    return res.json({ requests: data || [] });
+
+    // Where to send each open request. Looked up live rather than stored, so
+    // it follows an account the user corrects while the request is waiting.
+    const requests = data || [];
+    const destinations = new Map();
+    await Promise.all(
+      [...new Set(requests.filter((r) => ['pending', 'approved'].includes(r.status)).map((r) => `${r.user_id}:${r.role}`))]
+        .map(async (key) => {
+          const [userId, role] = key.split(':');
+          destinations.set(key, await payoutDestinationFor(supabase, userId, role));
+        }),
+    );
+    for (const r of requests) r.payout_destination = destinations.get(`${r.user_id}:${r.role}`) || null;
+
+    return res.json({ requests });
   } catch (error) {
     console.error('get /admin/withdrawals error:', error);
     return res.status(500).json({
@@ -10076,9 +10123,10 @@ app.get('/admin/withdrawals', requireAdmin, async (req, res) => {
   }
 });
 
-// PATCH /admin/withdrawals/:id — approve/reject/mark-paid. Rejecting refunds
-// the reserved amount back to the user's wallet; approve/paid just record
-// that the admin sent (or will send) the money outside the app.
+// PATCH /admin/withdrawals/:id — approve/reject/mark-paid, by an admin or
+// accountant. pending → approved | rejected | paid, approved → paid | rejected.
+// Rejecting refunds the reserved amount back to the user's wallet;
+// approve/paid record that staff sent (or will send) the money outside the app.
 app.patch('/admin/withdrawals/:id', requireAdmin, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
@@ -10097,11 +10145,12 @@ app.patch('/admin/withdrawals/:id', requireAdmin, async (req, res) => {
     if (reqError) throw new Error(reqError.message || 'Failed to load withdrawal request');
     if (!reqRow) return res.status(404).json({ error: 'Withdrawal request not found' });
 
+    const fromStatuses = status === 'approved' ? ['pending'] : ['pending', 'approved'];
     const { data: updated, error: updateError } = await supabase
       .from('withdrawal_requests')
       .update({ status, admin_note: admin_note || null, processed_at: new Date().toISOString() })
       .eq('id', id)
-      .eq('status', 'pending')
+      .in('status', fromStatuses)
       .select('*')
       .maybeSingle();
     if (updateError) throw new Error(updateError.message || 'Failed to update withdrawal request');

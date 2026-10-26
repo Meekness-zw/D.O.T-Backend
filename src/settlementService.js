@@ -152,6 +152,16 @@ export function applyDotPaidCourier(settlement) {
   return settlement;
 }
 
+/**
+ * Every other courier's share is credited to their in-app wallet when the
+ * order is delivered, and they are paid when they request a withdrawal (see
+ * withdrawals.js). Paying it again from here would pay them twice.
+ */
+export function applyWalletPaidCourier(settlement) {
+  settlement.courier.paid_via_wallet = true;
+  return settlement;
+}
+
 export function reconcile(s) {
   const out = money(s.store.amount_due + s.courier.amount_due + s.dot.net + s.lines.tax);
   return { balanced: Math.abs(out - s.customer_paid) < 0.02, distributed: out, charged: s.customer_paid };
@@ -204,10 +214,13 @@ export async function listSettlements({ from, to, storeId, courierId, limit = 50
   return orders.map((o) => {
     const s = settlementForOrder(o);
     if (payoutFlags.get(o.courier_id) === false) applyDotPaidCourier(s);
-    else s.reconciliation = reconcile(s);
+    else {
+      s.reconciliation = reconcile(s);
+      if (o.courier_id) applyWalletPaidCourier(s);
+    }
     s.paid = {
       merchant: paidKeys.has(`${o.id}:merchant`),
-      courier: paidKeys.has(`${o.id}:courier`),
+      courier: paidKeys.has(`${o.id}:courier`) || !!s.courier.paid_via_wallet,
     };
     return s;
   });
@@ -233,7 +246,10 @@ export async function settlementDetail(orderId) {
   const s = settlementForOrder({ ...order, store: order.stores });
   const payoutFlags = await courierPayoutFlags([order.courier_id]);
   if (payoutFlags.get(order.courier_id) === false) applyDotPaidCourier(s);
-  else s.reconciliation = reconcile(s);
+  else {
+    s.reconciliation = reconcile(s);
+    if (order.courier_id) applyWalletPaidCourier(s);
+  }
 
   const { data: items } = await supabase
     .from('order_items')
@@ -280,6 +296,9 @@ export async function recordDisbursement({ orderId, recipientType, actor, note }
     if (!s.courier.courier_id) fail(400, 'No courier on this order');
     if (s.courier.paid_by_dot) {
       fail(409, 'Paid by DOT', 'This rider is on the DOT payroll, so this job is not paid out.');
+    }
+    if (s.courier.paid_via_wallet) {
+      fail(409, 'Paid via withdrawal', 'This share went to the courier\'s wallet. They are paid when they request a withdrawal (see Withdrawals).');
     }
     if (s.courier.amount_due <= 0) fail(400, 'Nothing owed to the courier');
   } else if (!s.store.merchant_id) {

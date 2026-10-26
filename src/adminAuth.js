@@ -358,8 +358,8 @@ async function consumeRecoveryCode(userId, submitted) {
 // ─── Role permissions ───────────────────────────────────────────────────────
 
 export const DASHBOARD_SECTIONS = {
-  admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals', 'quickbooks', 'admins'],
-  accountant: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'payments', 'quickbooks'],
+  admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals', 'withdrawals', 'quickbooks', 'admins'],
+  accountant: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'payments', 'withdrawals', 'quickbooks'],
   sales_marketing: ['overview', 'users', 'merchants', 'stores', 'discounts'],
 };
 
@@ -378,6 +378,9 @@ export function dashboardRoleCanAccess(role, method, path) {
     // Accountant manages the QuickBooks connection (connect/disconnect/mappings/backfill) in
     // addition to the usual read-only financial views.
     if (path.startsWith('/admin/quickbooks')) return true;
+    // Paying out wallet withdrawals (couriers' and merchants' earnings) is the
+    // accountant's job, so they can approve, reject and mark them paid.
+    if (path.startsWith('/admin/withdrawals')) return true;
     // Accountants can inspect registered customers, merchants, and couriers,
     // but approval and user-management actions remain admin-only.
     if (path === '/admin/users/pending') return false;
