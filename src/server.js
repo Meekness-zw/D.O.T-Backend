@@ -5993,14 +5993,9 @@ app.patch('/courier/orders/:id/location', requireAuth, requireApprovedCourier, a
       });
     }
 
-    const me = await getFullUserMe(req.userId);
-    if (!me?.roles?.includes('courier')) {
-      return res.status(403).json({
-        error: 'Forbidden',
-        details: 'User is not a courier',
-      });
-    }
-
+    // requireApprovedCourier has already confirmed this is an approved
+    // courier. This runs every few seconds per active courier, so it skips
+    // the full profile/wallet lookup the other courier routes do.
     const { data: order, error: orderError } = await supabase
       .from('orders')
       .select('id, courier_id')
