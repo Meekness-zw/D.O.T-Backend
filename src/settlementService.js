@@ -30,6 +30,8 @@ import { resolveCheckoutGateway } from './checkoutGateway.js';
 import { getSmilePayConfig } from './smilePayService.js';
 import { getPesepayConfig } from './pesepayConfig.js';
 
+import { LATE_CANCEL_NOTE } from './lateCancel.js';
+
 const supabase = supabaseAdmin;
 
 const money = (n) => Math.round((Number(n) || 0) * 100) / 100;
@@ -162,6 +164,46 @@ export function applyWalletPaidCourier(settlement) {
   return settlement;
 }
 
+/**
+ * The customer cancelled after waiting 60+ minutes past handover (see
+ * lateCancel.js). They were refunded in full, the courier earns nothing, and
+ * DOT still pays the store for food it made and handed over.
+ */
+export function applyLateCancellation(settlement) {
+  const storeDue = money(settlement.store.amount_due);
+  settlement.late_cancellation = true;
+  settlement.customer_paid = 0;
+  settlement.lines = { ...settlement.lines, tax: 0 };
+  settlement.courier.amount_due = 0;
+  settlement.courier.delivery_fee_share = 0;
+  settlement.courier.dot_delivery_cut = 0;
+  settlement.dot = {
+    ...settlement.dot,
+    product_markup: 0,
+    markup_amount: 0,
+    weekly_commission_amount: 0,
+    delivery_cut: 0,
+    promo_subsidy: 0,
+    net: money(-storeDue),
+  };
+  settlement.reconciliation = reconcile(settlement);
+  return settlement;
+}
+
+/** Of these order ids, the ones a customer cancelled for late delivery. */
+async function lateCancelledIds(orderIds) {
+  const ids = [...new Set(orderIds.filter(Boolean))];
+  if (!ids.length) return new Set();
+  const { data, error } = await supabase
+    .from('order_status_history')
+    .select('order_id')
+    .in('order_id', ids)
+    .eq('status', 'cancelled')
+    .eq('notes', LATE_CANCEL_NOTE);
+  if (error) throw new Error(error.message || 'Failed to load late cancellations');
+  return new Set((data || []).map((row) => row.order_id));
+}
+
 export function reconcile(s) {
   const out = money(s.store.amount_due + s.courier.amount_due + s.dot.net + s.lines.tax);
   return { balanced: Math.abs(out - s.customer_paid) < 0.02, distributed: out, charged: s.customer_paid };
@@ -196,7 +238,36 @@ export async function listSettlements({ from, to, storeId, courierId, limit = 50
   const { data, error } = await query;
   if (error) throw new Error(error.message || 'Failed to load settlements');
 
-  const orders = (data || []).map((o) => ({ ...o, store: o.stores }));
+  // Late-delivery cancellations: refunded, but the store is still owed.
+  const { data: lateRows, error: lateError } = await supabase
+    .from('order_status_history')
+    .select('order_id')
+    .eq('status', 'cancelled')
+    .eq('notes', LATE_CANCEL_NOTE);
+  if (lateError) throw new Error(lateError.message || 'Failed to load late cancellations');
+  let lateOrders = [];
+  const lateIds = [...new Set((lateRows || []).map((row) => row.order_id))];
+  if (lateIds.length) {
+    let lateQuery = supabase
+      .from('orders')
+      .select(`id, order_number, created_at, actual_delivery_time, status, payment_status,
+               payment_method, subtotal, delivery_fee, customer_delivery_fee, dot_delivery_subsidy,
+               tax, total_amount, store_id, courier_id,
+               pickup_latitude, pickup_longitude, delivery_latitude, delivery_longitude,
+               stores!inner ( id, store_name, merchant_id )`)
+      .in('id', lateIds)
+      .eq('status', 'cancelled');
+    if (from) lateQuery = lateQuery.gte('created_at', from);
+    if (to) lateQuery = lateQuery.lte('created_at', to);
+    if (storeId) lateQuery = lateQuery.eq('store_id', storeId);
+    if (courierId) lateQuery = lateQuery.eq('courier_id', courierId);
+    const { data: lateData, error: lateOrdersError } = await lateQuery;
+    if (lateOrdersError) throw new Error(lateOrdersError.message || 'Failed to load late cancellations');
+    lateOrders = lateData || [];
+  }
+  const lateSet = new Set(lateOrders.map((o) => o.id));
+
+  const orders = [...(data || []), ...lateOrders].map((o) => ({ ...o, store: o.stores }));
   const orderIds = orders.map((o) => o.id);
   const payoutFlags = await courierPayoutFlags(orders.map((o) => o.courier_id));
 
@@ -213,14 +284,16 @@ export async function listSettlements({ from, to, storeId, courierId, limit = 50
 
   return orders.map((o) => {
     const s = settlementForOrder(o);
-    if (payoutFlags.get(o.courier_id) === false) applyDotPaidCourier(s);
+    if (lateSet.has(o.id)) applyLateCancellation(s);
+    else if (payoutFlags.get(o.courier_id) === false) applyDotPaidCourier(s);
     else {
       s.reconciliation = reconcile(s);
       if (o.courier_id) applyWalletPaidCourier(s);
     }
     s.paid = {
       merchant: paidKeys.has(`${o.id}:merchant`),
-      courier: paidKeys.has(`${o.id}:courier`) || !!s.courier.paid_via_wallet,
+      // Nothing is owed to the courier on a late cancellation.
+      courier: paidKeys.has(`${o.id}:courier`) || !!s.courier.paid_via_wallet || !!s.late_cancellation,
     };
     return s;
   });
@@ -245,7 +318,9 @@ export async function settlementDetail(orderId) {
 
   const s = settlementForOrder({ ...order, store: order.stores });
   const payoutFlags = await courierPayoutFlags([order.courier_id]);
-  if (payoutFlags.get(order.courier_id) === false) applyDotPaidCourier(s);
+  const isLateCancel = order.status === 'cancelled' && (await lateCancelledIds([order.id])).has(order.id);
+  if (isLateCancel) applyLateCancellation(s);
+  else if (payoutFlags.get(order.courier_id) === false) applyDotPaidCourier(s);
   else {
     s.reconciliation = reconcile(s);
     if (order.courier_id) applyWalletPaidCourier(s);

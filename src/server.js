@@ -95,6 +95,13 @@ import {
 } from './orderPaymentSplit.js';
 import { createInternalCourier } from './internalCourierService.js';
 import {
+  LATE_CANCEL_STATUSES,
+  LATE_CANCEL_NOTE,
+  handoverTimes,
+  lateCancelAvailableAt,
+  attachLateCancel,
+} from './lateCancel.js';
+import {
   MIN_WITHDRAWAL_USD,
   NO_DESTINATION_DETAILS,
   payoutDestinationFor,
@@ -4719,7 +4726,9 @@ async function refundCancelledOrderToWallet(order, totalAmount) {
     .eq('customer_id', order.customer_id);
 }
 
-// POST /orders/:id/cancel — customer cancels before the store marks the order ready (wallet refunds applied)
+// POST /orders/:id/cancel — customer cancels before the store accepts, or once
+// the courier has had it 60 minutes after handover (see lateCancel.js). Paid
+// orders are refunded to the customer's wallet.
 app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
@@ -4728,7 +4737,7 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
     const { data: order, error: orderError } = await supabase
       .from('orders')
       .select(
-        'id, customer_id, store_id, status, payment_status, payment_method, total_amount, order_number',
+        'id, customer_id, store_id, courier_id, status, payment_status, payment_method, total_amount, order_number',
       )
       .eq('id', id)
       .maybeSingle();
@@ -4747,13 +4756,30 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
       .toLowerCase()
       .trim()
       .replace(/\s+/g, '_');
-    const cancellable = new Set(['awaiting_payment', 'pending']);
-    if (!cancellable.has(st)) {
-      return res.status(400).json({
-        error: 'Cannot cancel this order',
-        details:
-          'You can only cancel before the merchant accepts your order. Contact support if you need help.',
-      });
+    const earlyStatuses = ['awaiting_payment', 'pending'];
+    let lateCancel = false;
+    if (!earlyStatuses.includes(st)) {
+      const handedOverAt = LATE_CANCEL_STATUSES.includes(st)
+        ? (await handoverTimes(supabase, [order.id])).get(order.id)
+        : null;
+      const availableAt = lateCancelAvailableAt(st, handedOverAt);
+      if (!availableAt) {
+        return res.status(400).json({
+          error: 'Cannot cancel this order',
+          details:
+            'You can only cancel before the merchant accepts your order, or if the courier has not delivered it within 60 minutes of collecting it. Contact support if you need help.',
+        });
+      }
+      const waitMs = Date.parse(availableAt) - Date.now();
+      if (waitMs > 0) {
+        const mins = Math.ceil(waitMs / 60000);
+        return res.status(400).json({
+          error: 'Too early to cancel',
+          details: `The courier has your order. If it hasn't arrived, you can cancel in ${mins} minute${mins === 1 ? '' : 's'}.`,
+          late_cancel_available_at: availableAt,
+        });
+      }
+      lateCancel = true;
     }
 
     const totalAmount = Number(order.total_amount);
@@ -4773,7 +4799,7 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
         payment_status: nextPaymentStatus,
       })
       .eq('id', id)
-      .in('status', ['awaiting_payment', 'pending'])
+      .in('status', lateCancel ? LATE_CANCEL_STATUSES : earlyStatuses)
       .select('id, order_number, status, payment_status')
       .maybeSingle();
 
@@ -4801,11 +4827,42 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
     const { error: historyError } = await supabase.from('order_status_history').insert({
       order_id: updated.id,
       status: 'cancelled',
-      notes: 'Cancelled by customer',
+      notes: lateCancel ? LATE_CANCEL_NOTE : 'Cancelled by customer',
       changed_by: req.userId,
     });
     if (historyError) {
       console.error('order_status_history insert (customer cancel) error:', historyError);
+    }
+
+    if (lateCancel) {
+      try {
+        const { data: store } = await supabase
+          .from('stores')
+          .select('merchant_id')
+          .eq('id', order.store_id)
+          .maybeSingle();
+        const num = updated.order_number;
+        await Promise.all([
+          order.courier_id && insertUserNotification(supabase, {
+            userId: order.courier_id,
+            title: 'Order cancelled',
+            message: `The customer cancelled order ${num} because it wasn't delivered within 60 minutes. Contact DOT support about the order you're carrying.`,
+            referenceId: updated.id,
+            audience: 'courier',
+            data: { type: 'order_cancelled', orderId: updated.id, reason: 'late_delivery' },
+          }),
+          store?.merchant_id && insertUserNotification(supabase, {
+            userId: store.merchant_id,
+            title: 'Order cancelled after handover',
+            message: `The customer cancelled order ${num}: the courier didn't deliver it within 60 minutes. You'll still be paid for this order.`,
+            referenceId: updated.id,
+            audience: 'merchant',
+            data: { type: 'order_cancelled', orderId: updated.id, reason: 'late_delivery' },
+          }),
+        ]);
+      } catch (notifyErr) {
+        console.error('late cancel notifications failed (non-fatal):', notifyErr);
+      }
     }
 
     await notifyCustomerOrderSelfCancelled(supabase, {
@@ -4912,6 +4969,7 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
     // can view the order, but must never be able to retrieve the code.
     if (!isCustomer) delete order.delivery_code;
     if (!isCourier && !isMerchant) delete order.pickup_code;
+    if (isCustomer) await attachLateCancel(supabase, [order]);
 
     let courier_full_name = null;
     let courier_phone = null;

@@ -7,6 +7,7 @@ import { supabaseAdmin } from './supabaseAdminClient.js';
 import { getProfile, getRoles } from './userService.js';
 import { getWalletBalances } from './walletLedger.js';
 import { computeSubtotalSplit } from './orderPaymentSplit.js';
+import { attachLateCancel } from './lateCancel.js';
 
 const supabase = supabaseAdmin;
 
@@ -171,6 +172,8 @@ export async function getOrdersForUser(userId, options = {}) {
 
   const { data, error } = await query;
   if (error) throw new Error(error.message || 'Failed to fetch orders');
+  // So the customer app knows when a late order becomes cancellable.
+  if (effectiveRole === 'customer') await attachLateCancel(supabase, data || []);
   return { orders: data || [], role: effectiveRole };
 }
 
