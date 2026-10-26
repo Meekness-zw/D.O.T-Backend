@@ -4998,15 +4998,21 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
     }
 
     let courier_vehicle_type = null;
+    // Plate and look of the vehicle, so the customer can recognise the courier.
+    let courier_vehicle_plate = null;
+    let courier_vehicle_description = null;
     if (order.courier_id) {
       const { data: vehicle } = await supabase
         .from('courier_vehicles')
-        .select('vehicle_type')
+        .select('vehicle_type, license_plate, color, brand, model')
         .eq('courier_id', order.courier_id)
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle();
       courier_vehicle_type = vehicle?.vehicle_type || null;
+      courier_vehicle_plate = vehicle?.license_plate ? String(vehicle.license_plate).trim().toUpperCase() : null;
+      courier_vehicle_description =
+        [vehicle?.color, vehicle?.brand, vehicle?.model].filter(Boolean).join(' ').trim() || null;
     }
 
     return res.json({
@@ -5015,6 +5021,8 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
         store_name: store?.store_name || null,
         courier_full_name,
         courier_vehicle_type,
+        courier_vehicle_plate,
+        courier_vehicle_description,
         courier_phone,
         courier_profile_photo_url,
         requires_id_check,
