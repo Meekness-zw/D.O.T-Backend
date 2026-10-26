@@ -125,6 +125,7 @@ export async function getOrdersForUser(userId, options = {}) {
         customer_id,
         courier_id,
         courier_match_expired_at,
+        pickup_code,
         stores ( store_name ),
         order_items (
           product_id,

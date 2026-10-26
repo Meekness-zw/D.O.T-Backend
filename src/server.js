@@ -4830,6 +4830,7 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
         id,
         order_number,
         delivery_code,
+        pickup_code,
         customer_id,
         store_id,
         courier_id,
@@ -4902,6 +4903,7 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
     // The handoff secret belongs only to the customer. Couriers and merchants
     // can view the order, but must never be able to retrieve the code.
     if (!isCustomer) delete order.delivery_code;
+    if (!isCourier && !isMerchant) delete order.pickup_code;
 
     let courier_full_name = null;
     let courier_phone = null;
@@ -5605,6 +5607,7 @@ app.get('/courier/orders/active', requireAuth, requireApprovedCourier, async (re
         total_amount,
         delivery_fee,
         status,
+        pickup_code,
         pickup_address,
         pickup_latitude,
         pickup_longitude,
@@ -5834,13 +5837,16 @@ app.post('/courier/jobs/:id/accept', requireAuth, requireApprovedCourier, async 
 
     // Single atomic update: only wins if still accepted-and-unassigned (preparing
     // or ready), avoids races with other couriers grabbing the same job.
+    // The courier shows this at the store; the merchant sees the same code
+    // and releases the order only to the courier whose code matches.
+    const pickupCode = String(crypto.randomInt(0, 100)).padStart(2, '0');
     const { data: updated, error: updateError } = await supabase
       .from('orders')
-      .update({ courier_id: req.userId, status: 'assigned' })
+      .update({ courier_id: req.userId, status: 'assigned', pickup_code: pickupCode })
       .eq('id', id)
       .in('status', ['preparing', 'ready'])
       .is('courier_id', null)
-      .select('id, order_number, status, courier_id, customer_id')
+      .select('id, order_number, status, courier_id, customer_id, pickup_code')
       .maybeSingle();
 
     if (updateError) {
@@ -5937,6 +5943,8 @@ app.post('/courier/orders/:id/drop', requireAuth, requireApprovedCourier, async 
       .update({
         courier_id: null,
         status: 'ready',
+        // The next courier to accept gets a fresh code.
+        pickup_code: null,
         courier_match_started_at: new Date().toISOString(),
         courier_match_expired_at: null,
       })
