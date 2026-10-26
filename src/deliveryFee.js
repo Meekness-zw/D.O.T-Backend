@@ -20,6 +20,17 @@ export const DELIVERY_PER_KM_USD = 0.5;
 
 const money = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
+// How far a store delivers. A merchant may set a tighter radius than the
+// limit (e.g. "only 5 km out" for hot food); no store delivers beyond it.
+export const DEFAULT_DELIVERY_RADIUS_KM = 15;
+export const MAX_DELIVERY_RADIUS_KM = 15;
+
+/** The distance (km) this store will actually deliver to. */
+export function storeDeliveryRadiusKm(store) {
+  const merchantRadiusKm = Number(store?.delivery_radius_km) || DEFAULT_DELIVERY_RADIUS_KM;
+  return Math.min(merchantRadiusKm, MAX_DELIVERY_RADIUS_KM);
+}
+
 /** Most a customer is ever charged for delivery (default $8). */
 export function getMaxDeliveryFeeUsd() {
   const raw = process.env.MAX_DELIVERY_FEE_USD;

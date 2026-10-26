@@ -11,7 +11,7 @@ import {
   uploadProfilePhoto,
   recordCourierProfilePhotoDocument,
 } from './userService.js';
-import { calculateDeliveryFee, deliveryFeeQuote, haversineKm } from './deliveryFee.js';
+import { calculateDeliveryFee, deliveryFeeQuote, haversineKm, storeDeliveryRadiusKm } from './deliveryFee.js';
 import { getOrdersForUser, getWalletTransactionsForUser, getPaymentsForUser, getFullUserMe, getMerchantDashboardStats, resolveCourierProfilePhotoUrl } from './historyService.js';
 import {
   createPesepayTransaction,
@@ -130,10 +130,11 @@ import * as quickbooksService from './quickbooksService.js';
 import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
 
 const app = express();
-// Render guarantees the left-most X-Forwarded-For value is the real client
-// address. Let Express resolve that trusted proxy chain, then validate and
-// normalize it before using it in any limiter or durable counter.
-app.set('trust proxy', true);
+// Trust exactly one proxy hop (Render's load balancer), so req.ip is the
+// address that balancer saw. `true` would take the left-most
+// X-Forwarded-For value, which the client can set to anything — letting one
+// caller rotate fake IPs past every rate limiter keyed on req.ip.
+app.set('trust proxy', 1);
 const supabase = supabaseAdmin;
 const requireApprovedCourier = createRequireApprovedCourier({ client: supabase });
 const requireApprovedMerchant = createRequireApprovedMerchant({ client: supabase });
@@ -1103,6 +1104,9 @@ app.use((req, res, next) => {
 // Request timeout middleware (30 seconds)
 app.use((req, res, next) => {
   req.setTimeout(30000, () => {
+    // A handler may already have started (or finished) responding; writing
+    // again would throw ERR_HTTP_HEADERS_SENT from this timer and crash the process.
+    if (res.headersSent) return;
     res.status(408).json({ error: 'Request timeout' });
   });
   next();
@@ -1630,10 +1634,8 @@ app.get('/stores', optionalAuth, async (req, res) => {
     // that store's own delivery_radius_km, not every active store in the
     // database regardless of how far away it is. A merchant can still set a
     // *tighter* radius than the cap (e.g. "I only deliver 5km out"), but
-    // nothing shows a regular customer past MAX_CUSTOMER_VISIBLE_RADIUS_KM
+    // nothing shows a regular customer past MAX_DELIVERY_RADIUS_KM (deliveryFee.js)
     // regardless of what they've configured.
-    const DEFAULT_DELIVERY_RADIUS_KM = 15;
-    const MAX_CUSTOMER_VISIBLE_RADIUS_KM = 15;
     if (hasLocation) {
       stores = stores.map((s) => {
         if (s.latitude == null || s.longitude == null) {
@@ -1647,9 +1649,7 @@ app.get('/stores', optionalAuth, async (req, res) => {
         stores = stores.filter((s) => {
           // No coordinates on file → can't confirm it's actually deliverable, exclude rather than guess.
           if (s.distance_km == null) return false;
-          const merchantRadiusKm = Number(s.delivery_radius_km) || DEFAULT_DELIVERY_RADIUS_KM;
-          const radiusKm = Math.min(merchantRadiusKm, MAX_CUSTOMER_VISIBLE_RADIUS_KM);
-          return s.distance_km <= radiusKm;
+          return s.distance_km <= storeDeliveryRadiusKm(s);
         });
       }
     }
@@ -6588,7 +6588,7 @@ app.post('/orders', requireAuth, async (req, res) => {
     const { data: store, error: storeError } = await supabase
       .from('stores')
       .select(
-        'id, store_name, address_line1, city, latitude, longitude, is_active, is_open, operating_hours, merchant_id, merchants!inner ( is_active, approval_status )',
+        'id, store_name, address_line1, city, latitude, longitude, is_active, is_open, operating_hours, merchant_id, delivery_radius_km, merchants!inner ( is_active, approval_status )',
       )
       .eq('id', store_id)
       .eq('merchants.is_active', true)
@@ -6766,6 +6766,26 @@ app.post('/orders', requireAuth, async (req, res) => {
       store.latitude, store.longitude,
       defAddr.latitude, defAddr.longitude,
     );
+
+    // The store list already hides stores out of range; this stops an order
+    // reaching one anyway (address changed after opening the store, a shared
+    // store link). Unrestricted-browsing accounts see every store, so they
+    // can order from any of them, same as the listing.
+    const radiusKm = storeDeliveryRadiusKm(store);
+    if (Number.isFinite(distanceKm) && distanceKm > radiusKm) {
+      const { data: browsingProfile } = await supabase
+        .from('user_profiles')
+        .select('unrestricted_browsing')
+        .eq('id', req.userId)
+        .maybeSingle();
+      if (!browsingProfile?.unrestricted_browsing) {
+        return res.status(400).json({
+          error: 'Out of delivery range',
+          details: `${store.store_name || 'This store'} delivers up to ${radiusKm} km away. Your delivery address is ${Math.round(distanceKm * 10) / 10} km away.`,
+        });
+      }
+    }
+
     const deliveryFee = calculateDeliveryFee(distanceKm);
     const tax = 0;
 

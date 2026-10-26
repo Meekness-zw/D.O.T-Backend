@@ -9,7 +9,7 @@ mock.module('../src/supabaseAdminClient.js', { namedExports: { supabaseAdmin: nu
 process.env.DELIVERY_PLATFORM_CUT_RATE = '0.2';
 delete process.env.MAX_DELIVERY_FEE_USD;
 
-const { calculateDeliveryFee, deliveryFeeQuote, deliveryBreakdownForOrder } = await import('../src/deliveryFee.js');
+const { calculateDeliveryFee, deliveryFeeQuote, deliveryBreakdownForOrder, storeDeliveryRadiusKm } = await import('../src/deliveryFee.js');
 
 test('base fee within 5 km', () => {
   assert.equal(calculateDeliveryFee(0), 4.99);
@@ -65,4 +65,10 @@ test('an order priced before the cap is flagged, not re-priced', () => {
   assert.equal(b.priced_by_current_rules, false);
   assert.equal(b.current_rules_fee, 8);
   assert.equal(b.capped, false);
+});
+
+test('a store delivers up to its own radius, never past 15 km', () => {
+  assert.equal(storeDeliveryRadiusKm({ delivery_radius_km: 5 }), 5);
+  assert.equal(storeDeliveryRadiusKm({ delivery_radius_km: 40 }), 15);
+  assert.equal(storeDeliveryRadiusKm({}), 15);
 });
