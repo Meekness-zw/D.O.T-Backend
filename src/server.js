@@ -98,7 +98,6 @@ import {
   MIN_WITHDRAWAL_USD,
   NO_DESTINATION_DETAILS,
   payoutDestinationFor,
-  emailStaffAboutWithdrawal,
 } from './withdrawals.js';
 import {
   listSettlements,
@@ -7601,8 +7600,8 @@ app.get('/users/me/wallet-balance-24h', requireAuth, async (req, res) => {
 
 // POST /wallet/withdraw — merchant/courier requests a payout of their in-app
 // wallet balance. The amount is debited immediately (so it can't be spent
-// twice while the request sits pending). Admins and accountants are emailed,
-// and pay it to the user's payout account from the dashboard's Withdrawals page.
+// twice while the request sits pending). It appears on the dashboard's
+// Withdrawals page, where an admin or accountant pays it to the user's account.
 app.post('/wallet/withdraw', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
@@ -7692,16 +7691,6 @@ app.post('/wallet/withdraw', requireAuth, async (req, res) => {
       await supabase.from('withdrawal_requests').delete().eq('id', request.id);
       throw new Error(debitError.message || 'Failed to debit wallet');
     }
-
-    supabase
-      .from('user_profiles')
-      .select('full_name')
-      .eq('id', req.userId)
-      .maybeSingle()
-      .then(({ data: profile }) =>
-        emailStaffAboutWithdrawal(supabase, { request, requesterName: profile?.full_name, destination }),
-      )
-      .catch((err) => console.error('withdrawal staff email failed (non-fatal):', err.message));
 
     return res.status(201).json({ request });
   } catch (error) {
@@ -10083,6 +10072,23 @@ app.patch('/admin/discount-codes/:id', requireAdmin, async (req, res) => {
       error: 'Failed to update discount code',
       details: error.message || 'Please try again later',
     });
+  }
+});
+
+// GET /admin/withdrawals/pending-count — the number on the dashboard's
+// Withdrawals menu item, polled every 30s, so it skips the account lookups.
+app.get('/admin/withdrawals/pending-count', requireAdmin, async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Server not configured');
+    const { count, error } = await supabase
+      .from('withdrawal_requests')
+      .select('id', { count: 'exact', head: true })
+      .eq('status', 'pending');
+    if (error) throw new Error(error.message || 'Failed to count withdrawal requests');
+    return res.json({ count: count || 0 });
+  } catch (error) {
+    console.error('get /admin/withdrawals/pending-count error:', error);
+    return res.status(500).json({ error: 'Failed to count withdrawal requests' });
   }
 });
 
