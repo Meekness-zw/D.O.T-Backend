@@ -1,7 +1,29 @@
 import 'dotenv/config.js';
 import express from 'express';
 import cors from 'cors';
-import { loginWithPassword, checkPhoneRegistered, deleteUserById } from './authService.js';
+import {
+  loginWithPassword,
+  checkPhoneRegistered,
+  deleteUserById,
+  findProfileByPhone,
+  findProfileById,
+  sessionForProfile,
+} from './authService.js';
+import {
+  pinProblem,
+  hashPin,
+  isPinLocked,
+  checkAccountPin,
+  setAccountPin,
+  issueDeviceToken,
+  userForDeviceToken,
+  revokeDeviceToken,
+  revokeAllDeviceTokens,
+  createEmailCode,
+  checkEmailCode,
+  consumeEmailCode,
+  maskEmail,
+} from './pinAuth.js';
 import { verifyFirebaseToken } from './firebaseAdmin.js';
 import {
   ensureUserProfile,
@@ -660,7 +682,7 @@ app.post('/auth/firebase-verify', async (req, res) => {
     });
 
     // 5. Sign in to get a live Supabase session
-    const sessionData = await loginWithPassword({ phone: verifiedPhone, password });
+    const sessionData = await loginWithPassword({ phone: verifiedPhone, password, allowWithPin: true });
 
     return res.status(201).json({
       success: true,
@@ -725,21 +747,24 @@ const otpStore = new Map();
 app.post('/auth/send-otp', otpRequestLimiter, async (req, res) => {
   try {
     const role = req.body?.role;
-    const password = req.body?.password;
+    // New sign-ups choose a 4-digit PIN; older app versions still send a password.
+    const pin = req.body?.pin != null ? String(req.body.pin) : null;
+    const password = pin ? null : req.body?.password;
     const name = String(req.body?.name || '').trim();
     const email = String(req.body?.email || '').trim().toLowerCase();
     const phone = normalizeE164(req.body?.phone);
-    if (!phone || !role || !password || !email || !name) {
+    if (!phone || !role || !(password || pin) || !email || !name) {
       if (req.body?.phone && !phone) {
         return res.status(400).json({
           error: 'Invalid phone number',
           details: 'Enter the number with its country code, e.g. +263 77 123 4567 or +44 7911 123456.',
         });
       }
-      const missing = ['phone', 'name', 'email', 'role', 'password'].filter((field) => {
+      const missing = ['phone', 'name', 'email', 'role', 'pin'].filter((field) => {
         if (field === 'email') return !email;
         if (field === 'name') return !name;
         if (field === 'phone') return !phone;
+        if (field === 'pin') return !(password || pin);
         return !req.body?.[field];
       });
       return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
@@ -752,9 +777,14 @@ app.post('/auth/send-otp', otpRequestLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Invalid role' });
     }
 
-    const passwordCheck = await assertStrongPassword(password);
-    if (!passwordCheck.valid) {
-      return res.status(400).json({ error: passwordCheck.error });
+    if (pin) {
+      const problem = pinProblem(pin);
+      if (problem) return res.status(400).json({ error: problem });
+    } else {
+      const passwordCheck = await assertStrongPassword(password);
+      if (!passwordCheck.valid) {
+        return res.status(400).json({ error: passwordCheck.error });
+      }
     }
 
     // Only allow signup for phones not already in user_profiles
@@ -789,7 +819,16 @@ app.post('/auth/send-otp', otpRequestLimiter, async (req, res) => {
 
     // Store the code only after the email is accepted, so a failed send
     // leaves any earlier code still valid.
-    otpStore.set(phone, { code, expiresAt, name, role, password, email, failedAttempts: 0 });
+    otpStore.set(phone, {
+      code,
+      expiresAt,
+      name,
+      role,
+      password,
+      pinHash: pin ? hashPin(pin) : null,
+      email,
+      failedAttempts: 0,
+    });
     return res.status(200).json({ success: true, channel: 'email' });
   } catch (error) {
     console.error('send-otp error:', error.message);
@@ -831,7 +870,7 @@ app.post('/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
     }
 
     otpStore.delete(phone);
-    const { name, role, password, email } = entry;
+    const { name, role, password, pinHash, email } = entry;
 
     const existing = await checkPhoneRegistered(phone);
     let userId;
@@ -852,7 +891,7 @@ app.post('/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
     } else {
       const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
         phone,
-        password,
+        ...(password ? { password } : {}),
         phone_confirm: true,
       });
       if (authError) {
@@ -864,7 +903,7 @@ app.post('/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
           }
           const { data: retryData, error: retryError } = await supabaseAdmin.auth.admin.createUser({
             phone,
-            password,
+            ...(password ? { password } : {}),
             phone_confirm: true,
           });
           if (retryError) throw retryError;
@@ -879,7 +918,25 @@ app.post('/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
 
     await ensureUserProfile({ userId, email: email || null, phone, fullName: name || '', role, password });
 
-    const sessionData = await loginWithPassword({ phone, password });
+    if (pinHash) {
+      // PIN sign-up: the email code just proved this phone, so trust it.
+      const { error: pinError } = await supabaseAdmin
+        .from('user_profiles')
+        .update({ pin_hash: pinHash, pin_failed_attempts: 0, pin_locked_until: null })
+        .eq('id', userId);
+      if (pinError) throw pinError;
+      const profile = await findProfileById(userId);
+      const sessionData = sessionForProfile(profile);
+      const deviceToken = await issueDeviceToken(userId, 'device');
+      return res.status(201).json({
+        success: true,
+        user: { ...sessionData.user, role },
+        session: sessionData.session,
+        deviceToken,
+      });
+    }
+
+    const sessionData = await loginWithPassword({ phone, password, allowWithPin: true });
 
     return res.status(201).json({
       success: true,
@@ -4178,6 +4235,14 @@ app.post('/auth/login-password', loginLimiter, async (req, res) => {
       });
     }
 
+    if (msg.includes('signs in with a PIN')) {
+      return res.status(409).json({
+        code: 'USE_PIN',
+        error: 'Sign in with your PIN',
+        details: 'This account now signs in with a 4-digit PIN instead of a password.',
+      });
+    }
+
     if (msg.includes('Incorrect phone or password')) {
       return res.status(401).json({
         error: msg,
@@ -4196,6 +4261,240 @@ app.post('/auth/login-password', loginLimiter, async (req, res) => {
       error: 'Failed to sign in',
       details: 'Please try again',
     });
+  }
+});
+
+// ── PIN sign-in ─────────────────────────────────────────────────────────────
+// See src/pinAuth.js. A trusted device signs in with phone + PIN; any other
+// device needs an emailed code first. Face ID / fingerprint uses a separate
+// biometric token held behind the phone's own check.
+
+const pinStatusLimiter = authRateLimiter({
+  max: 30,
+  windowMinutes: 15,
+  message: 'Too many attempts for this number. Please try again in 15 minutes.',
+});
+
+function pinSignInResponse(profile, extra = {}) {
+  const data = sessionForProfile(profile);
+  return { success: true, user: data.user, session: data.session, ...extra };
+}
+
+async function profileForPinRequest(req, res) {
+  const phone = normalizeE164(req.body?.phone);
+  if (!phone) {
+    res.status(400).json({ error: 'Invalid phone number', details: 'Enter the number with its country code.' });
+    return null;
+  }
+  const profile = await findProfileByPhone(phone);
+  if (!profile) {
+    res.status(404).json({ error: 'No account found with this phone number' });
+    return null;
+  }
+  if (profile.is_suspended) {
+    res.status(403).json({ error: 'Your account has been frozen. Please contact support.' });
+    return null;
+  }
+  return profile;
+}
+
+function pinFailure(res, result) {
+  if (result.locked) {
+    return res.status(423).json({
+      code: 'PIN_LOCKED',
+      error: 'Your PIN is locked',
+      details: 'Too many wrong PINs. Reset your PIN with a code sent to your email.',
+    });
+  }
+  return res.status(401).json({
+    code: 'WRONG_PIN',
+    error: 'Wrong PIN',
+    details: `${result.attemptsLeft} ${result.attemptsLeft === 1 ? 'try' : 'tries'} left before your PIN is locked.`,
+    attemptsLeft: result.attemptsLeft,
+  });
+}
+
+const PIN_NOT_SET = {
+  code: 'PIN_NOT_SET',
+  error: 'Create a PIN',
+  details: 'This account doesn’t have a PIN yet.',
+};
+
+// POST /auth/pin/status { phone, deviceToken? } — what the sign-in screen should ask for.
+app.post('/auth/pin/status', pinStatusLimiter, async (req, res) => {
+  try {
+    const profile = await profileForPinRequest(req, res);
+    if (!profile) return;
+    const trustedUserId = await userForDeviceToken(req.body?.deviceToken, 'device');
+    return res.json({
+      hasPin: !!profile.pin_hash,
+      trusted: trustedUserId === profile.id,
+      locked: isPinLocked(profile),
+      hasEmail: !!profile.email,
+    });
+  } catch (error) {
+    console.error('pin/status error:', error);
+    return res.status(500).json({ error: 'Something went wrong', details: 'Please try again.' });
+  }
+});
+
+// POST /auth/pin/login { phone, pin, deviceToken } — sign in on a trusted device.
+app.post('/auth/pin/login', loginLimiter, async (req, res) => {
+  try {
+    const profile = await profileForPinRequest(req, res);
+    if (!profile) return;
+    if (!profile.pin_hash) return res.status(409).json(PIN_NOT_SET);
+    const trustedUserId = await userForDeviceToken(req.body?.deviceToken, 'device');
+    if (trustedUserId !== profile.id) {
+      return res.status(401).json({
+        code: 'NEW_DEVICE',
+        error: 'Confirm it’s you',
+        details: 'This is a new phone or browser for your account, so we’ll email you a code.',
+      });
+    }
+    const result = await checkAccountPin(profile, req.body?.pin);
+    if (!result.ok) return pinFailure(res, result);
+    return res.json(pinSignInResponse(profile));
+  } catch (error) {
+    console.error('pin/login error:', error);
+    return res.status(500).json({ error: 'Failed to sign in', details: 'Please try again' });
+  }
+});
+
+// POST /auth/pin/send-code { phone, purpose: 'new-device' | 'pin-reset' } — email a one-time code.
+app.post('/auth/pin/send-code', otpRequestLimiter, async (req, res) => {
+  try {
+    const purpose = req.body?.purpose === 'pin-reset' ? 'pin-reset' : 'new-device';
+    const profile = await profileForPinRequest(req, res);
+    if (!profile) return;
+    if (!profile.email) {
+      return res.status(400).json({
+        error: 'No email on this account',
+        details: 'Contact support to add an email address to your account.',
+      });
+    }
+    const code = createEmailCode(profile.id, purpose);
+    try {
+      await sendOtpEmail({ to: profile.email, code, name: profile.full_name || '', purpose });
+    } catch (emailErr) {
+      console.error('pin/send-code email error:', emailErr.message);
+      return res.status(502).json({ error: 'Failed to send the code', details: 'Please try again shortly.' });
+    }
+    return res.json({ success: true, channel: 'email', sentTo: maskEmail(profile.email) });
+  } catch (error) {
+    console.error('pin/send-code error:', error);
+    return res.status(500).json({ error: 'Failed to send the code', details: 'Please try again shortly.' });
+  }
+});
+
+// POST /auth/pin/verify-device { phone, code, pin } — emailed code, then PIN; trusts this device.
+app.post('/auth/pin/verify-device', otpVerifyLimiter, async (req, res) => {
+  try {
+    const profile = await profileForPinRequest(req, res);
+    if (!profile) return;
+    const codeCheck = checkEmailCode(profile.id, 'new-device', req.body?.code);
+    if (!codeCheck.ok) return res.status(codeCheck.status).json({ error: codeCheck.error });
+    if (!profile.pin_hash) return res.status(409).json(PIN_NOT_SET);
+    const result = await checkAccountPin(profile, req.body?.pin);
+    if (!result.ok) return pinFailure(res, result);
+    consumeEmailCode(profile.id);
+    const deviceToken = await issueDeviceToken(profile.id, 'device');
+    return res.json(pinSignInResponse(profile, { deviceToken }));
+  } catch (error) {
+    console.error('pin/verify-device error:', error);
+    return res.status(500).json({ error: 'Failed to sign in', details: 'Please try again' });
+  }
+});
+
+// POST /auth/pin/reset { phone, code, pin } — set a new PIN with an emailed code.
+// Also how an existing password account creates its first PIN.
+app.post('/auth/pin/reset', otpVerifyLimiter, async (req, res) => {
+  try {
+    const problem = pinProblem(req.body?.pin);
+    if (problem) return res.status(400).json({ error: problem });
+    const profile = await profileForPinRequest(req, res);
+    if (!profile) return;
+    const codeCheck = checkEmailCode(profile.id, 'pin-reset', req.body?.code);
+    if (!codeCheck.ok) return res.status(codeCheck.status).json({ error: codeCheck.error });
+    consumeEmailCode(profile.id);
+    await setAccountPin(profile.id, req.body.pin);
+    // Whoever knew the old PIN may hold a trusted device; start over.
+    await revokeAllDeviceTokens(profile.id);
+    const deviceToken = await issueDeviceToken(profile.id, 'device');
+    return res.json(pinSignInResponse(profile, { deviceToken }));
+  } catch (error) {
+    console.error('pin/reset error:', error);
+    return res.status(500).json({ error: 'Failed to set your PIN', details: 'Please try again' });
+  }
+});
+
+// POST /auth/pin/set { pin, currentPin? } — signed in: create or change the PIN.
+// Returns a device token, since this device is now trusted with the new PIN.
+app.post('/auth/pin/set', requireAuth, async (req, res) => {
+  try {
+    const problem = pinProblem(req.body?.pin);
+    if (problem) return res.status(400).json({ error: problem });
+    const profile = await findProfileById(req.userId);
+    if (!profile) return res.status(404).json({ error: 'Account not found' });
+    if (profile.pin_hash) {
+      const result = await checkAccountPin(profile, req.body?.currentPin);
+      if (!result.ok) return pinFailure(res, result);
+    }
+    await setAccountPin(profile.id, req.body.pin);
+    const deviceToken = await issueDeviceToken(profile.id, 'device');
+    return res.json({ success: true, deviceToken });
+  } catch (error) {
+    console.error('pin/set error:', error);
+    return res.status(500).json({ error: 'Failed to save your PIN', details: 'Please try again' });
+  }
+});
+
+// POST /auth/pin/biometric { biometricToken } — Face ID / fingerprint sign-in.
+app.post('/auth/pin/biometric', loginLimiter, async (req, res) => {
+  try {
+    const userId = await userForDeviceToken(req.body?.biometricToken, 'biometric');
+    if (!userId) {
+      return res.status(401).json({
+        code: 'BIOMETRIC_EXPIRED',
+        error: 'Sign in with your PIN',
+        details: 'Face ID / fingerprint sign-in is no longer set up on this phone.',
+      });
+    }
+    const profile = await findProfileById(userId);
+    if (!profile) return res.status(404).json({ error: 'Account not found' });
+    if (profile.is_suspended) {
+      return res.status(403).json({ error: 'Your account has been frozen. Please contact support.' });
+    }
+    return res.json(pinSignInResponse(profile));
+  } catch (error) {
+    console.error('pin/biometric error:', error);
+    return res.status(500).json({ error: 'Failed to sign in', details: 'Please try again' });
+  }
+});
+
+// POST /auth/pin/biometric/enable { deviceToken } — signed in on a trusted device.
+app.post('/auth/pin/biometric/enable', requireAuth, async (req, res) => {
+  try {
+    const trustedUserId = await userForDeviceToken(req.body?.deviceToken, 'device');
+    if (trustedUserId !== req.userId) {
+      return res.status(403).json({ error: 'Sign in with your PIN on this phone first.' });
+    }
+    const biometricToken = await issueDeviceToken(req.userId, 'biometric');
+    return res.json({ success: true, biometricToken });
+  } catch (error) {
+    console.error('pin/biometric/enable error:', error);
+    return res.status(500).json({ error: 'Failed to turn on biometric sign-in' });
+  }
+});
+
+// POST /auth/pin/biometric/disable { biometricToken }
+app.post('/auth/pin/biometric/disable', requireAuth, async (req, res) => {
+  try {
+    await revokeDeviceToken(req.body?.biometricToken);
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('pin/biometric/disable error:', error);
+    return res.status(500).json({ error: 'Failed to turn off biometric sign-in' });
   }
 });
 
@@ -4291,7 +4590,7 @@ app.post('/auth/register', async (req, res) => {
     });
 
     // Sign in to return a live session
-    const sessionData = await loginWithPassword({ phone, password });
+    const sessionData = await loginWithPassword({ phone, password, allowWithPin: true });
 
     return res.status(201).json({
       success: true,

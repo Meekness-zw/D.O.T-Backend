@@ -25,34 +25,80 @@ function buildPhoneCandidates(phone) {
   return { normalised, digits, candidates: Array.from(candidates).filter(Boolean) };
 }
 
-export async function loginWithPassword({ phone, password }) {
+const PROFILE_LOGIN_FIELDS =
+  'id, phone, email, full_name, role, password_hash, is_suspended, pin_hash, pin_failed_attempts, pin_locked_until';
+
+/** The account for a phone number, matching legacy formats too. Null if none. */
+export async function findProfileByPhone(phone) {
+  // Normalise: strip spaces/dashes and ensure leading + so "+263 71 234 5678" matches "+263712345678"
+  const { normalised, digits, candidates } = buildPhoneCandidates(phone);
+
+  const { data: exactProfile, error: profileError } = await supabaseAdmin
+    .from('user_profiles')
+    .select(PROFILE_LOGIN_FIELDS)
+    .eq('phone', normalised)
+    .single();
+
+  if (!profileError && exactProfile) return exactProfile;
+
+  const { data: fallbackProfiles, error: fallbackError } = await supabaseAdmin
+    .from('user_profiles')
+    .select(PROFILE_LOGIN_FIELDS)
+    .in('phone', candidates)
+    .limit(5);
+
+  if (fallbackError) throw fallbackError;
+
+  return (fallbackProfiles || []).find((p) => toPhoneDigits(p.phone) === digits) || null;
+}
+
+export async function findProfileById(userId) {
+  const { data, error } = await supabaseAdmin
+    .from('user_profiles')
+    .select(PROFILE_LOGIN_FIELDS)
+    .eq('id', userId)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+/** The { user, session } a successful sign-in returns. */
+export function sessionForProfile(profile) {
+  const accessTokenTtlSeconds = 60 * 60 * 24 * 3650; // 10 years
+  const accessToken = createSupabaseAccessToken({
+    userId: profile.id,
+    phone: profile.phone,
+    email: profile.email || '',
+    sessionId: randomUUID(),
+    supabaseUrl: process.env.SUPABASE_URL,
+    jwtSecret: process.env.SUPABASE_JWT_SECRET,
+    expiresInSeconds: accessTokenTtlSeconds,
+  });
+
+  return {
+    user: {
+      id: profile.id,
+      phone: profile.phone,
+      email: profile.email || null,
+      full_name: profile.full_name || null,
+      role: profile.role || null,
+    },
+    session: {
+      access_token: accessToken,
+      refresh_token: null,
+      token_type: 'bearer',
+      expires_in: accessTokenTtlSeconds,
+    },
+  };
+}
+
+export async function loginWithPassword({ phone, password, allowWithPin = false }) {
   if (!phone || !password) {
     throw new Error('Phone and password are required');
   }
 
-  // Normalise: strip spaces/dashes and ensure leading + so "+263 71 234 5678" matches "+263712345678"
-  const { normalised, digits, candidates } = buildPhoneCandidates(phone);
-  let profile = null;
-
-  const { data: exactProfile, error: profileError } = await supabaseAdmin
-    .from('user_profiles')
-    .select('id, phone, email, full_name, role, password_hash, is_suspended')
-    .eq('phone', normalised)
-    .single();
-
-  if (!profileError && exactProfile) {
-    profile = exactProfile;
-  } else {
-    const { data: fallbackProfiles, error: fallbackError } = await supabaseAdmin
-      .from('user_profiles')
-      .select('id, phone, email, full_name, role, password_hash, is_suspended')
-      .in('phone', candidates)
-      .limit(5);
-
-    if (fallbackError) throw fallbackError;
-
-    profile = (fallbackProfiles || []).find((p) => toPhoneDigits(p.phone) === digits) || null;
-  }
+  const { normalised } = buildPhoneCandidates(phone);
+  const profile = await findProfileByPhone(phone);
 
   if (!profile) {
     throw new Error('No account found with this phone number');
@@ -60,6 +106,11 @@ export async function loginWithPassword({ phone, password }) {
 
   if (profile.is_suspended) {
     throw new Error('Your account has been frozen. Please contact support.');
+  }
+
+  // Accounts with a PIN no longer sign in with a password.
+  if (profile.pin_hash && !allowWithPin) {
+    throw new Error('This account signs in with a PIN');
   }
 
   const { valid, needsRehash } = verifyPassword(password, profile.password_hash);
@@ -78,32 +129,7 @@ export async function loginWithPassword({ phone, password }) {
       });
   }
 
-  const accessTokenTtlSeconds = 60 * 60 * 24 * 3650; // 10 years
-  const accessToken = createSupabaseAccessToken({
-    userId: profile.id,
-    phone: profile.phone || normalised,
-    email: profile.email || '',
-    sessionId: randomUUID(),
-    supabaseUrl: process.env.SUPABASE_URL,
-    jwtSecret: process.env.SUPABASE_JWT_SECRET,
-    expiresInSeconds: accessTokenTtlSeconds,
-  });
-
-  return {
-    user: {
-      id: profile.id,
-      phone: profile.phone || normalised,
-      email: profile.email || null,
-      full_name: profile.full_name || null,
-      role: profile.role || null,
-    },
-    session: {
-      access_token: accessToken,
-      refresh_token: null,
-      token_type: 'bearer',
-      expires_in: accessTokenTtlSeconds,
-    },
-  };
+  return sessionForProfile({ ...profile, phone: profile.phone || normalised });
 }
 
 export async function checkPhoneRegistered(phone) {

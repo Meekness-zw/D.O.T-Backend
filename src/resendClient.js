@@ -23,6 +23,16 @@ const EMAIL_COPY = {
     intro: 'Use this code to choose a new Delivery On Time password. It expires in 10 minutes.',
     ignore: "If you didn't ask to reset your password, you can ignore this email. Your password will stay the same.",
   },
+  'new-device': {
+    subject: 'Your Delivery On Time sign-in code',
+    intro: 'Use this code to sign in to Delivery On Time on a new phone or browser. It expires in 10 minutes.',
+    ignore: "If you didn't try to sign in, don't share this code with anyone. Your account stays safe without it.",
+  },
+  'pin-reset': {
+    subject: 'Set your Delivery On Time PIN',
+    intro: 'Use this code to set a new 4-digit PIN for Delivery On Time. It expires in 10 minutes.',
+    ignore: "If you didn't ask for this, don't share this code with anyone. Your PIN will stay the same.",
+  },
 };
 
 function emailCopy(purpose) {
