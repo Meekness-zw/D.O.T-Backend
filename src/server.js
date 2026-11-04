@@ -24,6 +24,15 @@ import {
   consumeEmailCode,
   maskEmail,
 } from './pinAuth.js';
+import {
+  ecocashConfigured,
+  ecocashEndUserId,
+  newClientCorrelator,
+  mapEcocashStatus,
+  chargeEcocash,
+  lookupEcocash,
+  ecocashErrorMessage,
+} from './ecocashService.js';
 import { verifyFirebaseToken } from './firebaseAdmin.js';
 import {
   ensureUserProfile,
@@ -4863,7 +4872,7 @@ app.patch('/orders/:id', requireAuth, requireApprovedMerchant, async (req, res) 
     }
     if (
       !isCancelling &&
-      isOnlineCheckoutMethod(order.payment_method) &&
+      (isOnlineCheckoutMethod(order.payment_method) || order.payment_method === 'ecocash') &&
       !['paid', 'completed'].includes(String(order.payment_status || '').toLowerCase())
     ) {
       return res.status(400).json({
@@ -5014,7 +5023,9 @@ async function refundCancelledOrderToWallet(order, totalAmount) {
     ? ' (paid via Pesepay)'
     : order.payment_method === 'smilepay'
       ? ' (paid via Smile Cash)'
-      : '';
+      : order.payment_method === 'ecocash'
+        ? ' (paid via EcoCash)'
+        : '';
 
   const { error: refundError } = await supabase.from('wallet_transactions').insert({
     user_id: order.customer_id,
@@ -6943,10 +6954,17 @@ app.post('/orders', requireAuth, async (req, res) => {
       });
     }
 
-    if (payment_method !== 'wallet' && !isOnlineCheckoutMethod(payment_method)) {
+    const isEcocash = payment_method === 'ecocash';
+    if (isEcocash && !ecocashConfigured()) {
+      return res.status(400).json({
+        error: 'EcoCash is not available',
+        details: 'EcoCash payments are not set up yet. Please pay another way.',
+      });
+    }
+    if (payment_method !== 'wallet' && !isEcocash && !isOnlineCheckoutMethod(payment_method)) {
       return res.status(400).json({
         error: 'Invalid payment_method',
-        details: 'payment_method must be pesepay, smilepay, or wallet',
+        details: 'payment_method must be pesepay, smilepay, ecocash, or wallet',
       });
     }
 
@@ -8636,6 +8654,232 @@ app.post('/payments/pesepay/direct', requireAuth, async (req, res) => {
       details: error.response?.data?.message || error.response?.data?.error || error.message || 'Please try again',
     });
   }
+});
+
+// ── EcoCash (direct) ────────────────────────────────────────────────────────
+// See src/ecocashService.js. The order is created with payment_method
+// 'ecocash' (awaiting_payment); /start sends the customer the EcoCash prompt;
+// the app polls /status until EcoCash says it's charged or failed.
+
+/**
+ * Ask EcoCash where a charge stands, store it, and settle the order once it's
+ * paid (same step as card payments). Returns our payment status.
+ */
+async function syncEcocashPayment(payment) {
+  if (!payment || ['completed', 'failed', 'refunded'].includes(payment.status)) return payment?.status;
+  const endUserId = payment.metadata?.endUserId;
+  if (!endUserId || !payment.transaction_id) return payment.status;
+  let body;
+  try {
+    body = await lookupEcocash({ endUserId, clientCorrelator: payment.transaction_id });
+  } catch (err) {
+    // Not found yet, or EcoCash unreachable: leave it pending and ask again later.
+    console.warn('[EcoCash] lookup failed (will retry):', err?.response?.status, err?.message);
+    return payment.status;
+  }
+  const status = mapEcocashStatus(body);
+  if (status === 'pending') return status;
+  const { data: claimed } = await supabase
+    .from('payments')
+    .update({ status, metadata: { ...(payment.metadata || {}), lookup: body } })
+    .eq('id', payment.id)
+    .eq('status', payment.status)
+    .select('*')
+    .maybeSingle();
+  // Another poll or the callback got here first and settled it.
+  if (!claimed) return status;
+  await finalizeOrderPaymentFromPesepay({ payment: claimed, paymentStatus: status, transaction: body });
+  return status;
+}
+
+async function latestEcocashPayment(orderId) {
+  const { data } = await supabase
+    .from('payments')
+    .select('*')
+    .eq('order_id', orderId)
+    .eq('payment_method', 'ecocash')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  return data || null;
+}
+
+// GET /payments/ecocash/available — whether checkout should offer EcoCash.
+app.get('/payments/ecocash/available', (req, res) => {
+  res.json({ enabled: ecocashConfigured() });
+});
+
+// POST /payments/ecocash/start { orderId, phone } — send the EcoCash prompt.
+app.post('/payments/ecocash/start', requireAuth, async (req, res) => {
+  try {
+    if (!ecocashConfigured()) {
+      return res.status(503).json({
+        error: 'EcoCash is not available',
+        details: 'EcoCash payments are not set up yet. Please pay another way.',
+      });
+    }
+    const { orderId, phone } = req.body || {};
+    if (!orderId) return res.status(400).json({ error: 'Missing orderId' });
+    const endUserId = ecocashEndUserId(phone);
+    if (!endUserId) {
+      return res.status(400).json({
+        error: 'Not an EcoCash number',
+        details: 'Enter the EcoCash number to pay from (it starts with 077 or 078).',
+      });
+    }
+
+    const { data: ord, error: ordErr } = await supabase
+      .from('orders')
+      .select('id, customer_id, order_number, status, payment_method, payment_status, total_amount')
+      .eq('id', orderId)
+      .maybeSingle();
+    if (ordErr || !ord) return res.status(404).json({ error: 'Order not found' });
+    if (ord.customer_id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    if (ord.payment_status === 'paid') {
+      return res.status(409).json({ error: 'Order already paid', alreadyPaid: true });
+    }
+    if (ord.payment_method !== 'ecocash' || ord.status !== 'awaiting_payment') {
+      return res.status(400).json({ error: 'Order is not awaiting EcoCash payment' });
+    }
+    const amount = Number(ord.total_amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: 'Invalid order total' });
+    }
+
+    // A previous prompt may still go through: settle it before sending another,
+    // so a retry can never charge the customer twice.
+    const previous = await latestEcocashPayment(ord.id);
+    if (previous) {
+      const previousStatus = await syncEcocashPayment(previous);
+      if (previousStatus === 'completed') {
+        return res.status(409).json({ error: 'Order already paid', alreadyPaid: true });
+      }
+      const ageMs = Date.now() - new Date(previous.created_at).getTime();
+      if (previousStatus === 'pending' && ageMs < 90 * 1000) {
+        return res.status(409).json({
+          error: 'Payment already requested',
+          details: 'Check your phone for the EcoCash prompt and enter your PIN.',
+          pending: true,
+        });
+      }
+      if (previousStatus === 'pending') {
+        // Abandoned prompt: stop polling it so the new one is the only live attempt.
+        await supabase.from('payments').update({ status: 'failed' }).eq('id', previous.id).eq('status', 'pending');
+      }
+    }
+
+    const clientCorrelator = newClientCorrelator();
+    const apiBase = (process.env.PUBLIC_API_BASE_URL || process.env.API_BASE_URL || '').replace(/\/$/, '');
+    const notifyUrl = /^https:\/\//.test(apiBase) ? `${apiBase}/payments/ecocash/notify` : undefined;
+
+    const { data: payment, error: insertError } = await supabase
+      .from('payments')
+      .insert({
+        order_id: ord.id,
+        customer_id: req.userId,
+        amount,
+        currency: process.env.ECOCASH_CURRENCY || 'USD',
+        payment_method: 'ecocash',
+        payment_provider: 'EcoCash',
+        transaction_id: clientCorrelator,
+        status: 'pending',
+        metadata: { endUserId },
+      })
+      .select('*')
+      .single();
+    if (insertError) throw insertError;
+
+    let body;
+    try {
+      body = await chargeEcocash({
+        clientCorrelator,
+        endUserId,
+        amount,
+        description: `DOT order ${ord.order_number || ord.id.slice(0, 8)}`,
+        notifyUrl,
+      });
+    } catch (chargeErr) {
+      console.error('[EcoCash] charge failed:', chargeErr?.response?.status, JSON.stringify(chargeErr?.response?.data || chargeErr?.message));
+      await supabase
+        .from('payments')
+        .update({ status: 'failed', metadata: { endUserId, error: chargeErr?.response?.data || chargeErr?.message } })
+        .eq('id', payment.id);
+      const status = chargeErr?.response?.status;
+      return res.status(status === 422 || status === 400 ? 402 : 502).json({
+        error: 'EcoCash payment not started',
+        details: ecocashErrorMessage(chargeErr),
+      });
+    }
+
+    const status = mapEcocashStatus(body);
+    const { data: updated } = await supabase
+      .from('payments')
+      .update({ metadata: { endUserId, charge: body } })
+      .eq('id', payment.id)
+      .select('*')
+      .single();
+    if (status !== 'pending') {
+      // Some responses are already final (e.g. sandbox charges immediately).
+      const { data: claimed } = await supabase
+        .from('payments')
+        .update({ status })
+        .eq('id', payment.id)
+        .eq('status', 'pending')
+        .select('*')
+        .maybeSingle();
+      if (claimed) await finalizeOrderPaymentFromPesepay({ payment: claimed, paymentStatus: status, transaction: body });
+    }
+
+    return res.json({ status, paymentId: (updated || payment).id });
+  } catch (error) {
+    console.error('[EcoCash] start error:', error);
+    return res.status(500).json({ error: 'Failed to start EcoCash payment', details: 'Please try again.' });
+  }
+});
+
+// GET /payments/ecocash/status/:orderId — the app polls this while the customer approves.
+app.get('/payments/ecocash/status/:orderId', requireAuth, async (req, res) => {
+  try {
+    const { data: ord } = await supabase
+      .from('orders')
+      .select('id, customer_id, status, payment_status')
+      .eq('id', req.params.orderId)
+      .maybeSingle();
+    if (!ord) return res.status(404).json({ error: 'Order not found' });
+    if (ord.customer_id !== req.userId) return res.status(403).json({ error: 'Forbidden' });
+    if (ord.payment_status === 'paid') return res.json({ status: 'completed', orderStatus: ord.status });
+
+    const payment = await latestEcocashPayment(ord.id);
+    if (!payment) return res.json({ status: 'none', orderStatus: ord.status });
+    const status = await syncEcocashPayment(payment);
+    return res.json({ status, orderStatus: ord.status });
+  } catch (error) {
+    console.error('[EcoCash] status error:', error);
+    return res.status(500).json({ error: 'Failed to check EcoCash payment' });
+  }
+});
+
+// POST /payments/ecocash/notify — EcoCash's callback (notifyUrl). Its body only
+// tells us which charge to look up; the outcome always comes from EcoCash's
+// lookup call, so a forged callback can't mark an order paid.
+app.post('/payments/ecocash/notify', async (req, res) => {
+  try {
+    const clientCorrelator = String(req.body?.clientCorrelator || req.body?.referenceCode || '').trim();
+    if (clientCorrelator) {
+      const { data: payment } = await supabase
+        .from('payments')
+        .select('*')
+        .eq('payment_method', 'ecocash')
+        .eq('transaction_id', clientCorrelator)
+        .maybeSingle();
+      if (payment) await syncEcocashPayment(payment);
+    }
+  } catch (error) {
+    console.error('[EcoCash] notify error:', error);
+  }
+  // Always acknowledge, so EcoCash doesn't keep retrying; the app's polling
+  // settles the payment either way.
+  return res.json({ received: true });
 });
 
 // GET /payments/pesepay/payment-methods?currencyCode=USD — payment methods (and their
