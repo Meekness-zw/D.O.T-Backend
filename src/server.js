@@ -188,16 +188,20 @@ function clientIpForSms(req) {
   return isIP(candidate) ? ipKeyGenerator(candidate) : null;
 }
 
-function authRateLimiter({ max, windowMinutes, message, skipServerErrors = false }) {
+function authRateLimiter({ max, windowMinutes, message, skipServerErrors = false, skipSuccessful = false }) {
   return rateLimit({
     windowMs: windowMinutes * 60 * 1000,
     max,
     standardHeaders: true,
     legacyHeaders: false,
+    // Only failures count where each success is already proof of the secret.
+    skipSuccessfulRequests: skipSuccessful,
     // Provider/infrastructure failures did not send a code and should not lock
     // out a real user. Validation, abuse and quota 4xx responses still count.
     skipFailedRequests: skipServerErrors,
-    requestWasSuccessful: (_req, res) => res.statusCode < 500,
+    // With skipSuccessful a wrong PIN (4xx) must still count as a failure;
+    // otherwise only server errors are failures.
+    requestWasSuccessful: (_req, res) => res.statusCode < (skipSuccessful ? 400 : 500),
     keyGenerator: (req) => {
       const phone = String(req.body?.phone || '').replace(/[\s\-().]/g, '').toLowerCase();
       const clientIp = clientIpForSms(req) || 'unknown-ip';
@@ -4274,6 +4278,14 @@ const pinStatusLimiter = authRateLimiter({
   windowMinutes: 15,
   message: 'Too many attempts for this number. Please try again in 15 minutes.',
 });
+// Wrong PINs are capped per account (PIN_MAX_ATTEMPTS), so only failed
+// sign-ins count here; signing in and out repeatedly never trips it.
+const pinLoginLimiter = authRateLimiter({
+  max: 10,
+  windowMinutes: 15,
+  message: 'Too many sign-in attempts for this number. Please try again in 15 minutes.',
+  skipSuccessful: true,
+});
 
 function pinSignInResponse(profile, extra = {}) {
   const data = sessionForProfile(profile);
@@ -4339,11 +4351,13 @@ app.post('/auth/pin/status', pinStatusLimiter, async (req, res) => {
 });
 
 // POST /auth/pin/login { phone, pin, deviceToken } — sign in on a trusted device.
-app.post('/auth/pin/login', loginLimiter, async (req, res) => {
+app.post('/auth/pin/login', pinLoginLimiter, async (req, res) => {
   try {
     const profile = await profileForPinRequest(req, res);
     if (!profile) return;
     if (!profile.pin_hash) return res.status(409).json(PIN_NOT_SET);
+    // Say so before asking a new phone for an emailed code it can't use yet.
+    if (isPinLocked(profile)) return pinFailure(res, { locked: true });
     const trustedUserId = await userForDeviceToken(req.body?.deviceToken, 'device');
     if (trustedUserId !== profile.id) {
       return res.status(401).json({
@@ -4450,7 +4464,7 @@ app.post('/auth/pin/set', requireAuth, async (req, res) => {
 });
 
 // POST /auth/pin/biometric { biometricToken } — Face ID / fingerprint sign-in.
-app.post('/auth/pin/biometric', loginLimiter, async (req, res) => {
+app.post('/auth/pin/biometric', pinStatusLimiter, async (req, res) => {
   try {
     const userId = await userForDeviceToken(req.body?.biometricToken, 'biometric');
     if (!userId) {

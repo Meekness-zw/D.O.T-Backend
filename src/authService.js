@@ -8,6 +8,13 @@ function toPhoneDigits(value) {
   return String(value || '').replace(/\D/g, '');
 }
 
+// Digits with the Zimbabwe country code, so a legacy local "07…" row and the
+// "+2637…" number someone types compare equal.
+function canonicalDigits(value) {
+  const digits = toPhoneDigits(value);
+  return digits.length === 10 && digits.startsWith('0') ? `263${digits.slice(1)}` : digits;
+}
+
 function buildPhoneCandidates(phone) {
   const normalised = String(phone || '').replace(/[\s\-().]/g, '').replace(/^\+?/, '+');
   const digits = toPhoneDigits(normalised);
@@ -49,7 +56,8 @@ export async function findProfileByPhone(phone) {
 
   if (fallbackError) throw fallbackError;
 
-  return (fallbackProfiles || []).find((p) => toPhoneDigits(p.phone) === digits) || null;
+  const wanted = canonicalDigits(digits);
+  return (fallbackProfiles || []).find((p) => canonicalDigits(p.phone) === wanted) || null;
 }
 
 export async function findProfileById(userId) {
