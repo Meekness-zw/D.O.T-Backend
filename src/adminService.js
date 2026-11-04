@@ -658,6 +658,8 @@ export async function getAdminMerchants(options = {}) {
       is_verified,
       is_active,
       created_at,
+      store_setup_requested_at,
+      store_setup_note,
       user_profiles ( full_name, email, phone )
     `, { count: 'exact' })
     .order('created_at', { ascending: false })

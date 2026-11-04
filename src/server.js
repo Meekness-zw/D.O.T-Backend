@@ -24,6 +24,7 @@ import {
   consumeEmailCode,
   maskEmail,
 } from './pinAuth.js';
+import { merchantOnboardingState, STORE_SETUP_NOTE_MAX } from './merchantOnboarding.js';
 import {
   ecocashConfigured,
   ecocashEndUserId,
@@ -7493,7 +7494,7 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
     // Use admin client throughout so RLS never blocks these lookups
     const { data: merchant, error: merchantError } = await supabaseAdmin
       .from('merchants')
-      .select('id, business_name, business_type, is_active, approval_status, rejected_reason')
+      .select('id, business_name, business_type, is_active, approval_status, rejected_reason, store_setup_requested_at')
       .eq('id', req.userId)
       .maybeSingle();
 
@@ -7503,9 +7504,6 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
     }
 
     const isMerchant = !!merchant;
-    const approvalStatus = merchant?.approval_status || 'pending';
-    const isApproved = approvalStatus === 'approved';
-    const isRejected = approvalStatus === 'rejected';
     const rejectedReason = merchant?.rejected_reason || null;
 
     // At least one store row exists for this merchant
@@ -7540,16 +7538,18 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
       }
     }
 
-    const onboardingComplete = isMerchant && hasStore;
+    const state = merchantOnboardingState({
+      isMerchant,
+      hasStore,
+      approvalStatus: merchant?.approval_status,
+      storeSetupRequestedAt: merchant?.store_setup_requested_at,
+    });
 
     return res.json({
       isMerchant,
       hasStore,
       hasRequiredDocuments,
-      onboardingComplete,
-      approvalStatus,
-      isApproved,
-      isRejected,
+      ...state,
       rejectedReason,
     });
   } catch (error) {
@@ -7558,6 +7558,36 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
       error: 'Failed to load merchant onboarding status',
       details: error.message || 'Please try again later',
     });
+  }
+});
+
+// POST /merchant/request-store-setup { note? } — skip onboarding and let the
+// DOT team set the store up (admin dashboard: Merchants -> Set up store).
+app.post('/merchant/request-store-setup', requireAuth, async (req, res) => {
+  try {
+    const note = String(req.body?.note || '').trim().slice(0, STORE_SETUP_NOTE_MAX) || null;
+    const { data: merchant, error: lookupError } = await supabaseAdmin
+      .from('merchants')
+      .select('id, store_setup_requested_at')
+      .eq('id', req.userId)
+      .maybeSingle();
+    if (lookupError) throw lookupError;
+    if (!merchant) {
+      return res.status(404).json({ error: 'No merchant account found', details: 'Sign up as a merchant first.' });
+    }
+    const { error: updateError } = await supabaseAdmin
+      .from('merchants')
+      .update({
+        // Keep the first request time, so the team sees how long they've waited.
+        store_setup_requested_at: merchant.store_setup_requested_at || new Date().toISOString(),
+        store_setup_note: note,
+      })
+      .eq('id', req.userId);
+    if (updateError) throw updateError;
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('post /merchant/request-store-setup error:', error);
+    return res.status(500).json({ error: 'Failed to send your request', details: 'Please try again.' });
   }
 });
 
