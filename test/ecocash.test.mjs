@@ -71,6 +71,14 @@ test('the charge body matches the documented request', () => {
   assert.equal(buildChargeBody({ clientCorrelator: 'X', endUserId: '1', amount: 1 }, env).notifyUrl, undefined);
 });
 
+test('the terminal ID is optional and left out when not issued', () => {
+  const { ECOCASH_TERMINAL_ID, ...withoutTerminal } = env;
+  assert.equal(ecocashConfigured(withoutTerminal), true);
+  const body = buildChargeBody({ clientCorrelator: 'X', endUserId: '773047653', amount: 1 }, withoutTerminal);
+  assert.equal('terminalID' in body, false);
+  assert.equal(buildChargeBody({ clientCorrelator: 'X', endUserId: '773047653', amount: 1 }, env).terminalID, 'UAT00003');
+});
+
 test('each charge gets its own reference', () => {
   const ids = new Set(Array.from({ length: 50 }, () => newClientCorrelator()));
   assert.equal(ids.size, 50);

@@ -16,8 +16,9 @@ import { normalizeZwPhone, detectProviderFromPhone } from './walletProvider.js';
  *   ECOCASH_BASE_URL         e.g. https://developers.ecocash.co.zw/sandbox/payment/v1
  *   ECOCASH_USERNAME / ECOCASH_PASSWORD   Basic auth
  *   ECOCASH_MERCHANT_CODE, ECOCASH_MERCHANT_PIN, ECOCASH_MERCHANT_NUMBER,
- *   ECOCASH_TERMINAL_ID, ECOCASH_MERCHANT_NAME
- *   optional: ECOCASH_SUPER_MERCHANT_NAME (ECOCASH), ECOCASH_LOCATION (Harare),
+ *   ECOCASH_MERCHANT_NAME
+ *   optional: ECOCASH_TERMINAL_ID (only if EcoCash issued one; left out of
+ *   the request otherwise), ECOCASH_SUPER_MERCHANT_NAME (ECOCASH), ECOCASH_LOCATION (Harare),
  *   ECOCASH_CURRENCY (USD), ECOCASH_MSISDN_FORMAT ('local' = 771234567, or
  *   'international' = 263771234567)
  */
@@ -29,7 +30,6 @@ const REQUIRED = [
   'ECOCASH_MERCHANT_CODE',
   'ECOCASH_MERCHANT_PIN',
   'ECOCASH_MERCHANT_NUMBER',
-  'ECOCASH_TERMINAL_ID',
   'ECOCASH_MERCHANT_NAME',
 ];
 
@@ -84,7 +84,7 @@ function merchantFields(env = process.env) {
     merchantPin: env.ECOCASH_MERCHANT_PIN,
     merchantNumber: env.ECOCASH_MERCHANT_NUMBER,
     countryCode: 'ZW',
-    terminalID: env.ECOCASH_TERMINAL_ID,
+    ...(String(env.ECOCASH_TERMINAL_ID || '').trim() ? { terminalID: env.ECOCASH_TERMINAL_ID.trim() } : {}),
     location: env.ECOCASH_LOCATION || 'Harare',
     superMerchantName: env.ECOCASH_SUPER_MERCHANT_NAME || 'ECOCASH',
     merchantName: env.ECOCASH_MERCHANT_NAME,
