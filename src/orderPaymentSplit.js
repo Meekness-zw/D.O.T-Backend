@@ -68,8 +68,8 @@ export function getOtdPlatformServiceChargeUsd() {
 
 /**
  * Courier wallet credit for completing a delivery: the fee minus DOT's
- * 20% cut (floored to the cent so the base $4.99 splits exactly
- * $0.99 to DOT and $4.00 to the courier).
+ * 20% cut (floored to the cent: the $5.00 base splits $1.00 to DOT and
+ * $4.00 to the courier).
  */
 export function computeCourierDeliveryPayoutUsd(deliveryFee) {
   const total = Number(deliveryFee) || 0;
