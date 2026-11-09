@@ -27,6 +27,7 @@ import {
 import { registerAdminAuthRoutes, staffForSessionToken, logAdminAction } from './adminAuth.js';
 import {
   isMerchantController,
+  controllerEmails,
   blockedWhileActing,
   ACTING_TOKEN_TTL_SECONDS,
   NEW_ORDER_STATUSES,
@@ -830,12 +831,14 @@ app.post('/auth/send-otp', otpRequestLimiter, async (req, res) => {
     if (existing.registered) {
       return res.status(409).json({ error: 'Phone number already registered. Please log in instead.' });
     }
+    // limit(1), not maybeSingle(): the DOT inbox can be on several stores,
+    // and maybeSingle() would error on that and read as "not taken".
     const { data: emailTaken } = await supabaseAdmin
       .from('user_profiles')
       .select('id')
       .eq('email', email)
-      .maybeSingle();
-    if (emailTaken) {
+      .limit(1);
+    if (emailTaken?.length || controllerEmails().includes(email)) {
       return res.status(409).json({ error: 'This email address is already in use.' });
     }
 
@@ -7763,7 +7766,9 @@ app.post('/merchant-control/merchants', requireMerchantController, async (req, r
     const body = req.body || {};
     const phone = normalizeE164(body.phone);
     const ownerName = String(body.ownerName || '').trim();
-    const email = String(body.email || '').trim().toLowerCase() || null;
+    // DOT-created stores default to the DOT inbox, so their sign-in codes come to the team.
+    const email = String(body.email || '').trim().toLowerCase() || controllerEmails()[0] || null;
+    const sharedDotEmail = !!email && controllerEmails().includes(email);
     const pin = body.pin ? String(body.pin) : null;
 
     if (!ownerName) return res.status(400).json({ error: 'Enter the owner’s name.' });
@@ -7797,9 +7802,10 @@ app.post('/merchant-control/merchants', requireMerchantController, async (req, r
         details: 'Ask the owner to sign up as a merchant with it, or use a different number.',
       });
     }
-    if (email) {
-      const { data: emailTaken } = await supabase.from('user_profiles').select('id').eq('email', email).maybeSingle();
-      if (emailTaken) return res.status(409).json({ error: 'This email address is already in use.' });
+    // The DOT inbox may be on many stores; any other email belongs to one account.
+    if (email && !sharedDotEmail) {
+      const { data: emailTaken } = await supabase.from('user_profiles').select('id').eq('email', email).limit(1);
+      if (emailTaken?.length) return res.status(409).json({ error: 'This email address is already in use.' });
     }
 
     // 1. The owner's merchant account (no password: they sign in with a PIN).

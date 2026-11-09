@@ -104,8 +104,8 @@ export async function createInternalCourier(body = {}) {
     .from('user_profiles')
     .select('id')
     .eq('email', email)
-    .maybeSingle();
-  if (emailTaken) throw fail('This email address is already in use.', 409);
+    .limit(1);
+  if (emailTaken?.length) throw fail('This email address is already in use.', 409);
 
   let userId;
   const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
