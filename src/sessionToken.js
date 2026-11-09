@@ -12,6 +12,8 @@ export function createSupabaseAccessToken({
   supabaseUrl,
   jwtSecret,
   expiresInSeconds = 3600,
+  // Extra claims, e.g. act_by for DOT staff working in a merchant's store.
+  extraClaims = {},
 }) {
   if (!userId || !sessionId || !supabaseUrl || !jwtSecret) {
     throw new Error('createSupabaseAccessToken: missing required params');
@@ -36,6 +38,7 @@ export function createSupabaseAccessToken({
     amr: [{ method: 'otp', timestamp: now }],
     app_metadata: { provider: 'phone', providers: ['phone'] },
     user_metadata: {},
+    ...extraClaims,
   };
 
   const header = { alg: 'HS256', typ: 'JWT' };

@@ -175,6 +175,18 @@ async function loadSession(token) {
   return { ...data, user: data.admin_users };
 }
 
+/**
+ * The staff account behind a fully signed-in session token (both factors
+ * done), or null. For features outside the admin dashboard, e.g. the DOT team
+ * managing merchants' stores (src/merchantControl.js).
+ */
+export async function staffForSessionToken(token) {
+  if (!supabase) return null;
+  const session = await loadSession(token);
+  if (!session || session.mfa_pending) return null;
+  return { ...session.user, sessionId: session.id };
+}
+
 async function promoteSession(sessionId) {
   const { error } = await supabase
     .from('admin_sessions')
@@ -605,10 +617,11 @@ export function registerAdminAuthRoutes(app) {
         return res.status(400).json({ error: 'Enter your username and password' });
       }
 
+      // Staff may sign in with their username or their email address.
       const { data: user, error } = await supabase
         .from('admin_users')
         .select('*')
-        .ilike('username', username)
+        .ilike(isEmail(username.toLowerCase()) ? 'email' : 'username', username)
         .maybeSingle();
       if (error) throw new Error(error.message || 'Failed to look up account');
 

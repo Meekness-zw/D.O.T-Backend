@@ -24,6 +24,13 @@ import {
   consumeEmailCode,
   maskEmail,
 } from './pinAuth.js';
+import { registerAdminAuthRoutes, staffForSessionToken, logAdminAction } from './adminAuth.js';
+import {
+  isMerchantController,
+  blockedWhileActing,
+  ACTING_TOKEN_TTL_SECONDS,
+  NEW_ORDER_STATUSES,
+} from './merchantControl.js';
 import { merchantOnboardingState, STORE_SETUP_NOTE_MAX } from './merchantOnboarding.js';
 import {
   ecocashConfigured,
@@ -573,6 +580,11 @@ app.use(cors({
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true }));
 
+// Named staff sign-in (email or username + password + emailed code). Used by
+// the DOT team to manage merchants' stores; the admin dashboard itself still
+// signs in with its role keys.
+registerAdminAuthRoutes(app);
+
 /** Auth middleware: verify Bearer token, set req.userId */
 async function requireAuth(req, res, next) {
   const auth = req.headers.authorization;
@@ -586,6 +598,18 @@ async function requireAuth(req, res, next) {
     if (decoded?.sub) {
       req.userId = decoded.sub;
       if (await isAccountFrozen(req.userId)) return frozenAccount(res);
+      // DOT team working in a merchant's store (src/merchantControl.js).
+      if (decoded.act_by) {
+        if (!(await actingStillAllowed(decoded))) {
+          return res.status(401).json({
+            error: 'Unauthorized',
+            details: 'DOT access to this store has ended. Switch stores again from the DOT team screen.',
+          });
+        }
+        const blocked = blockedWhileActing(req.method, req.path);
+        if (blocked) return res.status(403).json({ error: 'Merchant only', details: blocked });
+        req.actingStaffId = decoded.act_by;
+      }
       return next();
     }
 
@@ -7558,6 +7582,192 @@ app.get('/merchant/onboarding-status', requireAuth, async (req, res) => {
       error: 'Failed to load merchant onboarding status',
       details: error.message || 'Please try again later',
     });
+  }
+});
+
+// ── DOT team managing merchants' stores ─────────────────────────────────────
+// See src/merchantControl.js. Staff sign in with /admin/auth/login + /verify
+// (src/adminAuth.js), then use these with their staff session token.
+
+/** Staff session token -> req.controller, if that account may manage stores. */
+async function requireMerchantController(req, res, next) {
+  try {
+    const auth = req.headers.authorization;
+    const token = auth?.startsWith('Bearer ') ? auth.slice(7) : null;
+    const staff = token ? await staffForSessionToken(token) : null;
+    if (!staff) {
+      return res.status(401).json({ error: 'Unauthorized', details: 'Sign in with your DOT team account.' });
+    }
+    if (!isMerchantController(staff)) {
+      return res.status(403).json({ error: 'Forbidden', details: 'This account cannot manage merchants’ stores.' });
+    }
+    req.controller = staff;
+    return next();
+  } catch (error) {
+    console.error('merchant-control auth error:', error);
+    return res.status(500).json({ error: 'Something went wrong' });
+  }
+}
+
+// An acting token stays valid only while the store is still managed by DOT and
+// the staff session that created it is live. Checked at most once a minute.
+const actingCheckCache = new Map();
+async function actingStillAllowed(decoded) {
+  const key = `${decoded.sub}:${decoded.act_session}`;
+  const cached = actingCheckCache.get(key);
+  if (cached && cached.until > Date.now()) return cached.ok;
+  const [{ data: merchant }, { data: session }] = await Promise.all([
+    supabase.from('merchants').select('managed_by_dot').eq('id', decoded.sub).maybeSingle(),
+    supabase.from('admin_sessions').select('revoked_at, expires_at, mfa_pending').eq('id', decoded.act_session).maybeSingle(),
+  ]);
+  const ok =
+    !!merchant?.managed_by_dot &&
+    !!session &&
+    !session.revoked_at &&
+    !session.mfa_pending &&
+    new Date(session.expires_at).getTime() > Date.now();
+  actingCheckCache.set(key, { ok, until: Date.now() + 60 * 1000 });
+  return ok;
+}
+
+/** Store name, logo and how many orders are waiting, per managed merchant. */
+async function managedStoresSummary() {
+  const { data: merchants, error } = await supabase
+    .from('merchants')
+    .select('id, business_name, user_profiles ( full_name, phone )')
+    .eq('managed_by_dot', true)
+    .order('business_name', { ascending: true });
+  if (error) throw error;
+  const ids = (merchants || []).map((m) => m.id);
+  if (!ids.length) return [];
+
+  const { data: stores } = await supabase
+    .from('stores')
+    .select('id, merchant_id, store_name, logo, is_open')
+    .in('merchant_id', ids);
+  const storesByMerchant = new Map();
+  (stores || []).forEach((s) => {
+    if (!storesByMerchant.has(s.merchant_id)) storesByMerchant.set(s.merchant_id, []);
+    storesByMerchant.get(s.merchant_id).push(s);
+  });
+
+  const storeIds = (stores || []).map((s) => s.id);
+  const waiting = new Map();
+  if (storeIds.length) {
+    const { data: orders } = await supabase
+      .from('orders')
+      .select('id, store_id, created_at')
+      .in('store_id', storeIds)
+      .in('status', NEW_ORDER_STATUSES)
+      .order('created_at', { ascending: false })
+      .limit(500);
+    (orders || []).forEach((o) => {
+      const entry = waiting.get(o.store_id) || { count: 0, latest: null };
+      entry.count += 1;
+      if (!entry.latest) entry.latest = o.created_at;
+      waiting.set(o.store_id, entry);
+    });
+  }
+
+  return (merchants || []).map((m) => {
+    const own = storesByMerchant.get(m.id) || [];
+    const counts = own.map((s) => waiting.get(s.id)).filter(Boolean);
+    return {
+      merchantId: m.id,
+      name: own[0]?.store_name || m.business_name || m.user_profiles?.full_name || 'Store',
+      logoUrl: own[0]?.logo || null,
+      isOpen: own.some((s) => s.is_open !== false),
+      ownerName: m.user_profiles?.full_name || null,
+      ownerPhone: m.user_profiles?.phone || null,
+      newOrders: counts.reduce((sum, c) => sum + c.count, 0),
+      latestNewOrderAt: counts.map((c) => c.latest).sort().pop() || null,
+    };
+  });
+}
+
+// GET /merchant-control/stores — the stores DOT manages, with waiting-order counts.
+// The dashboard polls this to alert about stores that aren't on screen.
+app.get('/merchant-control/stores', requireMerchantController, async (req, res) => {
+  try {
+    return res.json({
+      controller: { email: req.controller.email, name: req.controller.full_name || req.controller.username },
+      stores: await managedStoresSummary(),
+    });
+  } catch (error) {
+    console.error('get /merchant-control/stores error:', error);
+    return res.status(500).json({ error: 'Failed to load managed stores' });
+  }
+});
+
+// POST /merchant-control/act-as { merchantId } — switch into a managed store.
+// Returns the same { user, session } a merchant gets when they sign in.
+app.post('/merchant-control/act-as', requireMerchantController, async (req, res) => {
+  try {
+    const merchantId = String(req.body?.merchantId || '');
+    const { data: merchant } = await supabase
+      .from('merchants')
+      .select('id, managed_by_dot')
+      .eq('id', merchantId)
+      .maybeSingle();
+    if (!merchant?.managed_by_dot) {
+      return res.status(403).json({ error: 'Not a managed store', details: 'Tick “Managed by DOT” for this merchant first.' });
+    }
+    const profile = await findProfileById(merchantId);
+    if (!profile) return res.status(404).json({ error: 'Merchant account not found' });
+    if (profile.is_suspended) {
+      return res.status(403).json({ error: 'This merchant account is frozen.' });
+    }
+    const accessToken = createSupabaseAccessToken({
+      userId: profile.id,
+      phone: profile.phone,
+      email: profile.email || '',
+      sessionId: crypto.randomUUID(),
+      supabaseUrl: process.env.SUPABASE_URL,
+      jwtSecret: process.env.SUPABASE_JWT_SECRET,
+      expiresInSeconds: ACTING_TOKEN_TTL_SECONDS,
+      extraClaims: { act_by: req.controller.id, act_session: req.controller.sessionId },
+    });
+    await logAdminAction({
+      req,
+      user: req.controller,
+      action: 'merchant_control.act_as',
+      detail: { merchant_id: merchantId },
+    }).catch(() => {});
+    return res.json({
+      user: {
+        id: profile.id,
+        phone: profile.phone,
+        email: profile.email || null,
+        full_name: profile.full_name || null,
+        role: 'merchant',
+      },
+      session: { access_token: accessToken, refresh_token: null, token_type: 'bearer', expires_in: ACTING_TOKEN_TTL_SECONDS },
+      actingAs: req.controller.email,
+    });
+  } catch (error) {
+    console.error('post /merchant-control/act-as error:', error);
+    return res.status(500).json({ error: 'Failed to open the store' });
+  }
+});
+
+// PATCH /admin/merchants/:id/managed { managed } — admin dashboard: tick or
+// untick "Managed by DOT". Unticking ends DOT's access within a minute.
+app.patch('/admin/merchants/:id/managed', requireAdmin, async (req, res) => {
+  try {
+    const managed = req.body?.managed === true;
+    const { data, error } = await supabase
+      .from('merchants')
+      .update({ managed_by_dot: managed })
+      .eq('id', req.params.id)
+      .select('id, managed_by_dot')
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Merchant not found' });
+    actingCheckCache.clear();
+    return res.json({ success: true, managed_by_dot: data.managed_by_dot });
+  } catch (error) {
+    console.error('patch /admin/merchants/:id/managed error:', error);
+    return res.status(500).json({ error: 'Failed to update merchant' });
   }
 });
 

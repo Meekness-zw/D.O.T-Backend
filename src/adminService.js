@@ -660,6 +660,7 @@ export async function getAdminMerchants(options = {}) {
       created_at,
       store_setup_requested_at,
       store_setup_note,
+      managed_by_dot,
       user_profiles ( full_name, email, phone )
     `, { count: 'exact' })
     .order('created_at', { ascending: false })
