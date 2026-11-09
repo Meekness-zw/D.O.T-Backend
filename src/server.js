@@ -7750,6 +7750,123 @@ app.post('/merchant-control/act-as', requireMerchantController, async (req, res)
   }
 });
 
+// POST /merchant-control/merchants — the DOT team creates a store for an owner:
+// the owner's merchant account and the store in one step, already approved and
+// managed by DOT. Only DOT team accounts reach this (requireMerchantController);
+// merchants never see it.
+//
+// The owner can sign in themselves later with their phone number: with the PIN
+// set here, or by asking for an emailed code to set one (needs the email).
+app.post('/merchant-control/merchants', requireMerchantController, async (req, res) => {
+  let createdUserId = null;
+  try {
+    const body = req.body || {};
+    const phone = normalizeE164(body.phone);
+    const ownerName = String(body.ownerName || '').trim();
+    const email = String(body.email || '').trim().toLowerCase() || null;
+    const pin = body.pin ? String(body.pin) : null;
+
+    if (!ownerName) return res.status(400).json({ error: 'Enter the owner’s name.' });
+    if (!phone) {
+      return res.status(400).json({ error: 'Enter the owner’s phone number with its country code, e.g. +263 77 123 4567.' });
+    }
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: 'That email address looks incomplete.' });
+    }
+    if (pin) {
+      const problem = pinProblem(pin);
+      if (problem) return res.status(400).json({ error: problem });
+    }
+    for (const [field, label] of [
+      ['businessName', 'business name'],
+      ['businessType', 'business type'],
+      ['storeName', 'store name'],
+      ['address', 'store address'],
+    ]) {
+      if (!String(body[field] || '').trim()) return res.status(400).json({ error: `Enter the ${label}.` });
+    }
+    const latitude = Number(body.latitude);
+    const longitude = Number(body.longitude);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+      return res.status(400).json({ error: 'Pick the store’s location on the map.' });
+    }
+
+    if ((await checkPhoneRegistered(phone)).registered) {
+      return res.status(409).json({
+        error: 'This phone number already has a DOT account.',
+        details: 'Ask the owner to sign up as a merchant with it, or use a different number.',
+      });
+    }
+    if (email) {
+      const { data: emailTaken } = await supabase.from('user_profiles').select('id').eq('email', email).maybeSingle();
+      if (emailTaken) return res.status(409).json({ error: 'This email address is already in use.' });
+    }
+
+    // 1. The owner's merchant account (no password: they sign in with a PIN).
+    let authResult = await supabaseAdmin.auth.admin.createUser({ phone, phone_confirm: true });
+    if (authResult.error?.code === 'phone_exists') {
+      // Orphaned auth record with no profile: clear it and start fresh.
+      const orphan = await findAuthUserByPhone(phone);
+      if (orphan) await supabaseAdmin.auth.admin.deleteUser(orphan.id);
+      authResult = await supabaseAdmin.auth.admin.createUser({ phone, phone_confirm: true });
+    }
+    if (authResult.error) throw authResult.error;
+    createdUserId = authResult.data.user.id;
+
+    await ensureUserProfile({ userId: createdUserId, email, phone, fullName: ownerName, role: 'merchant' });
+    if (pin) await setAccountPin(createdUserId, pin);
+
+    // 2. The store.
+    const store = await upsertMerchantOnboarding({
+      userId: createdUserId,
+      businessName: String(body.businessName).trim(),
+      businessType: String(body.businessType).trim(),
+      storeName: String(body.storeName).trim(),
+      ownerName,
+      phone,
+      email,
+      address: String(body.address).trim(),
+      address_line2: body.address_line2 || null,
+      city: String(body.city || '').trim() || null,
+      country: body.country || 'Zimbabwe',
+      latitude,
+      longitude,
+      description: body.description || null,
+      delivery_radius_km: body.deliveryRadiusKm != null ? Number(body.deliveryRadiusKm) : undefined,
+      storeLogoBase64: body.storeLogoBase64 || null,
+    });
+
+    // 3. Approved and run by DOT from the start.
+    await approveMerchant(createdUserId);
+    const { error: managedError } = await supabase
+      .from('merchants')
+      .update({ managed_by_dot: true })
+      .eq('id', createdUserId);
+    if (managedError) throw managedError;
+
+    await logAdminAction({
+      req,
+      user: req.controller,
+      action: 'merchant_control.store_created',
+      detail: { merchant_id: createdUserId, store_name: body.storeName, phone },
+    }).catch(() => {});
+
+    return res.status(201).json({ success: true, merchantId: createdUserId, storeId: store?.storeId || null });
+  } catch (error) {
+    console.error('post /merchant-control/merchants error:', error);
+    // Don't leave a half-made account behind (no store yet means nobody uses it).
+    if (createdUserId) {
+      const { data: madeStore } = await supabase.from('stores').select('id').eq('merchant_id', createdUserId).maybeSingle();
+      if (!madeStore) {
+        await supabase.from('merchants').delete().eq('id', createdUserId);
+        await supabase.from('user_profiles').delete().eq('id', createdUserId);
+        await supabaseAdmin.auth.admin.deleteUser(createdUserId).catch(() => {});
+      }
+    }
+    return res.status(400).json({ error: 'Could not create the store', details: error.message || 'Please try again.' });
+  }
+});
+
 // PATCH /admin/merchants/:id/managed { managed } — admin dashboard: tick or
 // untick "Managed by DOT". Unticking ends DOT's access within a minute.
 app.patch('/admin/merchants/:id/managed', requireAdmin, async (req, res) => {
