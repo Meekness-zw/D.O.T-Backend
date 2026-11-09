@@ -38,24 +38,29 @@ function parseFrom(from) {
   return match ? { email: match[2], name: match[1] || undefined } : { email: from };
 }
 
+// Falls back to the Resend settings the customer sign-up codes already use
+// (resendClient.js), so staff codes need no extra configuration.
+const apiKey = () => process.env.EMAIL_API_KEY || process.env.RESEND_API_KEY;
+const fromAddress = () => process.env.EMAIL_FROM || process.env.RESEND_FROM_EMAIL;
+
 export function emailConfigured() {
-  return !!(process.env.EMAIL_API_KEY && process.env.EMAIL_FROM);
+  return !!(apiKey() && fromAddress());
 }
 
 export async function sendEmail({ to, subject, html, text }) {
   if (!emailConfigured()) {
-    throw new Error('Email is not configured: set EMAIL_API_KEY and EMAIL_FROM');
+    throw new Error('Email is not configured: set EMAIL_API_KEY and EMAIL_FROM (or RESEND_API_KEY and RESEND_FROM_EMAIL)');
   }
   const name = (process.env.EMAIL_PROVIDER || 'resend').toLowerCase();
   const provider = PROVIDERS[name];
   if (!provider) throw new Error(`Unknown EMAIL_PROVIDER "${name}"`);
 
-  const from = process.env.EMAIL_FROM;
+  const from = fromAddress();
   try {
     await axios.post(
       provider.url,
       provider.body({ to, from, subject, html, text }),
-      { headers: provider.headers(process.env.EMAIL_API_KEY), timeout: 12000 },
+      { headers: provider.headers(apiKey()), timeout: 12000 },
     );
   } catch (err) {
     // Log the provider's own reason — "email failed" alone is useless when the
