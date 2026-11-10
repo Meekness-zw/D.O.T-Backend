@@ -33,6 +33,7 @@ import {
   NEW_ORDER_STATUSES,
 } from './merchantControl.js';
 import { merchantOnboardingState, STORE_SETUP_NOTE_MAX } from './merchantOnboarding.js';
+import { saveCourierPosition, getCourierMap } from './courierPositions.js';
 import {
   ecocashConfigured,
   ecocashEndUserId,
@@ -6412,6 +6413,18 @@ app.post('/courier/orders/:id/drop', requireAuth, requireApprovedCourier, async 
 });
 
 // PATCH /courier/orders/:id/location — assigned courier reports GPS (customer live map)
+// POST /courier/location { latitude, longitude } — the courier app reports
+// where the courier is while online without a job, for the admin couriers map.
+app.post('/courier/location', requireAuth, requireApprovedCourier, async (req, res) => {
+  const lat = Number(req.body?.latitude);
+  const lng = Number(req.body?.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return res.status(400).json({ error: 'Invalid coordinates', details: 'latitude and longitude must be numbers' });
+  }
+  await saveCourierPosition(req.userId, lat, lng);
+  return res.json({ ok: true });
+});
+
 app.patch('/courier/orders/:id/location', requireAuth, requireApprovedCourier, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
@@ -6466,6 +6479,8 @@ app.patch('/courier/orders/:id/location', requireAuth, requireApprovedCourier, a
       throw new Error(updateError.message || 'Failed to update location');
     }
 
+    // Also the courier's last position, for the admin couriers map.
+    saveCourierPosition(req.userId, lat, lng).catch(() => {});
     return res.json({ order: updated });
   } catch (error) {
     console.error('patch /courier/orders/:id/location error:', error);
@@ -13475,6 +13490,18 @@ app.get('/admin/orders/:id/detail', requireAdmin, async (req, res) => {
 });
 
 /** Live fleet: couriers currently on a job, and where they were last seen. */
+// GET /admin/couriers/map?dot_only=1 — every approved courier and where they
+// were last seen (on a job or online without one), for the couriers map.
+app.get('/admin/couriers/map', requireAdmin, async (req, res) => {
+  try {
+    const dotOnly = req.query.dot_only === '1' || req.query.dot_only === 'true';
+    return res.json(await getCourierMap({ dotOnly }));
+  } catch (error) {
+    console.error('get /admin/couriers/map error:', error);
+    return res.status(500).json({ error: 'Failed to load the couriers map', details: error.message });
+  }
+});
+
 app.get('/admin/fleet', requireAdmin, async (req, res) => {
   try {
     return res.json(await getFleet({ companyId: req.query.company_id || undefined }));

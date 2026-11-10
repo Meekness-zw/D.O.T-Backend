@@ -19,7 +19,7 @@ const supabase = supabaseAdmin;
 const money = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
 /** Statuses where a courier is holding a job and their position matters. */
-const ACTIVE_STATUSES = [
+export const ACTIVE_STATUSES = [
   'assigned', 'courier_arrived', 'merchant_confirmed',
   'picked_up', 'in_transit', 'delivery_confirmation_pending',
 ];
