@@ -184,7 +184,32 @@ export async function staffForSessionToken(token) {
   if (!supabase) return null;
   const session = await loadSession(token);
   if (!session || session.mfa_pending) return null;
+  await keepTeamSessionAlive(session);
   return { ...session.user, sessionId: session.id };
+}
+
+// The DOT team leaves the merchant dashboard open all day in a background tab,
+// so its session slides: every use pushes the end out to a week from now. It
+// still ends after a week without use, on sign-out, or on a password change.
+export const TEAM_SESSION_IDLE_MS = 7 * 24 * 60 * 60 * 1000;
+const TEAM_SESSION_EXTEND_EVERY_MS = 10 * 60 * 1000; // at most one write per 10 minutes
+
+export function teamSessionNewExpiry(expiresAt, now = Date.now()) {
+  const target = now + TEAM_SESSION_IDLE_MS;
+  const current = new Date(expiresAt).getTime();
+  if (Number.isFinite(current) && target - current < TEAM_SESSION_EXTEND_EVERY_MS) return null;
+  return new Date(target).toISOString();
+}
+
+async function keepTeamSessionAlive(session) {
+  const next = teamSessionNewExpiry(session.expires_at);
+  if (!next) return;
+  const { error } = await supabase
+    .from('admin_sessions')
+    .update({ expires_at: next, last_seen_at: new Date().toISOString() })
+    .eq('id', session.id)
+    .is('revoked_at', null);
+  if (error) console.error('team session extend failed:', error.message);
 }
 
 async function promoteSession(sessionId) {
