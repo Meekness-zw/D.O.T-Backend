@@ -126,7 +126,7 @@ export async function getMerchantOversight(merchantId, { period = 'daily', from,
     gross: money(acc.gross + s.customer_paid),
     earned: money(acc.earned + s.store.amount_due),
     dot_markup: money(acc.dot_markup + s.store.dot_markup),
-    // dot_markup split into its two named pieces (15% markup + 5% commission)
+    // dot_markup split into its two named pieces (15% markup + any commission)
     markup_amount: money(acc.markup_amount + s.store.markup_amount),
     weekly_commission_amount: money(acc.weekly_commission_amount + s.store.weekly_commission_amount),
   }), { orders: 0, gross: 0, earned: 0, dot_markup: 0, markup_amount: 0, weekly_commission_amount: 0 });

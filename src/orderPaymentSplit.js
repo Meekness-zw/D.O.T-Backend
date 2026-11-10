@@ -3,8 +3,8 @@
  *  - Every merchant price is automatically marked up 15% for customers
  *    (PLATFORM_MARKUP_RATE). The markup stays in DOT's account on every
  *    transaction; the merchant is credited their own base price.
- *  - On top of that, DOT takes a further 5% (WEEKLY_COMMISSION_RATE) of the
- *    merchant's post-markup earnings on every order — applied right here in
+ *  - DOT can also take a commission (WEEKLY_COMMISSION_RATE, default 0%: no
+ *    commission) of the merchant's earnings on every order — applied right here in
  *    computeSubtotalSplit(), the moment the order is paid, not later at
  *    withdrawal/distribution time. This means merchants.wallet balance (via
  *    wallet_transactions) is already the true payable amount; nothing
@@ -42,11 +42,11 @@ export function applyPlatformMarkup(basePrice) {
   return Math.round(base * (1 + getPlatformMarkupRate()) * 100) / 100;
 }
 
-/** Weekly commission deducted from merchant payouts (default 5%). */
+/** Commission taken from the merchant's share of each order (default 0%: none). */
 export function getWeeklyCommissionRate() {
   const raw = process.env.WEEKLY_COMMISSION_RATE;
-  const n = raw != null && raw !== '' ? parseFloat(String(raw), 10) : 0.05;
-  if (!Number.isFinite(n) || n < 0 || n > 0.5) return 0.05;
+  const n = raw != null && raw !== '' ? parseFloat(String(raw), 10) : 0;
+  if (!Number.isFinite(n) || n < 0 || n > 0.5) return 0;
   return n;
 }
 

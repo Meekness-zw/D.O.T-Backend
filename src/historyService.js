@@ -488,7 +488,7 @@ export async function getMerchantDashboardStats(userId) {
 
   const revenueByDay = buildRevenueByDay(orderList);
 
-  // Real net earnings vs. what DOT kept (15% markup + 5% commission), for
+  // Real net earnings vs. what DOT kept (15% markup + any commission), for
   // paid orders only — matches exactly what's actually in the merchant's wallet.
   let netEarnings = 0;
   let platformFees = 0;
@@ -571,7 +571,7 @@ export async function getMerchantDashboardStats(userId) {
     totalOrders,
     avgOrderValue,
     openOrders,
-    // Net of the 15% platform markup and 5% commission — what actually
+    // Net of the 15% platform markup and any commission — what actually
     // landed (or will land) in the wallet, vs. what DOT kept, for paid orders.
     netEarnings,
     platformFees,

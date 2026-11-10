@@ -11429,7 +11429,7 @@ app.get('/admin/payout-details', requireAdmin, async (req, res) => {
       const pm = payoutByKey.get(key);
       const profile = profileById.get(id);
       const balance = balances.get(key) || 0;
-      // The 5% weekly commission is already deducted per-order in
+      // Any commission (WEEKLY_COMMISSION_RATE, now 0%) is already deducted per-order in
       // computeSubtotalSplit() before this balance is ever credited — do not
       // subtract it again here. `balance` is the true payable amount.
       return {
