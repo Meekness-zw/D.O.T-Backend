@@ -156,6 +156,61 @@ export async function recordMerchantEarningsForOrderPayment({
 }
 
 /**
+ * Take the store's share back out of the merchant's wallet when a paid order
+ * is cancelled and the customer refunded, so the store isn't paid for an order
+ * it never delivered. Not for late cancellations: DOT pays the store for those.
+ * Safe to call more than once per order.
+ */
+export async function reverseMerchantEarningsForOrder({ orderId, orderNumber }) {
+  if (!supabase || !orderId) return null;
+
+  const { data: payments } = await supabase.from('payments').select('id').eq('order_id', orderId);
+  const paymentIds = (payments || []).map((p) => p.id);
+  if (!paymentIds.length) return null;
+
+  const { data: credits } = await supabase
+    .from('wallet_transactions')
+    .select('user_id, amount')
+    .eq('user_type', 'merchant')
+    .eq('transaction_type', 'earnings')
+    .in('reference_id', paymentIds);
+  const credit = (credits || [])[0];
+  const amount = Math.round((credits || []).reduce((sum, c) => sum + Number(c.amount || 0), 0) * 100) / 100;
+  if (!credit || amount <= 0) return null;
+
+  const { data: already } = await supabase
+    .from('wallet_transactions')
+    .select('id')
+    .eq('user_id', credit.user_id)
+    .eq('user_type', 'merchant')
+    .eq('transaction_type', 'refund')
+    .eq('reference_id', orderId)
+    .limit(1);
+  if (already?.length) return { skipped: true, reason: 'already_reversed' };
+
+  const prevBalance = await getWalletBalance(credit.user_id, 'merchant');
+  const { data, error } = await supabase
+    .from('wallet_transactions')
+    .insert({
+      user_id: credit.user_id,
+      user_type: 'merchant',
+      transaction_type: 'refund',
+      amount: -amount,
+      balance_after: Math.round((prevBalance - amount) * 100) / 100,
+      description: `Order ${orderNumber || ''} cancelled and refunded to the customer`,
+      reference_id: orderId,
+      status: 'completed',
+    })
+    .select('*')
+    .single();
+  if (error) {
+    console.error('[orderPaymentSplit] merchant earnings reversal error:', error);
+    return null;
+  }
+  return data;
+}
+
+/**
  * Whether this courier is paid per job.
  *
  * An empty result means the column is not on this database yet, and callers

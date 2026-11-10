@@ -133,6 +133,7 @@ import {
   getOtdPlatformServiceChargeUsd,
   applyPlatformMarkup,
   courierPayoutsEnabled,
+  reverseMerchantEarningsForOrder,
 } from './orderPaymentSplit.js';
 import { createInternalCourier } from './internalCourierService.js';
 import {
@@ -4971,6 +4972,7 @@ app.patch('/orders/:id', requireAuth, requireApprovedMerchant, async (req, res) 
       // The status-guarded update above is the claim, so this refund runs once.
       if (refundOnCancel) {
         await refundCancelledOrderToWallet(order, totalAmount);
+        await reverseMerchantEarningsForOrder({ orderId: order.id, orderNumber: order.order_number });
       }
       // Best-effort: the column comes from migrations/2026-10-22-order-cancellation-reason.sql.
       // The reason is also kept in order_status_history below, so cancelling
@@ -5175,6 +5177,10 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
     // wallet/pesepay orders that were actually charged upfront.
     if (wasPaid) {
       await refundCancelledOrderToWallet(order, totalAmount);
+      // A late cancellation still pays the store (DOT covers it), so its share stays.
+      if (!lateCancel) {
+        await reverseMerchantEarningsForOrder({ orderId: order.id, orderNumber: order.order_number });
+      }
     }
 
     const { error: historyError } = await supabase.from('order_status_history').insert({
@@ -6826,7 +6832,9 @@ app.get('/users/me/wallet-transactions', requireAuth, async (req, res) => {
       offset,
       userType: requestedRole,
     });
-    return res.json({ transactions });
+    // The wallet's actual balance (what can be withdrawn), for that role.
+    const balance = requestedRole ? await getWalletBalance(req.userId, requestedRole) : undefined;
+    return res.json({ transactions, ...(balance !== undefined ? { balance } : {}) });
   } catch (error) {
     console.error('get wallet-transactions error:', error);
     return res.status(500).json({

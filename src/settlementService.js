@@ -165,6 +165,16 @@ export function applyWalletPaidCourier(settlement) {
 }
 
 /**
+ * The store's share is credited to the merchant's wallet when the order is
+ * paid, and they are paid when they request a withdrawal (see withdrawals.js).
+ * Paying it again from here would pay them twice.
+ */
+export function applyWalletPaidMerchant(settlement) {
+  settlement.store.paid_via_wallet = true;
+  return settlement;
+}
+
+/**
  * The customer cancelled after waiting 60+ minutes past handover (see
  * lateCancel.js). They were refunded in full, the courier earns nothing, and
  * DOT still pays the store for food it made and handed over.
@@ -290,8 +300,9 @@ export async function listSettlements({ from, to, storeId, courierId, limit = 50
       s.reconciliation = reconcile(s);
       if (o.courier_id) applyWalletPaidCourier(s);
     }
+    applyWalletPaidMerchant(s);
     s.paid = {
-      merchant: paidKeys.has(`${o.id}:merchant`),
+      merchant: paidKeys.has(`${o.id}:merchant`) || !!s.store.paid_via_wallet,
       // Nothing is owed to the courier on a late cancellation.
       courier: paidKeys.has(`${o.id}:courier`) || !!s.courier.paid_via_wallet || !!s.late_cancellation,
     };
@@ -325,6 +336,7 @@ export async function settlementDetail(orderId) {
     s.reconciliation = reconcile(s);
     if (order.courier_id) applyWalletPaidCourier(s);
   }
+  applyWalletPaidMerchant(s);
 
   const { data: items } = await supabase
     .from('order_items')
@@ -378,6 +390,8 @@ export async function recordDisbursement({ orderId, recipientType, actor, note }
     if (s.courier.amount_due <= 0) fail(400, 'Nothing owed to the courier');
   } else if (!s.store.merchant_id) {
     fail(400, 'No merchant on this order');
+  } else if (s.store.paid_via_wallet) {
+    fail(409, 'Paid via withdrawal', 'This share went to the merchant\'s wallet. They are paid when they request a withdrawal (see Withdrawals).');
   } else if (s.store.amount_due <= 0) {
     fail(400, 'Nothing owed to the store');
   }
