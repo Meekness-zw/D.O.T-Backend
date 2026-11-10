@@ -18,6 +18,7 @@ import { hashPassword, verifyPassword } from './passwordHash.js';
 import { assertStrongPassword } from './passwordPolicy.js';
 import { supabaseAdmin as supabase } from './supabaseAdminClient.js';
 import { sendEmail, signInCodeEmail, emailConfigured } from './mailer.js';
+import { isMerchantController } from './merchantControl.js';
 
 export const DASHBOARD_ROLES = ['admin', 'accountant', 'sales_marketing'];
 
@@ -238,6 +239,77 @@ async function revokeAllSessionsFor(adminUserId) {
     .update({ revoked_at: new Date().toISOString() })
     .eq('admin_user_id', adminUserId)
     .is('revoked_at', null);
+  // Remembered computers go too: they could otherwise mint new sessions.
+  await forgetAllDevicesFor(adminUserId);
+}
+
+// ─── Remembered computers (DOT team on the merchant dashboard) ──────────────
+// A computer that finished the emailed-code sign-in gets a device key. With it
+// the team skips the code next time, and the dashboard signs itself back in
+// when the session lapses. 90 days from last use; only merchant controllers.
+export const TEAM_DEVICE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+const DEVICE_PREFIX = 'dot_dev_';
+
+async function rememberDevice({ user, req }) {
+  const token = DEVICE_PREFIX + crypto.randomBytes(32).toString('base64url');
+  const { error } = await supabase.from('admin_trusted_devices').insert({
+    admin_user_id: user.id,
+    token_hash: sha256(token),
+    label: String(req.headers['user-agent'] || '').slice(0, 200) || null,
+    expires_at: new Date(Date.now() + TEAM_DEVICE_TTL_MS).toISOString(),
+  });
+  if (error) throw new Error(error.message || 'Failed to remember device');
+  return token;
+}
+
+/** The live device row for this key, or null. Slides its expiry on use. */
+async function useDevice(token, adminUserId = null) {
+  if (!token || !String(token).startsWith(DEVICE_PREFIX)) return null;
+  const { data, error } = await supabase
+    .from('admin_trusted_devices')
+    .select('id, admin_user_id, expires_at, revoked_at')
+    .eq('token_hash', sha256(token))
+    .maybeSingle();
+  if (error || !data || data.revoked_at) return null;
+  if (new Date(data.expires_at).getTime() <= Date.now()) return null;
+  if (adminUserId && data.admin_user_id !== adminUserId) return null;
+  await supabase
+    .from('admin_trusted_devices')
+    .update({
+      last_used_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + TEAM_DEVICE_TTL_MS).toISOString(),
+    })
+    .eq('id', data.id);
+  return data;
+}
+
+async function forgetDevice(token) {
+  if (!token || !String(token).startsWith(DEVICE_PREFIX)) return;
+  await supabase
+    .from('admin_trusted_devices')
+    .update({ revoked_at: new Date().toISOString() })
+    .eq('token_hash', sha256(token));
+}
+
+async function forgetAllDevicesFor(adminUserId) {
+  const { error } = await supabase
+    .from('admin_trusted_devices')
+    .update({ revoked_at: new Date().toISOString() })
+    .eq('admin_user_id', adminUserId)
+    .is('revoked_at', null);
+  // Table missing (migration not run yet) must not break password changes.
+  if (error) console.error('forget devices failed:', error.message);
+}
+
+function teamSignedInBody(token, user) {
+  return {
+    token,
+    admin: publicUser(user),
+    role: user.role,
+    sections: DASHBOARD_SECTIONS[user.role] || [],
+    recoveryCodes: null,
+    recoveryCodeUsed: false,
+  };
 }
 
 // ─── Emailed sign-in codes + recovery codes ─────────────────────────────────
@@ -677,6 +749,16 @@ export function registerAdminAuthRoutes(app) {
       }
       await clearFailures(user);
 
+      // A remembered computer of a DOT team account skips the emailed code.
+      const deviceToken = String(req.body?.deviceToken || '');
+      if (deviceToken && isMerchantController(user) && (await useDevice(deviceToken, user.id))) {
+        const token = await createSession({ user, req, mfaPending: false });
+        const patch = { last_login_at: new Date().toISOString() };
+        await supabase.from('admin_users').update(patch).eq('id', user.id);
+        await logAdminAction({ req, user, action: 'admin.login.remembered_device' });
+        return res.json({ ...teamSignedInBody(token, { ...user, ...patch }), deviceToken });
+      }
+
       // Password is right; issue a token that proves ONLY that, and which
       // every dashboard endpoint refuses until the code is verified.
       const mfaToken = await createSession({ user, req, mfaPending: true });
@@ -766,7 +848,18 @@ export function registerAdminAuthRoutes(app) {
         action: usedRecovery ? 'admin.login.recovery_code' : 'admin.login.success',
       });
 
+      // DOT team on the merchant dashboard: remember this computer.
+      let deviceToken = null;
+      if (req.body?.rememberDevice && isMerchantController(user)) {
+        try {
+          deviceToken = await rememberDevice({ user, req });
+        } catch (deviceError) {
+          console.error('remember device failed:', deviceError.message);
+        }
+      }
+
       return res.json({
+        deviceToken,
         token: mfaToken,
         admin: publicUser({ ...user, ...patch }),
         role: user.role,
@@ -779,6 +872,41 @@ export function registerAdminAuthRoutes(app) {
       console.error('post /admin/auth/verify error:', error);
       return res.status(500).json({ error: 'Verification failed', details: 'Please try again later' });
     }
+  });
+
+  /**
+   * POST /admin/auth/device-login { deviceToken } — a remembered DOT team
+   * computer signs itself back in after its session lapsed.
+   */
+  app.post('/admin/auth/device-login', loginLimiter, async (req, res) => {
+    try {
+      if (!supabase) return res.status(503).json({ error: 'Server not configured' });
+      const device = await useDevice(String(req.body?.deviceToken || ''));
+      const forgotten = { error: 'Device not remembered', details: 'Sign in with your email and password.' };
+      if (!device) return res.status(401).json(forgotten);
+      const { data: user, error } = await supabase
+        .from('admin_users').select('*').eq('id', device.admin_user_id).maybeSingle();
+      if (error) throw new Error(error.message || 'Failed to look up account');
+      if (!user || user.is_active === false || isLocked(user) || !isMerchantController(user)) {
+        return res.status(401).json(forgotten);
+      }
+      const token = await createSession({ user, req, mfaPending: false });
+      await logAdminAction({ req, user, action: 'admin.login.device' });
+      return res.json(teamSignedInBody(token, user));
+    } catch (error) {
+      console.error('post /admin/auth/device-login error:', error);
+      return res.status(500).json({ error: 'Sign-in failed', details: 'Please try again later' });
+    }
+  });
+
+  /** POST /admin/auth/forget-device { deviceToken } — "forget this PC". */
+  app.post('/admin/auth/forget-device', async (req, res) => {
+    try {
+      await forgetDevice(String(req.body?.deviceToken || ''));
+    } catch (error) {
+      console.error('post /admin/auth/forget-device error:', error);
+    }
+    return res.json({ ok: true });
   });
 
   /** POST /admin/auth/logout — revoke the current session. */
