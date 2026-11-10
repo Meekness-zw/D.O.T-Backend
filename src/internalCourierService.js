@@ -1,7 +1,8 @@
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { checkPhoneRegistered, deleteUserById } from './authService.js';
 import { ensureUserProfile } from './userService.js';
-import { assertStrongPassword } from './passwordPolicy.js';
+import { pinProblem, setAccountPin } from './pinAuth.js';
+import { controllerEmails } from './merchantControl.js';
 import { approveCourier } from './adminService.js';
 import {
   upsertCourierProfile,
@@ -57,9 +58,14 @@ async function removeCreatedUser(userId) {
 }
 
 /**
- * Create a courier account the rider can log into immediately.
- * DOT staff supply the profile, vehicle, and license. Payout setup is
- * skipped and payouts_enabled is false: DOT pays the rider, not each job.
+ * Create a DOT courier the rider can log into immediately, with the phone
+ * number and 4-digit PIN the admin sets. The account email defaults to the DOT
+ * inbox (shared by all DOT couriers), so codes for a new phone or a forgotten
+ * PIN go to the team, who pass them to the rider.
+ *
+ * DOT staff supply the name, vehicle and plate; ID, date of birth, license and
+ * photos are optional and can be added later. Payout setup is skipped and
+ * payouts_enabled is false: DOT pays the rider, not each job.
  */
 export async function createInternalCourier(body = {}) {
   if (!supabaseAdmin) throw fail('Server not configured', 500);
@@ -69,21 +75,22 @@ export async function createInternalCourier(body = {}) {
   if (!phone) {
     throw fail('Enter the phone number with its country code, e.g. +263 77 123 4567.');
   }
-  const email = requireText(body.email, 'Email').toLowerCase();
+  const email = String(body.email || '').trim().toLowerCase() || controllerEmails()[0];
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw fail('A valid email address is required');
-  const password = String(body.password || '');
-  const passwordCheck = await assertStrongPassword(password);
-  if (!passwordCheck.valid) throw fail(passwordCheck.error);
+  const sharedDotEmail = controllerEmails().includes(email);
+  const pin = String(body.pin || '');
+  const problem = pinProblem(pin);
+  if (problem) throw fail(problem);
 
-  const nationalId = requireText(body.nationalId, 'National ID');
-  const dateOfBirth = requireText(body.dateOfBirth, 'Date of birth');
-  const city = requireText(body.city, 'City');
+  const nationalId = String(body.nationalId || '').trim();
+  const dateOfBirth = String(body.dateOfBirth || '').trim();
+  const city = String(body.city || '').trim();
   const vehicleType = requireText(body.vehicleType, 'Vehicle type');
   if (!VEHICLE_TYPES.has(vehicleType)) throw fail('Vehicle type must be bike, car, or motorcycle');
   const brand = requireText(body.brand, 'Vehicle brand');
   const model = requireText(body.model, 'Vehicle model');
   const licensePlate = requireText(body.licensePlate, 'License plate');
-  const licenseNumber = requireText(body.licenseNumber, 'Driver license number');
+  const licenseNumber = String(body.licenseNumber || '').trim();
 
   const profilePhotoBase64 = body.profilePhotoBase64;
   const nationalIdPhotoBase64 = body.nationalIdPhotoBase64;
@@ -91,26 +98,23 @@ export async function createInternalCourier(body = {}) {
   const registrationCertificateBase64 = body.registrationCertificateBase64;
   const licenseFrontBase64 = body.licenseFrontBase64;
   const licenseBackBase64 = body.licenseBackBase64;
-  if (!profilePhotoBase64) throw fail('A profile photo is required');
-  if (!nationalIdPhotoBase64) throw fail('A national ID or passport photo is required');
-  if (!vehiclePhotoBase64) throw fail('A vehicle photo is required');
-  if (!registrationCertificateBase64) throw fail('A vehicle registration certificate is required');
-  if (!licenseFrontBase64 || !licenseBackBase64) throw fail('Front and back license photos are required');
 
   const existing = await checkPhoneRegistered(phone);
   if (existing.registered) throw fail('A user with this phone number already exists.', 409);
 
-  const { data: emailTaken } = await supabaseAdmin
-    .from('user_profiles')
-    .select('id')
-    .eq('email', email)
-    .limit(1);
-  if (emailTaken?.length) throw fail('This email address is already in use.', 409);
+  // The DOT inbox is shared by all DOT couriers; any other email is one account's.
+  if (!sharedDotEmail) {
+    const { data: emailTaken } = await supabaseAdmin
+      .from('user_profiles')
+      .select('id')
+      .eq('email', email)
+      .limit(1);
+    if (emailTaken?.length) throw fail('This email address is already in use.', 409);
+  }
 
   let userId;
   const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
     phone,
-    password,
     phone_confirm: true,
   });
   if (authError) {
@@ -119,7 +123,6 @@ export async function createInternalCourier(body = {}) {
       if (match) await supabaseAdmin.auth.admin.deleteUser(match.id);
       const { data: retryData, error: retryError } = await supabaseAdmin.auth.admin.createUser({
         phone,
-        password,
         phone_confirm: true,
       });
       if (retryError) throw fail(retryError.message || 'Failed to create the login', 500);
@@ -138,8 +141,8 @@ export async function createInternalCourier(body = {}) {
       phone,
       fullName,
       role: 'courier',
-      password,
     });
+    await setAccountPin(userId, pin);
 
     await upsertCourierProfile({
       userId,
@@ -149,6 +152,7 @@ export async function createInternalCourier(body = {}) {
       city,
       profilePhotoBase64,
       nationalIdPhotoBase64,
+      documentsOptional: true,
     });
     await saveCourierVehicle({
       userId,
@@ -160,14 +164,18 @@ export async function createInternalCourier(body = {}) {
       licensePlate,
       vehiclePhotoBase64,
       registrationCertificateBase64,
+      documentsOptional: true,
     });
-    await saveCourierDriverLicense({
-      userId,
-      licenseNumber,
-      expiryDate: body.licenseExpiry,
-      frontBase64: licenseFrontBase64,
-      backBase64: licenseBackBase64,
-    });
+    if (licenseNumber) {
+      await saveCourierDriverLicense({
+        userId,
+        licenseNumber,
+        expiryDate: body.licenseExpiry,
+        frontBase64: licenseFrontBase64,
+        backBase64: licenseBackBase64,
+        documentsOptional: true,
+      });
+    }
 
     const profileUpdate = { payouts_enabled: false };
     const expiry = String(body.licenseExpiry || '').trim();

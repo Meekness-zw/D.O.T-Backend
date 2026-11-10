@@ -152,6 +152,9 @@ export async function upsertCourierProfile({
   city,
   profilePhotoBase64,
   nationalIdPhotoBase64,
+  // DOT staff creating one of DOT's own couriers: ID, date of birth and photos
+  // can be added later. Couriers signing themselves up always need them.
+  documentsOptional = false,
 }) {
   requireSupabase();
   if (!userId) throw new Error('userId is required');
@@ -171,35 +174,39 @@ export async function upsertCourierProfile({
     if (!cityValue) cityValue = String(existingCourier?.city || '').trim();
   }
   if (!name) throw new Error('fullName is required');
-  if (!idNumber) throw new Error('nationalId is required');
-  if (!dobRaw) throw new Error('dateOfBirth is required');
-  if (!profilePhotoBase64 && !(await courierDocumentUrl(userId, 'profile_photo'))) {
-    throw new Error('A profile photo is required');
-  }
-  if (!nationalIdPhotoBase64 && !(await courierDocumentUrl(userId, 'national_id'))) {
-    throw new Error('A national ID or passport photo is required');
+  if (!documentsOptional) {
+    if (!idNumber) throw new Error('nationalId is required');
+    if (!dobRaw) throw new Error('dateOfBirth is required');
+    if (!profilePhotoBase64 && !(await courierDocumentUrl(userId, 'profile_photo'))) {
+      throw new Error('A profile photo is required');
+    }
+    if (!nationalIdPhotoBase64 && !(await courierDocumentUrl(userId, 'national_id'))) {
+      throw new Error('A national ID or passport photo is required');
+    }
   }
 
   // Expect date in DD/MM/YYYY from UI; convert to YYYY-MM-DD if possible
-  let dobIso = dobRaw;
+  let dobIso = dobRaw || null;
   const dobMatch = dobRaw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
   if (dobMatch) {
     dobIso = `${dobMatch[3]}-${dobMatch[2]}-${dobMatch[1]}`;
   }
 
-  // Enforce minimum age of 18 years for couriers
-  const parsedDob = new Date(dobIso);
-  if (Number.isNaN(parsedDob.getTime())) {
-    throw new Error('Invalid date of birth format');
-  }
-  const today = new Date();
-  let age = today.getFullYear() - parsedDob.getFullYear();
-  const m = today.getMonth() - parsedDob.getMonth();
-  if (m < 0 || (m === 0 && today.getDate() < parsedDob.getDate())) {
-    age -= 1;
-  }
-  if (age < 18) {
-    throw new Error('You must be at least 18 years old to create a courier account');
+  // Enforce minimum age of 18 years for couriers (when a date is given)
+  if (dobIso) {
+    const parsedDob = new Date(dobIso);
+    if (Number.isNaN(parsedDob.getTime())) {
+      throw new Error('Invalid date of birth format');
+    }
+    const today = new Date();
+    let age = today.getFullYear() - parsedDob.getFullYear();
+    const m = today.getMonth() - parsedDob.getMonth();
+    if (m < 0 || (m === 0 && today.getDate() < parsedDob.getDate())) {
+      age -= 1;
+    }
+    if (age < 18) {
+      throw new Error('You must be at least 18 years old to create a courier account');
+    }
   }
 
   await ensureCourierAccountProfile(supabase, userId, name);
@@ -215,7 +222,7 @@ export async function upsertCourierProfile({
   const { error: courierError } = await supabase.from('couriers').upsert(
     {
       id: userId,
-      national_id: idNumber,
+      national_id: idNumber || null,
       date_of_birth: dobIso,
       city: cityValue || null,
       ...verification,
@@ -260,6 +267,7 @@ export async function saveCourierVehicle({
   licensePlate,
   vehiclePhotoBase64,
   registrationCertificateBase64,
+  documentsOptional = false,
 }) {
   requireSupabase();
   if (!userId) throw new Error('userId is required');
@@ -306,9 +314,11 @@ export async function saveCourierVehicle({
   }
   const photoOnFile = existingPhotoUrl || target?.vehicle_photo_url;
   const certOnFile = existingCertUrl || target?.registration_certificate_url;
-  if (!vehiclePhotoBase64 && !photoOnFile) throw new Error('A vehicle photo is required');
-  if (!registrationCertificateBase64 && !certOnFile) {
-    throw new Error('A vehicle registration certificate is required');
+  if (!documentsOptional) {
+    if (!vehiclePhotoBase64 && !photoOnFile) throw new Error('A vehicle photo is required');
+    if (!registrationCertificateBase64 && !certOnFile) {
+      throw new Error('A vehicle registration certificate is required');
+    }
   }
 
   const fields = {
@@ -401,6 +411,7 @@ export async function saveCourierDriverLicense({
   expiryDate,
   frontBase64,
   backBase64,
+  documentsOptional = false,
 }) {
   requireSupabase();
   if (!userId) throw new Error('userId is required');
@@ -415,7 +426,7 @@ export async function saveCourierDriverLicense({
   }
   if (!license) throw new Error('licenseNumber is required');
   const existingLicenseUrl = await courierDocumentUrl(userId, 'id_drivers_license');
-  if ((!frontBase64 || !backBase64) && !existingLicenseUrl) {
+  if (!documentsOptional && (!frontBase64 || !backBase64) && !existingLicenseUrl) {
     throw new Error('Front and back license photos are required');
   }
 

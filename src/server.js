@@ -10777,6 +10777,34 @@ app.post('/admin/couriers/internal', requireAdmin, async (req, res) => {
   }
 });
 
+// POST /admin/couriers/:id/pin { pin } — set a new sign-in PIN for one of
+// DOT's own couriers (e.g. the rider forgot it). Their account email is the
+// DOT inbox, so this saves passing a reset code on to them.
+app.post('/admin/couriers/:id/pin', requireAdmin, async (req, res) => {
+  try {
+    const problem = pinProblem(req.body?.pin);
+    if (problem) return res.status(400).json({ error: problem });
+    const { data: courier, error } = await supabase
+      .from('couriers')
+      .select('id, payouts_enabled')
+      .eq('id', req.params.id)
+      .maybeSingle();
+    if (error) throw error;
+    if (!courier) return res.status(404).json({ error: 'Courier not found' });
+    if (courier.payouts_enabled !== false) {
+      return res.status(403).json({
+        error: 'Only DOT couriers',
+        details: 'Other couriers reset their own PIN from the sign-in screen.',
+      });
+    }
+    await setAccountPin(courier.id, String(req.body.pin));
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('admin/couriers/:id/pin error:', error);
+    return res.status(500).json({ error: 'Failed to set the PIN' });
+  }
+});
+
 app.get('/admin/couriers', requireAdmin, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
