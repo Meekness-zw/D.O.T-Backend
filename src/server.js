@@ -90,6 +90,7 @@ import {
   upsertMerchantOnboarding,
 } from './onboardingService.js';
 import { zimbabweNumberProblem } from './internalCourierService.js';
+import { registerStoreWhatsappRoutes } from './storeWhatsapp.js';
 import { settleStoreCategory, ensureBusinessType, CATEGORY_CHECK_VERSION } from './storeCategory.js';
 import { detectProviderFromPhone, normalizeZwPhone } from './walletProvider.js';
 import { getSuggestedProductCategoryNames } from './storeCategorySuggestions.js';
@@ -4851,6 +4852,9 @@ app.put('/courier/availability', requireAuth, requireApprovedCourier, async (req
 });
 
 // GET /users/me/orders — order history for current user (by role). Use ?role=customer|merchant|courier when user has multiple roles.
+// DOT team: send new orders to the store on WhatsApp (src/storeWhatsapp.js).
+registerStoreWhatsappRoutes(app, requireAuth);
+
 app.get('/users/me/orders', requireAuth, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
