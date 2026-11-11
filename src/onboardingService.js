@@ -229,7 +229,17 @@ export async function upsertCourierProfile({
     },
     { onConflict: 'id' },
   );
-  if (courierError) throw new Error(courierError.message || 'Failed to save courier profile');
+  if (courierError) {
+    // Unique national ID: the same person already has another courier account.
+    if (courierError.code === '23505' && /national_id/i.test(courierError.message || '')) {
+      const err = new Error(
+        'This national ID is already registered on another courier account. Check the number, or contact DOT support so the accounts can be merged.',
+      );
+      err.status = 409;
+      throw err;
+    }
+    throw new Error(courierError.message || 'Failed to save courier profile');
+  }
 
   const uploads = {};
   if (profilePhotoBase64) {
