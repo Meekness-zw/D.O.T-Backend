@@ -89,6 +89,7 @@ import {
   saveMerchantPayoutMethod,
   upsertMerchantOnboarding,
 } from './onboardingService.js';
+import { zimbabweNumberProblem } from './internalCourierService.js';
 import { settleStoreCategory, ensureBusinessType, CATEGORY_CHECK_VERSION } from './storeCategory.js';
 import { detectProviderFromPhone, normalizeZwPhone } from './walletProvider.js';
 import { getSuggestedProductCategoryNames } from './storeCategorySuggestions.js';
@@ -7824,6 +7825,8 @@ app.post('/merchant-control/merchants', requireMerchantController, async (req, r
     if (!phone) {
       return res.status(400).json({ error: 'Enter the owner’s phone number with its country code, e.g. +263 77 123 4567.' });
     }
+    const phoneProblem = zimbabweNumberProblem(phone);
+    if (phoneProblem) return res.status(400).json({ error: phoneProblem });
     if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return res.status(400).json({ error: 'That email address looks incomplete.' });
     }

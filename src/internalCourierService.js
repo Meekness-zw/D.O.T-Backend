@@ -26,6 +26,14 @@ function normalizeE164(phone) {
   return cleaned;
 }
 
+/** A Zimbabwe number (+263) must have 9 digits after the code, e.g. +263 77 123 4567. */
+export function zimbabweNumberProblem(e164) {
+  if (!String(e164 || '').startsWith('+263')) return null;
+  const national = String(e164).slice(4);
+  if (national.length === 9) return null;
+  return `That Zimbabwe number has ${national.length} digits after +263; it needs 9, e.g. +263 77 123 4567. Check for a missing or extra digit.`;
+}
+
 function requireText(value, label) {
   const text = String(value || '').trim();
   if (!text) throw fail(`${label} is required`);
@@ -77,6 +85,8 @@ export async function createInternalCourier(body = {}) {
   if (!phone) {
     throw fail('Enter the phone number with its country code, e.g. +263 77 123 4567.');
   }
+  const phoneProblem = zimbabweNumberProblem(phone);
+  if (phoneProblem) throw fail(phoneProblem);
   const email = String(body.email || '').trim().toLowerCase() || controllerEmails()[0];
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw fail('A valid email address is required');
   const sharedDotEmail = controllerEmails().includes(email);
