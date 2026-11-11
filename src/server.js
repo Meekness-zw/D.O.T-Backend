@@ -4383,6 +4383,27 @@ function pinSignInResponse(profile, extra = {}) {
   return { success: true, user: data.user, session: data.session, ...extra };
 }
 
+/**
+ * App store review accounts (Google Play, Apple). Reviewers can't read the
+ * account's email, so the emailed new-device code would block them. Phone
+ * numbers listed in STORE_REVIEW_PHONES (comma-separated, any format) sign in
+ * with phone + PIN alone; the PIN check and its lockout still apply. Every
+ * other account is unchanged. Keep this list to dedicated test accounts.
+ */
+function storeReviewPhoneSet() {
+  return new Set(
+    String(process.env.STORE_REVIEW_PHONES || '')
+      .split(',')
+      .map((p) => normalizeE164(p.trim()))
+      .filter(Boolean),
+  );
+}
+
+function isStoreReviewAccount(profile) {
+  const phone = normalizeE164(profile?.phone || '');
+  return !!phone && storeReviewPhoneSet().has(phone);
+}
+
 async function profileForPinRequest(req, res) {
   const phone = normalizeE164(req.body?.phone);
   if (!phone) {
@@ -4479,7 +4500,8 @@ app.post('/auth/pin/login', pinLoginLimiter, async (req, res) => {
     // Say so before asking a new phone for an emailed code it can't use yet.
     if (isPinLocked(profile)) return pinFailure(res, { locked: true });
     const trustedUserId = await userForDeviceToken(req.body?.deviceToken, 'device');
-    if (trustedUserId !== profile.id) {
+    const reviewAccount = isStoreReviewAccount(profile);
+    if (trustedUserId !== profile.id && !reviewAccount) {
       return res.status(401).json({
         code: 'NEW_DEVICE',
         error: 'Confirm it’s you',
@@ -4488,6 +4510,11 @@ app.post('/auth/pin/login', pinLoginLimiter, async (req, res) => {
     }
     const result = await checkAccountPin(profile, req.body?.pin);
     if (!result.ok) return pinFailure(res, result);
+    if (reviewAccount && trustedUserId !== profile.id) {
+      // Trust this device like a normal emailed-code sign-in would.
+      const deviceToken = await issueDeviceToken(profile.id, 'device');
+      return res.json(pinSignInResponse(profile, { deviceToken }));
+    }
     return res.json(pinSignInResponse(profile));
   } catch (error) {
     console.error('pin/login error:', error);
