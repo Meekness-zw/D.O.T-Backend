@@ -165,6 +165,29 @@ export async function verifyStoreCategory({ storeName, description, declaredType
     }
   }
 
+  // Food outlets filed under a broad food category (or none): obvious
+  // specialities are recognised without the AI, so they still move when the
+  // AI is unavailable. Most specific first (sushi before Asian).
+  const declaredLower = String(declaredType || '').toLowerCase();
+  const broadFood = !declaredLower || /restaurant|food|take ?away|cafe|eat/.test(declaredLower);
+  if (broadFood) {
+    const foodRules = [
+      [/\bsushi\b/, ['Sushi']],
+      [/\bpizz(a|eria)/, ['Pizza']],
+      [/\b(chicken|wings|poultry)\b/, ['Chicken']],
+      [/\b(burgers?|fast food|take ?aways?)\b/, ['Fast Food']],
+      [/\b(mexican|tacos?|burritos?)\b/, ['Mexican']],
+      [/\b(chinese|japanese|thai|korean|asian|noodles?|ramen|dim sum)\b/, ['Asian']],
+      [/\b(desserts?|ice ?cream|cakes?|cupcakes?|waffles?|donuts?|doughnuts?)\b/, ['Desserts']],
+    ];
+    for (const [pattern, candidates] of foodRules) {
+      if (pattern.test(haystack)) {
+        const match = exactCategory(candidates);
+        if (match) return match;
+      }
+    }
+  }
+
   const client = getAnthropicClient();
   if (!client || anthropicCreditsPaused()) return null;
   try {

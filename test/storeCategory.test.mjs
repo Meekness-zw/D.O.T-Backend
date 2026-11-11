@@ -37,6 +37,25 @@ test('an unmistakable store lands in its specialist category even before it exis
   }
 });
 
+test('obvious food outlets under Restaurant / Food move without the AI', async () => {
+  const saved = process.env.ANTHROPIC_API_KEY;
+  delete process.env.ANTHROPIC_API_KEY;
+  const check = (storeName, description, declaredType = 'Restaurant / Food') =>
+    verifyStoreCategory({ storeName, description, declaredType, categoryNames: DEFAULTS });
+  try {
+    assert.equal(await check('Yummy Sushi', 'Sushi Restaurant'), 'Sushi');
+    assert.equal(await check('Chicken Basket', ''), 'Chicken');
+    assert.equal(await check('Dough By Zo', 'American and Mexican cuisine.'), 'Mexican');
+    assert.equal(await check('Chuan Fu Lou', 'Chinese Restaurant'), 'Asian');
+    // Nothing obvious: left to the AI (unavailable here), so unchanged.
+    assert.equal(await check('LaCasa Restaurant & Bar', 'Serving Authentic West African Cuisine'), null);
+    // Only broad food picks are second-guessed this way.
+    assert.equal(await check('Corner Grocer', 'bread, milk and chicken', 'Grocery / Retail'), null);
+  } finally {
+    if (saved) process.env.ANTHROPIC_API_KEY = saved;
+  }
+});
+
 test('settling a store creates the category it belongs in and files the store there', async () => {
   const writes = [];
   const types = [{ id: 'restaurant', name: 'Restaurant / Food', icon: 'dot:fast_food' }];
@@ -46,9 +65,11 @@ test('settling a store creates the category it belongs in and files the store th
       select: () => q,
       eq: () => q,
       order: () => q,
+      ilike: () => q,
+      limit: () => q,
       single: async () => ({ data: q._row, error: null }),
-      upsert: (row) => {
-        writes.push([name, 'upsert', row]);
+      insert: (row) => {
+        writes.push([name, 'insert', row]);
         types.push(row);
         q._row = row;
         return q;
@@ -77,6 +98,8 @@ test('settling a store creates the category it belongs in and files the store th
     declaredType: 'Restaurant / Food',
   });
   assert.equal(shownAs, 'Sushi');
-  assert.deepEqual(writes.find((w) => w[1] === 'upsert')[2], { id: 'sushi', name: 'Sushi', icon: 'dot:sushi', is_default: false });
+  const created = writes.find((w) => w[1] === 'insert')[2];
+  assert.match(created.id, /^[0-9a-f-]{36}$/); // business_types.id is a uuid
+  assert.deepEqual({ ...created, id: undefined }, { id: undefined, name: 'Sushi', icon: 'dot:sushi', is_default: false });
   assert.deepEqual(writes.find((w) => w[0] === 'stores')[2], { category_override: 'Sushi' });
 });

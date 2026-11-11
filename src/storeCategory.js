@@ -7,11 +7,12 @@
  * for a sushi restaurant filed under "Restaurant / Food", it is created
  * here with its icon, so it shows up as a category tab in the app.
  */
+import crypto from 'crypto';
 import { supabaseAdmin as supabase } from './supabaseAdminClient.js';
 import { verifyStoreCategory, pickCategoryImage, specialtyIcon } from './storeCategorizationAI.js';
 
 // Bump when the category rules change, so every store is re-checked once.
-export const CATEGORY_CHECK_VERSION = 2;
+export const CATEGORY_CHECK_VERSION = 3;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -31,12 +32,18 @@ export async function ensureBusinessType(name) {
   const existing = (types || []).find((t) => String(t.name || '').toLowerCase() === label.toLowerCase());
   if (existing) return existing;
   const icon = specialtyIcon(label) || (await pickCategoryImage(label));
-  const { data, error: upsertError } = await supabase
+  // business_types.id is a uuid: a text id like "sushi" is rejected.
+  const { data, error: insertError } = await supabase
     .from('business_types')
-    .upsert({ id: categorySlug(label), name: label, icon, is_default: false }, { onConflict: 'id' })
+    .insert({ id: crypto.randomUUID(), name: label, icon, is_default: false })
     .select('id, name, icon')
     .single();
-  if (upsertError) throw new Error(upsertError.message);
+  if (insertError) {
+    // Created by someone else a moment ago?
+    const { data: again } = await supabase.from('business_types').select('id, name, icon').ilike('name', label).limit(1);
+    if (again?.[0]) return again[0];
+    throw new Error(insertError.message);
+  }
   console.log(`[Category] created "${label}" (${icon})`);
   return data;
 }
@@ -49,9 +56,11 @@ export async function ensureBusinessType(name) {
 export async function settleStoreCategory({ storeId, storeName, description, declaredType }) {
   try {
     if (!supabase || !storeId) return null;
-    const declared = String(declaredType || '').trim();
-    const { data: types } = await supabase.from('business_types').select('name');
+    const { data: types } = await supabase.from('business_types').select('id, name');
     const names = (types || []).map((t) => t.name).filter(Boolean);
+    // Some merchants have the category's id saved instead of its name.
+    let declared = String(declaredType || '').trim();
+    if (UUID.test(declared)) declared = (types || []).find((t) => t.id === declared)?.name || '';
     // A category the merchant typed themselves is a candidate too.
     const typedOwn = declared && !UUID.test(declared) && !names.some((n) => n.toLowerCase() === declared.toLowerCase());
     if (typedOwn) names.push(declared);
@@ -66,7 +75,14 @@ export async function settleStoreCategory({ storeId, storeName, description, dec
     // Check unavailable: a typed-in category still becomes a real one.
     const chosen = verified || (typedOwn ? declared : null);
     if (!chosen) return null;
-    const row = await ensureBusinessType(chosen);
+    // Creating the category must never stop the store being filed under it:
+    // the app shows a category tab for it either way.
+    let row = null;
+    try {
+      row = await ensureBusinessType(chosen);
+    } catch (err) {
+      console.warn(`[Category] could not create "${chosen}":`, err?.message);
+    }
     const shownAs = row?.name || chosen;
     if (verified) {
       await supabase.from('stores').update({ category_override: shownAs }).eq('id', storeId);

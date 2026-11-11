@@ -89,7 +89,7 @@ import {
   saveMerchantPayoutMethod,
   upsertMerchantOnboarding,
 } from './onboardingService.js';
-import { settleStoreCategory, CATEGORY_CHECK_VERSION } from './storeCategory.js';
+import { settleStoreCategory, ensureBusinessType, CATEGORY_CHECK_VERSION } from './storeCategory.js';
 import { detectProviderFromPhone, normalizeZwPhone } from './walletProvider.js';
 import { getSuggestedProductCategoryNames } from './storeCategorySuggestions.js';
 import {
@@ -1457,22 +1457,10 @@ app.post('/business-types', requireAuth, async (req, res) => {
     if (!name || !String(name).trim()) {
       return res.status(400).json({ error: 'name is required' });
     }
-    const label = String(name).trim();
-    // Derive a slug from the label
-    const id = label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
-
-    // New category → AI picks its sticker once; reused forever after
-    const resolvedIcon = isCartoonIcon(icon) ? icon : await pickCategoryImage(label);
-
-    // Upsert so concurrent submissions of the same type are idempotent
-    const { data, error } = await supabase
-      .from('business_types')
-      .upsert({ id, name: label, icon: resolvedIcon, is_default: false }, { onConflict: 'id' })
-      .select('id, name, icon, is_default')
-      .single();
-
-    if (error) throw new Error(error.message);
-    return res.status(201).json(data);
+    // Existing one with that name, or a new one with its icon (storeCategory.js).
+    const data = await ensureBusinessType(String(name).trim());
+    if (!data) return res.status(400).json({ error: 'Enter a category name of up to 60 characters' });
+    return res.status(201).json({ ...data, is_default: false });
   } catch (err) {
     console.error('POST /business-types error:', err);
     return res.status(500).json({ error: 'Failed to create business type', details: err.message });
@@ -1519,13 +1507,10 @@ app.post('/business-types/suggest', requireAuth, async (req, res) => {
     if (!label) {
       return res.status(422).json({ error: 'Could not categorize business', details: 'Try selecting a category manually' });
     }
-    const id = label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
-    const { data: createdType, error: upsertError } = await supabase
-      .from('business_types')
-      .upsert({ id, name: label, icon: result.new_type_icon || 'shopping-bag', is_default: false }, { onConflict: 'id' })
-      .select('id, name, icon')
-      .single();
-    if (upsertError) throw new Error(upsertError.message);
+    const createdType = await ensureBusinessType(label);
+    if (!createdType) {
+      return res.status(422).json({ error: 'Could not categorize business', details: 'Try selecting a category manually' });
+    }
 
     return res.json({ business_type: createdType, is_new: true });
   } catch (err) {
@@ -1541,7 +1526,8 @@ app.post('/business-types/suggest', requireAuth, async (req, res) => {
 let storeCategoryBackfillRunning = false;
 let storeCategoryBackfillAt = 0;
 async function backfillStoreCategories(rows) {
-  if (storeCategoryBackfillRunning || anthropicCreditsPaused()) return;
+  // Runs even while AI credits are out: obvious cases are sorted locally.
+  if (storeCategoryBackfillRunning) return;
   if (Date.now() - storeCategoryBackfillAt < 2 * 60 * 1000) return; // at most every 2 minutes
   storeCategoryBackfillAt = Date.now();
   storeCategoryBackfillRunning = true;
@@ -1563,7 +1549,6 @@ async function backfillStoreCategories(rows) {
       candidates = due || [];
     }
     for (const row of candidates) {
-      if (anthropicCreditsPaused()) break;
       const merchants = Array.isArray(row.merchants) ? row.merchants[0] : row.merchants;
       await settleStoreCategory({
         storeId: row.id,
@@ -1577,6 +1562,19 @@ async function backfillStoreCategories(rows) {
   } finally {
     storeCategoryBackfillRunning = false;
   }
+}
+
+// id → name for business types, refreshed every 5 minutes.
+let businessTypeNamesCache = { at: 0, map: new Map() };
+async function businessTypeNamesById() {
+  if (Date.now() - businessTypeNamesCache.at < 5 * 60 * 1000) return businessTypeNamesCache.map;
+  try {
+    const { data } = await supabase.from('business_types').select('id, name');
+    businessTypeNamesCache = { at: Date.now(), map: new Map((data || []).map((t) => [String(t.id), t.name])) };
+  } catch (_) {
+    businessTypeNamesCache.at = Date.now();
+  }
+  return businessTypeNamesCache.map;
 }
 
 const BUSINESS_TYPE_UUID = /^[0-9a-f]{8}-[0-9a-f-]{27}$/i;
@@ -1827,14 +1825,16 @@ app.get('/stores', optionalAuth, async (req, res) => {
     // Flatten merchants.business_type → top-level business_type, preferring the
     // AI-verified category_override (catches a merchant's wrong self-pick) so
     // customers never see a miscategorized store; remove the nested object.
-    const flattenListingStore = ({ merchants, category_override, ...rest }) => ({
-      ...rest,
-      business_type:
+    // Some merchants have a category id saved instead of its name.
+    const typeNameById = await businessTypeNamesById();
+    const flattenListingStore = ({ merchants, category_override, ...rest }) => {
+      const raw =
         inferStrongStoreCategory(rest.store_name, rest.description) ||
         category_override ||
         merchants?.business_type ||
-        null,
-    });
+        null;
+      return { ...rest, business_type: (raw && typeNameById.get(String(raw))) || raw };
+    };
 
     let categories;
     if (String(req.query.include_categories || '') === 'true') {
