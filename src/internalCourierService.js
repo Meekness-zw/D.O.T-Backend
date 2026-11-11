@@ -19,7 +19,9 @@ function fail(message, status = 400) {
 }
 
 function normalizeE164(phone) {
-  const cleaned = String(phone || '').replace(/[\s\-().]/g, '');
+  // "+263 077…": the local 0 typed after the country code is dropped, the way
+  // the app does, so the same number is always saved and looked up the same.
+  const cleaned = String(phone || '').replace(/[\s\-().]/g, '').replace(/^\+2630+/, '+263');
   if (!/^\+[1-9]\d{6,14}$/.test(cleaned)) return null;
   return cleaned;
 }

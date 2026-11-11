@@ -11,22 +11,23 @@ function toPhoneDigits(value) {
 // Digits with the Zimbabwe country code, so a legacy local "07…" row and the
 // "+2637…" number someone types compare equal.
 function canonicalDigits(value) {
-  const digits = toPhoneDigits(value);
+  const digits = toPhoneDigits(value).replace(/^2630+/, '263'); // "+263 077…" saved with the local 0
   return digits.length === 10 && digits.startsWith('0') ? `263${digits.slice(1)}` : digits;
 }
 
 function buildPhoneCandidates(phone) {
-  const normalised = String(phone || '').replace(/[\s\-().]/g, '').replace(/^\+?/, '+');
+  const normalised = String(phone || '').replace(/[\s\-().]/g, '').replace(/^\+?/, '+').replace(/^\+2630+/, '+263');
   const digits = toPhoneDigits(normalised);
   const candidates = new Set([normalised, digits]);
 
-  // Zimbabwe local format fallback for legacy rows like 07xxxxxxxx.
-  if (digits.startsWith('263') && digits.length > 3) {
-    candidates.add(`0${digits.slice(3)}`);
-  }
-  if (digits.startsWith('0') && digits.length > 1) {
-    candidates.add(`+263${digits.slice(1)}`);
-    candidates.add(`263${digits.slice(1)}`);
+  // Every way a Zimbabwe number has been saved: +263…, 263…, the legacy local
+  // 07…, and "+263 077…" with the local 0 kept after the country code.
+  const canonical = canonicalDigits(digits);
+  if (canonical.startsWith('263') && canonical.length > 3) {
+    const national = canonical.slice(3);
+    for (const v of [`+263${national}`, `263${national}`, `0${national}`, `+2630${national}`, `2630${national}`]) {
+      candidates.add(v);
+    }
   }
 
   return { normalised, digits, candidates: Array.from(candidates).filter(Boolean) };
