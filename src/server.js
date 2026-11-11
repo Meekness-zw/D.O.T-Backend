@@ -4979,7 +4979,15 @@ app.patch('/orders/:id', requireAuth, requireApprovedMerchant, async (req, res) 
 
     let orderUpdate = { status };
     if (status === 'preparing') {
-      orderUpdate = { status, courier_match_started_at: new Date().toISOString(), courier_match_expired_at: null };
+      orderUpdate = {
+        status,
+        courier_match_started_at: new Date().toISOString(),
+        courier_match_expired_at: null,
+        // The pickup code exists from acceptance, so the store can be given it
+        // (the DOT team sends it on WhatsApp) before a courier is found. The
+        // courier who takes the job shows this same code at the store.
+        pickup_code: String(crypto.randomInt(0, 100)).padStart(2, '0'),
+      };
     } else if (refundOnCancel) {
       orderUpdate = { status, payment_status: 'refunded' };
     }
@@ -4989,7 +4997,7 @@ app.patch('/orders/:id', requireAuth, requireApprovedMerchant, async (req, res) 
       .update(orderUpdate)
       .eq('id', id)
       .eq('status', order.status)
-      .select('id, order_number, status')
+      .select('id, order_number, status, pickup_code')
       .maybeSingle();
     if (updateError) throw new Error(updateError.message || 'Failed to update order');
     if (!updated) {
@@ -5662,6 +5670,11 @@ app.post('/merchant/orders/:id/confirm-dispatch', requireAuth, requireApprovedMe
       return res.status(403).json({ error: 'Forbidden', details: 'Cannot update this order' });
     }
 
+    // Couriers now confirm pickup themselves; a store pressing hand-over
+    // afterwards is simply told it's done.
+    if (['merchant_confirmed', 'picked_up', 'in_transit', 'delivery_confirmation_pending', 'delivered'].includes(order.status)) {
+      return res.json({ order: { id: order.id, order_number: order.order_number, status: order.status, courier_id: order.courier_id } });
+    }
     if (!['assigned', 'courier_arrived'].includes(order.status)) {
       return res.status(400).json({
         error: 'Cannot confirm dispatch',
@@ -6303,7 +6316,10 @@ app.post('/courier/jobs/:id/accept', requireAuth, requireApprovedCourier, async 
     // or ready), avoids races with other couriers grabbing the same job.
     // The courier shows this at the store; the merchant sees the same code
     // and releases the order only to the courier whose code matches.
-    const pickupCode = String(crypto.randomInt(0, 100)).padStart(2, '0');
+    // Orders accepted since the code moved to acceptance already have one,
+    // which the store may have been sent; keep it. Older orders get one now.
+    const { data: codeRow } = await supabase.from('orders').select('pickup_code').eq('id', id).maybeSingle();
+    const pickupCode = codeRow?.pickup_code || String(crypto.randomInt(0, 100)).padStart(2, '0');
     const { data: updated, error: updateError } = await supabase
       .from('orders')
       .update({ courier_id: req.userId, status: 'assigned', pickup_code: pickupCode })
@@ -6407,8 +6423,7 @@ app.post('/courier/orders/:id/drop', requireAuth, requireApprovedCourier, async 
       .update({
         courier_id: null,
         status: 'ready',
-        // The next courier to accept gets a fresh code.
-        pickup_code: null,
+        // The code stays: the store already has it, and the next courier gets the same one.
         courier_match_started_at: new Date().toISOString(),
         courier_match_expired_at: null,
       })
@@ -6571,10 +6586,12 @@ app.post('/courier/orders/:id/pickup', requireAuth, requireApprovedCourier, asyn
       return res.json({ order: current });
     }
 
-    if (order.status !== 'merchant_confirmed') {
+    // The courier confirms pickup on their phone; the store checks the pickup
+    // code with the courier instead of approving the hand-over in the app.
+    if (!COURIER_PRE_PICKUP_STATUSES.includes(order.status)) {
       return res.status(400).json({
         error: 'Cannot pick up',
-        details: 'Order must be confirmed by the merchant before pickup',
+        details: 'This order is not waiting for pickup.',
       });
     }
 
@@ -6591,6 +6608,8 @@ app.post('/courier/orders/:id/pickup', requireAuth, requireApprovedCourier, asyn
       .from('orders')
       .update(updatePayload)
       .eq('id', id)
+      .eq('courier_id', req.userId)
+      .in('status', COURIER_PRE_PICKUP_STATUSES)
       .select('id, order_number, status, courier_id, estimated_delivery_time')
       .single();
 
