@@ -136,8 +136,11 @@ export async function categorizeStoreWithAI({ storeName, description, businessTy
  *   verification couldn't run (caller should keep the declared type as-is)
  */
 export async function verifyStoreCategory({ storeName, description, declaredType, categoryNames }) {
-  const names = (categoryNames || []).filter(Boolean);
-  if (names.length === 0) return null;
+  const existing = (categoryNames || []).filter(Boolean);
+  if (existing.length === 0) return null;
+  // The check may also place a store in a specialist category that doesn't
+  // exist yet (a sushi place → "Sushi"); the caller creates it with its icon.
+  const names = [...existing, ...missingSpecialties(existing)];
 
   // Resolve strong, unambiguous signals locally before calling the model. This
   // keeps categorisation correct even when the AI provider is unavailable and
@@ -176,7 +179,11 @@ export async function verifyStoreCategory({ storeName, description, declaredType
         'Trust what the store name and description say it actually sells over the merchant-selected category ' +
         'when they clearly conflict (e.g. a store named "City Butchery" selling meat, selected as "Grocery / Retail", ' +
         'should be corrected to "Butchery" if that option exists). ' +
-        'If the merchant-selected category is already reasonable, respond with it unchanged. ' +
+        'Prefer the most specific category that describes what the store mainly sells: a sushi restaurant ' +
+        'belongs in "Sushi", a pizzeria in "Pizza", a cake shop in "Desserts" or "Bakery", rather than a broad ' +
+        'category like "Restaurant / Food" or "Grocery / Retail". Use a broad category only when the store sells ' +
+        'a wide mix or nothing more specific in the list fits. ' +
+        'If the merchant-selected category is already the most specific fit, respond with it unchanged. ' +
         'Respond with ONLY the exact category name from the list, nothing else.',
       messages: [
         {
@@ -203,6 +210,41 @@ export async function verifyStoreCategory({ storeName, description, declaredType
 // backend stores a compact "dot:<key>" reference per business type;
 // Claude matches brand-new merchant-invented categories to the best
 // key once, cached in business_types.icon forever after.
+
+// Specialist categories the automatic check may create on its own, each with
+// its own bundled icon. Merchants can still type any category themselves;
+// automatic placement never invents names outside this list.
+export const SPECIALTY_CATEGORIES = [
+  ['Sushi', 'sushi'], ['Pizza', 'pizza'], ['Chicken', 'chicken'], ['Fast Food', 'fast_food'],
+  ['Asian', 'asian'], ['Mexican', 'mexican'], ['Desserts', 'desserts'], ['Bakery', 'bakery'],
+  ['Snacks', 'snacks'], ['Wine', 'wine'], ['Liquor', 'liquor'], ['Flowers', 'flowers'],
+  ['Beauty', 'beauty'], ['Tobacco', 'tobacco'], ['Butchery', 'butchery'], ['Fruits & Veg', 'fruits_veg'],
+  ['Groceries', 'groceries'], ['Pharmacy', 'pharmacy'], ['Hardware', 'hardware'],
+];
+
+// Words that don't say what kind of store it is ("Restaurant / Food" must not block "Fast Food").
+const GENERIC_WORDS = new Set(['food', 'store', 'shop', 'retail', 'service', 'general', 'restaurant', 'bottle']);
+const categoryWords = (name) =>
+  String(name || '')
+    .toLowerCase()
+    .split(/[^a-z]+/)
+    .filter((w) => w.length > 2)
+    .map((w) => w.replace(/ies$/, 'y').replace(/(es|s)$/, ''))
+    .filter((w) => !GENERIC_WORDS.has(w));
+
+/** Specialties with no existing category of the same kind ("Hardware Store" covers "Hardware"). */
+export function missingSpecialties(existingNames) {
+  const taken = new Set((existingNames || []).flatMap(categoryWords));
+  return SPECIALTY_CATEGORIES.map(([name]) => name).filter(
+    (name) => !categoryWords(name).some((w) => taken.has(w)),
+  );
+}
+
+/** The bundled icon for a specialist category name, or null. */
+export function specialtyIcon(name) {
+  const hit = SPECIALTY_CATEGORIES.find(([n]) => n.toLowerCase() === String(name || '').trim().toLowerCase());
+  return hit ? 'dot:' + hit[1] : null;
+}
 
 export const CATEGORY_ICON_KEYS = [
   'bakery', 'groceries', 'pharmacy', 'fast_food', 'pizza', 'chicken',

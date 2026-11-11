@@ -89,6 +89,7 @@ import {
   saveMerchantPayoutMethod,
   upsertMerchantOnboarding,
 } from './onboardingService.js';
+import { settleStoreCategory } from './storeCategory.js';
 import { detectProviderFromPhone, normalizeZwPhone } from './walletProvider.js';
 import { getSuggestedProductCategoryNames } from './storeCategorySuggestions.js';
 import {
@@ -165,7 +166,6 @@ import {
   pickCategoryImage,
   fallbackCategoryImage,
   isCartoonIcon,
-  verifyStoreCategory,
   inferStrongStoreCategory,
   anthropicCreditsPaused,
 } from './storeCategorizationAI.js';
@@ -1549,20 +1549,14 @@ async function backfillStoreCategories(rows) {
   if (candidates.length === 0) return;
   storeCategoryBackfillRunning = true;
   try {
-    const { data: types } = await supabase.from('business_types').select('name');
-    const categoryNames = (types || []).map((t) => t.name);
     for (const row of candidates) {
       if (anthropicCreditsPaused()) break;
-      const verified = await verifyStoreCategory({
+      await settleStoreCategory({
+        storeId: row.id,
         storeName: row.store_name,
         description: row.description || '',
         declaredType: row.merchants?.business_type || '',
-        categoryNames,
       });
-      if (verified && verified.toLowerCase() !== String(row.category_override || '').toLowerCase()) {
-        await supabase.from('stores').update({ category_override: verified }).eq('id', row.id);
-        console.log(`[CategoryVerify] ${row.store_name} → ${verified}`);
-      }
     }
   } catch (err) {
     console.warn('[CategoryVerify] backfill error:', err?.message);
@@ -2301,19 +2295,15 @@ app.patch('/merchant/profile', requireAuth, async (req, res) => {
           .from('stores')
           .select('id, store_name, description')
           .eq('merchant_id', req.userId);
-        const { data: types } = await supabase.from('business_types').select('name');
-        const categoryNames = (types || []).map((t) => t.name);
         for (const store of stores || []) {
-          const verified = await verifyStoreCategory({
+          const shownAs = await settleStoreCategory({
+            storeId: store.id,
             storeName: store.store_name,
             description: store.description || '',
             declaredType: merchantRow.business_type,
-            categoryNames,
           });
-          await supabase
-            .from('stores')
-            .update({ category_override: verified || null })
-            .eq('id', store.id);
+          // Check unavailable: show the merchant's new pick, not the old result.
+          if (!shownAs) await supabase.from('stores').update({ category_override: null }).eq('id', store.id);
         }
       } catch (err) {
         console.warn('[CategoryVerify] profile update verification skipped:', err?.message);
@@ -2826,7 +2816,7 @@ app.patch('/merchant/stores/:id', requireAuth, async (req, res) => {
     const { id } = req.params;
     const { data: store, error: storeError } = await supabase
       .from('stores')
-      .select('id, merchant_id')
+      .select('id, merchant_id, store_name, description')
       .eq('id', id)
       .maybeSingle();
     if (storeError || !store || store.merchant_id !== req.userId) {
@@ -2893,6 +2883,26 @@ app.patch('/merchant/stores/:id', requireAuth, async (req, res) => {
       .select()
       .single();
     if (updateError) throw new Error(updateError.message || 'Failed to update store');
+
+    // Name or description changed: re-check the category in the background.
+    const nameChanged = update.store_name !== undefined && update.store_name !== store.store_name;
+    const descriptionChanged = update.description !== undefined && (update.description || '') !== (store.description || '');
+    if (nameChanged || descriptionChanged) {
+      supabase
+        .from('merchants')
+        .select('business_type')
+        .eq('id', req.userId)
+        .maybeSingle()
+        .then(({ data: merchant }) =>
+          settleStoreCategory({
+            storeId: id,
+            storeName: updated.store_name,
+            description: updated.description || '',
+            declaredType: merchant?.business_type || '',
+          }),
+        )
+        .catch(() => {});
+    }
     return res.json(updated);
   } catch (error) {
     console.error('patch /merchant/stores/:id error:', error);

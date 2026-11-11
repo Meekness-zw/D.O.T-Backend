@@ -1,7 +1,7 @@
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { ensureCourierAccountProfile } from './courierAccountProfile.js';
 import { getSuggestedProductCategoryNames } from './storeCategorySuggestions.js';
-import { verifyStoreCategory } from './storeCategorizationAI.js';
+import { settleStoreCategory } from './storeCategory.js';
 
 const supabase = supabaseAdmin;
 
@@ -681,21 +681,14 @@ export async function upsertMerchantOnboarding({
   // Double-check the merchant's self-picked business type against what the
   // store's name/description actually say it sells, so a wrong pick never
   // surfaces as a customer-facing category mistake (never blocks onboarding).
-  try {
-    const { data: types } = await supabase.from('business_types').select('name');
-    const categoryNames = (types || []).map((t) => t.name);
-    const verified = await verifyStoreCategory({
-      storeName: String(storeName).trim(),
-      description: description ? String(description).trim() : '',
-      declaredType: resolvedBusinessType,
-      categoryNames,
-    });
-    if (verified) {
-      await supabase.from('stores').update({ category_override: verified }).eq('id', storeId);
-    }
-  } catch (err) {
-    console.warn('[CategoryVerify] onboarding verification skipped:', err?.message);
-  }
+  // A category the merchant typed in becomes a real one with an icon, and a
+  // specialist store (sushi, pizza…) lands in its own category (storeCategory.js).
+  await settleStoreCategory({
+    storeId,
+    storeName,
+    description,
+    declaredType: resolvedBusinessType,
+  });
 
   if (storeLogoBase64) {
     const ext = extForMime(parseDataUrl(storeLogoBase64)?.mime);
