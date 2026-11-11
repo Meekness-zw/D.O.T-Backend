@@ -89,7 +89,7 @@ import {
   saveMerchantPayoutMethod,
   upsertMerchantOnboarding,
 } from './onboardingService.js';
-import { settleStoreCategory } from './storeCategory.js';
+import { settleStoreCategory, CATEGORY_CHECK_VERSION } from './storeCategory.js';
 import { detectProviderFromPhone, normalizeZwPhone } from './walletProvider.js';
 import { getSuggestedProductCategoryNames } from './storeCategorySuggestions.js';
 import {
@@ -1539,23 +1539,37 @@ app.post('/business-types/suggest', requireAuth, async (req, res) => {
 // result is cached in category_override forever once resolved (same pattern
 // as the business_types icon backfill above).
 let storeCategoryBackfillRunning = false;
+let storeCategoryBackfillAt = 0;
 async function backfillStoreCategories(rows) {
   if (storeCategoryBackfillRunning || anthropicCreditsPaused()) return;
-  // Only stores that have never been verified. A saved category_override is
-  // kept, so opening the store list does not call Anthropic again.
-  const candidates = (rows || [])
-    .filter((row) => !String(row.category_override || '').trim())
-    .slice(0, 25);
-  if (candidates.length === 0) return;
+  if (Date.now() - storeCategoryBackfillAt < 2 * 60 * 1000) return; // at most every 2 minutes
+  storeCategoryBackfillAt = Date.now();
   storeCategoryBackfillRunning = true;
   try {
+    // Stores not yet checked under the current rules (CATEGORY_CHECK_VERSION),
+    // including ones checked under older rules that kept everything in
+    // "Restaurant / Food". 25 per run, so a big catalogue is spread out.
+    let candidates;
+    const { data: due, error } = await supabase
+      .from('stores')
+      .select('id, store_name, description, merchants ( business_type )')
+      .or(`category_checked_version.is.null,category_checked_version.lt.${CATEGORY_CHECK_VERSION}`)
+      .eq('is_active', true)
+      .limit(25);
+    if (error) {
+      // Migration not run yet: only stores that were never checked.
+      candidates = (rows || []).filter((row) => !String(row.category_override || '').trim()).slice(0, 25);
+    } else {
+      candidates = due || [];
+    }
     for (const row of candidates) {
       if (anthropicCreditsPaused()) break;
+      const merchants = Array.isArray(row.merchants) ? row.merchants[0] : row.merchants;
       await settleStoreCategory({
         storeId: row.id,
         storeName: row.store_name,
         description: row.description || '',
-        declaredType: row.merchants?.business_type || '',
+        declaredType: merchants?.business_type || '',
       });
     }
   } catch (err) {

@@ -10,6 +10,9 @@
 import { supabaseAdmin as supabase } from './supabaseAdminClient.js';
 import { verifyStoreCategory, pickCategoryImage, specialtyIcon } from './storeCategorizationAI.js';
 
+// Bump when the category rules change, so every store is re-checked once.
+export const CATEGORY_CHECK_VERSION = 2;
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function categorySlug(label) {
@@ -67,6 +70,8 @@ export async function settleStoreCategory({ storeId, storeName, description, dec
     const shownAs = row?.name || chosen;
     if (verified) {
       await supabase.from('stores').update({ category_override: shownAs }).eq('id', storeId);
+      // Separate write: before the migration runs the column doesn't exist.
+      await supabase.from('stores').update({ category_checked_version: CATEGORY_CHECK_VERSION }).eq('id', storeId);
       if (shownAs.toLowerCase() !== declared.toLowerCase()) {
         console.log(`[CategoryVerify] ${storeName}: "${declared}" → "${shownAs}"`);
       }
