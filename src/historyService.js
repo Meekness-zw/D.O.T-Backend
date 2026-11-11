@@ -131,6 +131,7 @@ export async function getOrdersForUser(userId, options = {}) {
         order_items (
           product_id,
           product_name,
+          product_price,
           quantity,
           selected_options
         )
