@@ -4398,7 +4398,36 @@ async function profileForPinRequest(req, res) {
     res.status(403).json({ error: 'Your account has been frozen. Please contact support.' });
     return null;
   }
-  return profile;
+  return withMerchantDefaultPin(profile);
+}
+
+/**
+ * Store owners who never chose a PIN (they had a password, and many forgot
+ * it) get a starting PIN: the last 4 digits of their store's phone number,
+ * or of their own number if the store has none. They can change it from the
+ * dashboard's Profile page. Accounts that already have a PIN keep it, and
+ * customers and couriers are never touched. A new browser still needs the
+ * emailed code first, so knowing a store's number is not enough to sign in.
+ */
+async function withMerchantDefaultPin(profile) {
+  if (profile.pin_hash) return profile;
+  try {
+    const { data: stores } = await supabase
+      .from('stores')
+      .select('phone')
+      .eq('merchant_id', profile.id)
+      .order('created_at', { ascending: true })
+      .limit(1);
+    if (!stores?.length) return profile;
+    const digits = String(stores[0].phone || profile.phone || '').replace(/\D/g, '');
+    if (digits.length < 4) return profile;
+    const pin = digits.slice(-4);
+    await setAccountPin(profile.id, pin);
+    return { ...profile, pin_hash: hashPin(pin), pin_failed_attempts: 0, pin_locked_until: null };
+  } catch (err) {
+    console.error('merchant default PIN error:', err.message);
+    return profile;
+  }
 }
 
 function pinFailure(res, result) {
