@@ -307,7 +307,7 @@ async function findAuthUserByPhone(phone) {
 // The job also becomes claimable in /courier/jobs/open at this same moment (status
 // 'preparing') rather than waiting for 'ready' — couriers can be en route before
 // the order is actually finished being prepared.
-async function notifyAvailableCouriers(orderId, orderNumber, storeName) {
+async function notifyAvailableCouriers(orderId, orderNumber, storeName, { excludeCourierId = null, reopened = false } = {}) {
   if (!supabase) return;
   try {
     // Both fields must agree: legacy/incomplete rows must not receive live jobs.
@@ -331,17 +331,41 @@ async function notifyAvailableCouriers(orderId, orderNumber, storeName) {
     const store = storeName || 'a store';
     const pushMessages = [];
     for (const courier of couriers) {
-      if (busyIds.has(courier.id)) continue;
+      if (busyIds.has(courier.id) || courier.id === excludeCourierId) continue;
       const token = courier.user_profiles?.push_token;
       if (!token || !token.startsWith('ExponentPushToken')) continue;
       if (courier.user_profiles?.push_role !== 'courier') continue;
-      pushMessages.push({ to: token, title: 'Order accepted — head that way', body: `${numLabel} from ${store} was just accepted and is being prepared. Get moving so you're there when it's ready.`, data: { type: 'new_job', orderId, audience: 'courier' }, sound: 'default' });
+      pushMessages.push({
+        to: token,
+        title: reopened ? 'Job available again' : 'Order accepted — head that way',
+        body: reopened
+          ? `${numLabel} from ${store} needs a courier. Tap to take it.`
+          : `${numLabel} from ${store} was just accepted and is being prepared. Get moving so you're there when it's ready.`,
+        data: { type: 'new_job', orderId, audience: 'courier' },
+        sound: 'default',
+        // High priority wakes an Android phone whose screen is off; at normal
+        // priority Android holds the message until the phone wakes, often after
+        // the job is gone. channelId is the app's max-importance channel (App.js).
+        priority: 'high',
+        channelId: 'default',
+        // A job notification is useless once stale.
+        ttl: 15 * 60,
+      });
     }
     if (!pushMessages.length) return;
-    await axios.post('https://exp.host/--/api/v2/push/send', pushMessages, {
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      timeout: 10000,
-    });
+    // Expo takes at most 100 messages per request.
+    for (let i = 0; i < pushMessages.length; i += 100) {
+      const batch = pushMessages.slice(i, i + 100);
+      const { data: result } = await axios.post('https://exp.host/--/api/v2/push/send', batch, {
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        timeout: 10000,
+      });
+      (result?.data || []).forEach((ticket, k) => {
+        if (ticket?.status === 'error') {
+          console.warn('[Push] courier job notification failed:', ticket.details?.error || ticket.message, batch[k]?.to?.slice(0, 30));
+        }
+      });
+    }
   } catch (err) {
     console.warn('[Push] Failed to notify couriers for order', orderId, err?.message);
   }
@@ -6430,7 +6454,7 @@ app.post('/courier/orders/:id/drop', requireAuth, requireApprovedCourier, async 
       .eq('id', id)
       .eq('courier_id', req.userId)
       .in('status', COURIER_PRE_PICKUP_STATUSES)
-      .select('id, order_number, status, courier_id, customer_id')
+      .select('id, order_number, status, courier_id, customer_id, store_id')
       .maybeSingle();
 
     if (updateError) {
@@ -6453,6 +6477,20 @@ app.post('/courier/orders/:id/drop', requireAuth, requireApprovedCourier, async 
     if (historyError) {
       console.error('order_status_history insert (drop) error:', historyError);
     }
+
+    // Back in the open pool: tell the other online couriers.
+    supabase
+      .from('stores')
+      .select('store_name')
+      .eq('id', updated.store_id)
+      .maybeSingle()
+      .then(({ data: storeRow }) =>
+        notifyAvailableCouriers(updated.id, updated.order_number, storeRow?.store_name, {
+          excludeCourierId: req.userId,
+          reopened: true,
+        }),
+      )
+      .catch(() => {});
 
     return res.json({ order: updated });
   } catch (error) {
