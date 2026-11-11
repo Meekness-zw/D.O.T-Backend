@@ -5,6 +5,7 @@
  * Table: migrations/2026-11-12-order-store-whatsapp.sql.
  */
 import { supabaseAdmin as supabase } from './supabaseAdminClient.js';
+import { getPlatformMarkupRate } from './orderPaymentSplit.js';
 
 const ACTIONS = new Set(['sent', 'confirmed', 'reset']);
 
@@ -29,7 +30,7 @@ export function registerStoreWhatsappRoutes(app, requireAuth) {
   app.get('/merchant/orders/whatsapp-status', requireAuth, async (req, res) => {
     try {
       const ids = await ownedOrderIds(req.userId, String(req.query.ids || '').split(','));
-      if (!ids.length) return res.json({ statuses: {} });
+      if (!ids.length) return res.json({ statuses: {}, markupRate: getPlatformMarkupRate() });
       const { data, error } = await supabase
         .from('order_store_confirmations')
         .select('order_id, sent_at, confirmed_at')
@@ -39,7 +40,7 @@ export function registerStoreWhatsappRoutes(app, requireAuth) {
       (data || []).forEach((row) => {
         statuses[row.order_id] = present(row);
       });
-      return res.json({ statuses });
+      return res.json({ statuses, markupRate: getPlatformMarkupRate() });
     } catch (error) {
       console.error('get whatsapp-status error:', error);
       return res.status(500).json({ error: 'Could not load WhatsApp status' });
