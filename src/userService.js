@@ -60,16 +60,29 @@ export async function uploadProfilePhoto(userId, buffer, contentType) {
 }
 
 export async function recordCourierProfilePhotoDocument(userId, photoUrl) {
-  const { error } = await supabaseAdmin
+  // courier_documents has no unique (courier_id, document_type) constraint, so
+  // an upsert on it failed and the courier kept seeing the old photo. Update
+  // every profile-photo row they have (older accounts can have several), and
+  // add one if there is none.
+  const { data: updated, error } = await supabaseAdmin
     .from('courier_documents')
-    .upsert({
-      courier_id: userId,
-      document_type: 'profile_photo',
-      document_url: photoUrl,
-      status: 'approved'
-    }, { onConflict: 'courier_id,document_type' });
-  
+    .update({ document_url: photoUrl, status: 'approved' })
+    .eq('courier_id', userId)
+    .eq('document_type', 'profile_photo')
+    .select('id');
   if (error) throw error;
+  if (updated?.length) return;
+
+  // Only couriers get a document row.
+  const { data: courier } = await supabaseAdmin.from('couriers').select('id').eq('id', userId).maybeSingle();
+  if (!courier) return;
+  const { error: insertError } = await supabaseAdmin.from('courier_documents').insert({
+    courier_id: userId,
+    document_type: 'profile_photo',
+    document_url: photoUrl,
+    status: 'approved',
+  });
+  if (insertError) throw insertError;
 }
 
 /**
