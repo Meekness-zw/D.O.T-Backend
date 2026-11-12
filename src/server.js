@@ -4360,8 +4360,8 @@ app.post('/auth/login-password', loginLimiter, async (req, res) => {
 });
 
 // ── PIN sign-in ─────────────────────────────────────────────────────────────
-// See src/pinAuth.js. A trusted device signs in with phone + PIN; any other
-// device needs an emailed code first. Face ID / fingerprint uses a separate
+// See src/pinAuth.js. Phone + PIN signs in on any device (no emailed code at
+// sign-in; sign-up and PIN reset still use one). Face ID / fingerprint uses a separate
 // biometric token held behind the phone's own check.
 
 const pinStatusLimiter = authRateLimiter({
@@ -4381,27 +4381,6 @@ const pinLoginLimiter = authRateLimiter({
 function pinSignInResponse(profile, extra = {}) {
   const data = sessionForProfile(profile);
   return { success: true, user: data.user, session: data.session, ...extra };
-}
-
-/**
- * App store review accounts (Google Play, Apple). Reviewers can't read the
- * account's email, so the emailed new-device code would block them. Phone
- * numbers listed in STORE_REVIEW_PHONES (comma-separated, any format) sign in
- * with phone + PIN alone; the PIN check and its lockout still apply. Every
- * other account is unchanged. Keep this list to dedicated test accounts.
- */
-function storeReviewPhoneSet() {
-  return new Set(
-    String(process.env.STORE_REVIEW_PHONES || '')
-      .split(',')
-      .map((p) => normalizeE164(p.trim()))
-      .filter(Boolean),
-  );
-}
-
-function isStoreReviewAccount(profile) {
-  const phone = normalizeE164(profile?.phone || '');
-  return !!phone && storeReviewPhoneSet().has(phone);
 }
 
 async function profileForPinRequest(req, res) {
@@ -4427,8 +4406,9 @@ async function profileForPinRequest(req, res) {
  * it) get a starting PIN: the last 4 digits of their store's phone number,
  * or of their own number if the store has none. They can change it from the
  * dashboard's Profile page. Accounts that already have a PIN keep it, and
- * customers and couriers are never touched. A new browser still needs the
- * emailed code first, so knowing a store's number is not enough to sign in.
+ * customers and couriers are never touched. Sign-in needs no emailed code, so
+ * until the owner changes it, anyone who knows the store's number can work out
+ * this PIN: owners should change it under Profile.
  */
 async function withMerchantDefaultPin(profile) {
   if (profile.pin_hash) return profile;
@@ -4491,27 +4471,22 @@ app.post('/auth/pin/status', pinStatusLimiter, async (req, res) => {
   }
 });
 
-// POST /auth/pin/login { phone, pin, deviceToken } — sign in on a trusted device.
+// POST /auth/pin/login { phone, pin, deviceToken } — phone + PIN signs in on
+// any phone or browser; there is no emailed new-device code at sign-in. The PIN
+// lockout (PIN_MAX_ATTEMPTS wrong tries) and the rate limit still apply.
+// Sign-up and "Forgot PIN" still use an emailed code.
 app.post('/auth/pin/login', pinLoginLimiter, async (req, res) => {
   try {
     const profile = await profileForPinRequest(req, res);
     if (!profile) return;
     if (!profile.pin_hash) return res.status(409).json(PIN_NOT_SET);
-    // Say so before asking a new phone for an emailed code it can't use yet.
     if (isPinLocked(profile)) return pinFailure(res, { locked: true });
-    const trustedUserId = await userForDeviceToken(req.body?.deviceToken, 'device');
-    const reviewAccount = isStoreReviewAccount(profile);
-    if (trustedUserId !== profile.id && !reviewAccount) {
-      return res.status(401).json({
-        code: 'NEW_DEVICE',
-        error: 'Confirm it’s you',
-        details: 'This is a new phone or browser for your account, so we’ll email you a code.',
-      });
-    }
     const result = await checkAccountPin(profile, req.body?.pin);
     if (!result.ok) return pinFailure(res, result);
-    if (reviewAccount && trustedUserId !== profile.id) {
-      // Trust this device like a normal emailed-code sign-in would.
+    const trustedUserId = await userForDeviceToken(req.body?.deviceToken, 'device');
+    if (trustedUserId !== profile.id) {
+      // First sign-in on this device: give it a device token, which Face ID /
+      // fingerprint sign-in and the app's trusted-device settings rely on.
       const deviceToken = await issueDeviceToken(profile.id, 'device');
       return res.json(pinSignInResponse(profile, { deviceToken }));
     }
