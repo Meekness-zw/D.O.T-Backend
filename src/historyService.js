@@ -6,7 +6,7 @@
 import { supabaseAdmin } from './supabaseAdminClient.js';
 import { getProfile, getRoles } from './userService.js';
 import { getWalletBalances } from './walletLedger.js';
-import { computeSubtotalSplit } from './orderPaymentSplit.js';
+import { computeSubtotalSplit, getPlatformMarkupRate } from './orderPaymentSplit.js';
 import { attachLateCancel } from './lateCancel.js';
 
 const supabase = supabaseAdmin;
@@ -175,6 +175,14 @@ export async function getOrdersForUser(userId, options = {}) {
   if (error) throw new Error(error.message || 'Failed to fetch orders');
   // So the customer app knows when a late order becomes cancellable.
   if (effectiveRole === 'customer') await attachLateCancel(supabase, data || []);
+  // Stores see their own money: items at their own prices (DOT's markup off,
+  // no delivery fee), and what they earn from the order.
+  if (effectiveRole === 'merchant') {
+    (data || []).forEach((o) => {
+      o.store_amount = storePriceTotal(o.subtotal);
+      o.merchant_earnings = computeSubtotalSplit(o.subtotal).merchantEarnings;
+    });
+  }
   return { orders: data || [], role: effectiveRole };
 }
 
@@ -378,26 +386,45 @@ export async function getFullUserMe(userId) {
 const TERMINAL_ORDER_STATUSES = new Set(['delivered', 'cancelled', 'refunded']);
 
 /** Sum total_amount across all orders for stores (paginated; accurate for KPIs). */
-async function sumOrderTotalsForStores(storeIds) {
-  if (!storeIds.length || !supabase) return 0;
-  let total = 0;
+/** Orders that count towards a store's earnings: paid, and not cancelled or refunded. */
+const NOT_EARNED_STATUSES = new Set(['cancelled', 'refunded']);
+function orderEarns(o) {
+  return o?.payment_status === 'paid' && !NOT_EARNED_STATUSES.has(String(o?.status || '').toLowerCase());
+}
+
+/** The order's items at the store's own prices: the customer subtotal without DOT's markup. */
+function storePriceTotal(subtotal) {
+  return money((Number(subtotal) || 0) / (1 + getPlatformMarkupRate()));
+}
+
+/**
+ * What the stores earned: paid, not-cancelled orders, at the store's own
+ * prices less any commission. Never the customer's total (that includes the
+ * delivery fee and DOT's markup).
+ */
+async function sumStoreEarnings(storeIds) {
+  if (!storeIds.length || !supabase) return { earnings: 0, earningOrders: 0 };
+  let earnings = 0;
+  let earningOrders = 0;
   let from = 0;
   const pageSize = 2000;
   for (;;) {
     const { data, error } = await supabase
       .from('orders')
-      .select('total_amount')
+      .select('subtotal, payment_status, status')
       .in('store_id', storeIds)
       .range(from, from + pageSize - 1);
-    if (error) throw new Error(error.message || 'Failed to sum order totals');
+    if (error) throw new Error(error.message || 'Failed to sum store earnings');
     const rows = data || [];
     for (const row of rows) {
-      total += Number(row.total_amount) || 0;
+      if (!orderEarns(row)) continue;
+      earnings += computeSubtotalSplit(row.subtotal).merchantEarnings;
+      earningOrders += 1;
     }
     if (rows.length < pageSize) break;
     from += pageSize;
   }
-  return total;
+  return { earnings: money(earnings), earningOrders };
 }
 
 /** Count non-terminal orders for stores (paginated). */
@@ -452,16 +479,18 @@ export async function getMerchantDashboardStats(userId) {
     };
   }
 
-  const [{ count: orderCountExact, error: countError }, totalSales, openOrders] = await Promise.all([
+  const [{ count: orderCountExact, error: countError }, { earnings: totalSales, earningOrders }, openOrders] = await Promise.all([
     supabase.from('orders').select('id', { count: 'exact', head: true }).in('store_id', storeIds),
-    sumOrderTotalsForStores(storeIds),
+    sumStoreEarnings(storeIds),
     countOpenOrdersForStores(storeIds),
   ]);
 
   if (countError) throw new Error(countError.message || 'Failed to count orders for dashboard');
 
   const totalOrders = typeof orderCountExact === 'number' ? orderCountExact : 0;
-  const avgOrderValue = totalOrders > 0 ? totalSales / totalOrders : 0;
+  // totalSales is the store's earnings (see sumStoreEarnings); the average is
+  // per paid order, so unpaid and cancelled orders don't drag it down.
+  const avgOrderValue = earningOrders > 0 ? money(totalSales / earningOrders) : 0;
 
   // Recent orders for charts & best sellers (no 90-day cutoff — that hid real totals vs order queue).
   const { data: orders, error: ordersError } = await supabase
@@ -494,7 +523,7 @@ export async function getMerchantDashboardStats(userId) {
   let netEarnings = 0;
   let platformFees = 0;
   orderList.forEach((o) => {
-    if (o.payment_status !== 'paid') return;
+    if (!orderEarns(o)) return;
     const { merchantEarnings, platformCommission } = computeSubtotalSplit(o.subtotal);
     netEarnings += merchantEarnings;
     platformFees += platformCommission;
@@ -614,15 +643,14 @@ function buildRevenueByDay(orders) {
   }
   orders.forEach((o) => {
     const created = (o.created_at || '').toString().slice(0, 10);
-    const amount = Number(o.total_amount) || 0;
     const row = days.find((d) => d.date === created);
     if (!row) return;
-    row.revenue += amount;
-    // Net income only exists for orders that were actually paid — an unpaid
-    // order was never credited to the merchant's wallet in the first place.
-    // Uses the real split (15% markup reversed, then the 5% platform
-    // commission taken), not a flat guess.
-    if (o.payment_status === 'paid') {
+    if (NOT_EARNED_STATUSES.has(String(o.status || '').toLowerCase())) return;
+    // Revenue: the day's orders at the store's own prices (no markup, no
+    // delivery fee). Net income: what was actually paid into the wallet,
+    // after any commission.
+    row.revenue += storePriceTotal(o.subtotal);
+    if (orderEarns(o)) {
       row.netIncome += computeSubtotalSplit(o.subtotal).merchantEarnings;
     }
   });
