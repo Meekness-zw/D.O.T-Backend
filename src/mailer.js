@@ -13,6 +13,7 @@
  * that owns the account, so test with that one first.
  */
 import axios from 'axios';
+import { codeEmailHtml } from './emailTemplate.js';
 
 const PROVIDERS = {
   resend: {
@@ -89,27 +90,15 @@ export function signInCodeEmail({ code, username, minutes }) {
     'Change it as soon as you can and tell the other admins.',
   ].join('\n');
 
-  const html = `
-<div style="font-family:'Outfit',system-ui,-apple-system,'Segoe UI',sans-serif;background:#0D0D0D;padding:32px 16px;">
-  <div style="max-width:440px;margin:0 auto;background:#14181F;border:1px solid rgba(255,255,255,0.09);border-radius:16px;padding:32px;">
-    <div style="font-size:12px;font-weight:800;letter-spacing:0.14em;text-transform:uppercase;color:#38B676;margin-bottom:22px;">
-      Delivery On Time — Admin
-    </div>
-    <div style="font-size:15px;color:rgba(233,238,246,0.66);margin-bottom:20px;">
-      Signing in as <strong style="color:#E9EEF6;">${escapeHtml(username)}</strong>. Enter this code to finish:
-    </div>
-    <div style="font-size:38px;font-weight:800;letter-spacing:9px;color:#F5A623;text-align:center;
-                background:rgba(245,166,35,0.09);border:1px dashed rgba(245,166,35,0.42);
-                border-radius:12px;padding:18px 10px;margin-bottom:20px;">
-      ${escapeHtml(code)}
-    </div>
-    <div style="font-size:13px;color:rgba(233,238,246,0.45);line-height:1.7;">
-      Expires in ${minutes} minutes, and works once.<br />
-      If this wasn't you, someone knows that account's password — change it now
-      and tell the other admins.
-    </div>
-  </div>
-</div>`.trim();
+  const html = codeEmailHtml({
+    heading: 'Admin sign-in',
+    lead: `Signing in as ${username}.`,
+    action: 'Enter this code to finish signing in.',
+    code,
+    expiry: `Expires in ${minutes} minutes, and works once.`,
+    note: "If this wasn't you, someone knows that account's password. Change it now and tell the other admins.",
+    tagline: 'DELIVERY ON TIME · ADMIN',
+  });
 
   return { subject, text, html };
 }

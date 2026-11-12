@@ -1,4 +1,5 @@
 import { Resend } from 'resend';
+import { codeEmailHtml, SUPPORT_EMAIL } from './emailTemplate.js';
 
 let cachedClient = null;
 function getClient() {
@@ -8,99 +9,68 @@ function getClient() {
   return cachedClient;
 }
 
-const BRAND_GREEN = '#4F7942';
-const BRAND_GOLD = '#F5A623';
-const SUPPORT_EMAIL = 'support@deliveryontime.co.zw';
-
 const EMAIL_COPY = {
   signup: {
     subject: 'Your Delivery On Time verification code',
-    intro: 'Use this code to finish creating your Delivery On Time account. It expires in 10 minutes.',
+    heading: 'Verify your account',
+    lead: 'Welcome to Delivery On Time! Here is the code to finish creating your account.',
+    action: 'Enter this code in the app to finish signing up.',
     ignore: "If you didn't try to create an account, you can ignore this email.",
   },
   reset: {
     subject: 'Reset your Delivery On Time password',
-    intro: 'Use this code to choose a new Delivery On Time password. It expires in 10 minutes.',
-    ignore: "If you didn't ask to reset your password, you can ignore this email. Your password will stay the same.",
+    heading: 'Reset your password',
+    lead: 'We received a request to reset your password.',
+    action: 'Enter this code to choose a new password.',
+    ignore: "If you didn't ask to reset your password, no worries: ignore this email and your password stays the same.",
   },
   'new-device': {
     subject: 'Your Delivery On Time sign-in code',
-    intro: 'Use this code to sign in to Delivery On Time on a new phone or browser. It expires in 10 minutes.',
+    heading: 'Confirm it’s you',
+    lead: 'Someone is signing in to your account on a new phone or browser.',
+    action: 'Enter this code to finish signing in.',
     ignore: "If you didn't try to sign in, don't share this code with anyone. Your account stays safe without it.",
   },
   'pin-reset': {
     subject: 'Set your Delivery On Time PIN',
-    intro: 'Use this code to set a new 4-digit PIN for Delivery On Time. It expires in 10 minutes.',
-    ignore: "If you didn't ask for this, don't share this code with anyone. Your PIN will stay the same.",
+    heading: 'Reset your PIN',
+    lead: 'We received a request to set a new 4-digit PIN for your account.',
+    action: 'Enter this code to choose your new PIN.',
+    ignore: "If you didn't ask for this, don't share this code with anyone. Your PIN stays the same.",
   },
 };
+
+const EXPIRY = 'Expires in 10 minutes.';
 
 function emailCopy(purpose) {
   return EMAIL_COPY[purpose] || EMAIL_COPY.signup;
 }
 
-/** Branded Delivery On Time message. Not a provider's default template. */
 function otpEmailHtml({ code, name, purpose, account }) {
   const copy = emailCopy(purpose);
-  const greeting = name ? `Hi ${escapeHtml(name)},` : 'Hi,';
-  const accountLine = account
-    ? `<p style="margin:0 0 16px;color:#171B17;font-size:14px;font-weight:700;">For: ${escapeHtml(account)}</p>`
-    : '';
-  return `<!DOCTYPE html>
-<html>
-  <body style="margin:0;padding:0;background-color:#F5F1E8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:32px 16px;">
-      <tr>
-        <td align="center">
-          <table role="presentation" width="100%" style="max-width:440px;background-color:#FFFFFF;border-radius:16px;overflow:hidden;">
-            <tr>
-              <td style="background-color:${BRAND_GREEN};padding:28px 32px;text-align:center;">
-                <span style="color:#F5F1E8;font-size:22px;font-weight:800;letter-spacing:1px;">D.O.T</span>
-                <div style="color:${BRAND_GOLD};font-size:11px;font-weight:800;letter-spacing:2.5px;margin-top:4px;">DELIVERY ON TIME</div>
-              </td>
-            </tr>
-            <tr>
-              <td style="padding:32px;">
-                <p style="margin:0 0 8px;color:#171B17;font-size:16px;">${greeting}</p>
-                ${accountLine}
-                <p style="margin:0 0 24px;color:#4B5563;font-size:14px;line-height:1.5;">
-                  ${copy.intro}
-                </p>
-                <div style="background-color:#F0FDF4;border:1px solid rgba(79,121,66,0.24);border-radius:12px;padding:20px;text-align:center;margin-bottom:24px;">
-                  <div style="color:#6B7280;font-size:11px;font-weight:700;letter-spacing:1.5px;margin-bottom:8px;">YOUR CODE</div>
-                  <span style="font-size:32px;font-weight:700;letter-spacing:8px;color:${BRAND_GREEN};">${escapeHtml(code)}</span>
-                </div>
-                <p style="margin:0;color:#6B7280;font-size:13px;line-height:1.5;">
-                  ${copy.ignore}
-                </p>
-              </td>
-            </tr>
-            <tr>
-              <td style="padding:16px 32px 24px;border-top:1px solid #E8E4DA;text-align:center;">
-                <p style="margin:0;color:#9CA3AF;font-size:12px;line-height:1.5;">
-                  Delivery On Time<br>
-                  Questions? Email <a href="mailto:${SUPPORT_EMAIL}" style="color:${BRAND_GREEN};text-decoration:none;">${SUPPORT_EMAIL}</a>
-                </p>
-              </td>
-            </tr>
-          </table>
-        </td>
-      </tr>
-    </table>
-  </body>
-</html>`;
+  return codeEmailHtml({
+    heading: copy.heading,
+    lead: copy.lead,
+    action: copy.action,
+    code,
+    expiry: EXPIRY,
+    note: copy.ignore,
+    name,
+    account,
+  });
 }
 
 function otpEmailText({ code, name, purpose, account }) {
   const copy = emailCopy(purpose);
-  const greeting = name ? `Hi ${name},` : 'Hi,';
   return [
-    greeting,
+    name ? `Hi ${name},` : 'Hi,',
     ...(account ? ['', `For: ${account}`] : []),
     '',
-    copy.intro,
+    copy.lead,
     '',
+    `${copy.action}`,
     `Your code: ${code}`,
+    EXPIRY,
     '',
     copy.ignore,
     '',
@@ -115,11 +85,6 @@ function dotFromAddress(from) {
   return `Delivery On Time <${raw}>`;
 }
 
-function escapeHtml(value) {
-  return String(value ?? '').replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[c]));
-}
 
 /**
  * Sends a verification-code email via Resend using a custom branded
