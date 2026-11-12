@@ -5463,6 +5463,21 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
         (await resolveCourierProfilePhotoUrl(order.courier_id)) || cp?.profile_photo || null;
     }
 
+    // The courier carrying this order can call the customer, but only while the
+    // delivery is under way: once it's delivered or cancelled the number goes.
+    let customer_full_name = null;
+    let customer_phone = null;
+    const deliveryUnderWay = !['delivered', 'cancelled', 'completed', 'refunded'].includes(order.status);
+    if (isCourier && order.customer_id) {
+      const { data: customerProfile } = await supabase
+        .from('user_profiles')
+        .select('full_name, phone')
+        .eq('id', order.customer_id)
+        .maybeSingle();
+      customer_full_name = customerProfile?.full_name || null;
+      if (deliveryUnderWay) customer_phone = customerProfile?.phone || null;
+    }
+
     let requires_id_check = false;
     try {
       requires_id_check = await orderRequiresIdCheck(supabase, order.id);
@@ -5498,6 +5513,8 @@ app.get('/orders/:id', requireAuth, async (req, res) => {
         courier_vehicle_description,
         courier_phone,
         courier_profile_photo_url,
+        customer_full_name,
+        customer_phone,
         requires_id_check,
       },
     });
