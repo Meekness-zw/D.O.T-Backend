@@ -40,9 +40,12 @@ function emailCopy(purpose) {
 }
 
 /** Branded Delivery On Time message. Not a provider's default template. */
-function otpEmailHtml({ code, name, purpose }) {
+function otpEmailHtml({ code, name, purpose, account }) {
   const copy = emailCopy(purpose);
   const greeting = name ? `Hi ${escapeHtml(name)},` : 'Hi,';
+  const accountLine = account
+    ? `<p style="margin:0 0 16px;color:#171B17;font-size:14px;font-weight:700;">For: ${escapeHtml(account)}</p>`
+    : '';
   return `<!DOCTYPE html>
 <html>
   <body style="margin:0;padding:0;background-color:#F5F1E8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
@@ -59,6 +62,7 @@ function otpEmailHtml({ code, name, purpose }) {
             <tr>
               <td style="padding:32px;">
                 <p style="margin:0 0 8px;color:#171B17;font-size:16px;">${greeting}</p>
+                ${accountLine}
                 <p style="margin:0 0 24px;color:#4B5563;font-size:14px;line-height:1.5;">
                   ${copy.intro}
                 </p>
@@ -87,11 +91,12 @@ function otpEmailHtml({ code, name, purpose }) {
 </html>`;
 }
 
-function otpEmailText({ code, name, purpose }) {
+function otpEmailText({ code, name, purpose, account }) {
   const copy = emailCopy(purpose);
   const greeting = name ? `Hi ${name},` : 'Hi,';
   return [
     greeting,
+    ...(account ? ['', `For: ${account}`] : []),
     '',
     copy.intro,
     '',
@@ -118,11 +123,13 @@ function escapeHtml(value) {
 
 /**
  * Sends a verification-code email via Resend using a custom branded
- * template. Throws on any failure — callers are expected to catch, since a
+ * template. `account` (optional) names the account the code is for, e.g.
+ * "Yummy Sushi · +263771234567": many stores' codes go to the one DOT
+ * inbox, and this says which store each one belongs to. Throws on any failure — callers are expected to catch, since a
  * silently-swallowed failure would leave a user waiting on a code that never
  * arrives.
  */
-export async function sendOtpEmail({ to, code, name, purpose = 'signup' }) {
+export async function sendOtpEmail({ to, code, name, purpose = 'signup', account = '' }) {
   const client = getClient();
   const from = dotFromAddress(process.env.RESEND_FROM_EMAIL);
   if (!client || !from) {
@@ -132,9 +139,9 @@ export async function sendOtpEmail({ to, code, name, purpose = 'signup' }) {
   const { error } = await client.emails.send({
     from,
     to,
-    subject: copy.subject,
-    html: otpEmailHtml({ code, name, purpose }),
-    text: otpEmailText({ code, name, purpose }),
+    subject: account ? `${copy.subject} (${account})` : copy.subject,
+    html: otpEmailHtml({ code, name, purpose, account }),
+    text: otpEmailText({ code, name, purpose, account }),
   });
   if (error) {
     throw new Error(error.message || 'Failed to send verification email');

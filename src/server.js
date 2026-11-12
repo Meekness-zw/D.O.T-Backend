@@ -4536,7 +4536,16 @@ app.post('/auth/pin/send-code', otpRequestLimiter, async (req, res) => {
     }
     const code = createEmailCode(profile.id, purpose);
     try {
-      await sendOtpEmail({ to: profile.email, code, name: profile.full_name || '', purpose });
+      // Say which store the code is for: many stores' codes go to the DOT inbox.
+      const { data: ownStores } = await supabase
+        .from('stores')
+        .select('store_name')
+        .eq('merchant_id', profile.id)
+        .order('created_at', { ascending: true })
+        .limit(1);
+      const storeName = ownStores?.[0]?.store_name;
+      const account = storeName ? `${storeName} · ${profile.phone || ''}`.trim() : '';
+      await sendOtpEmail({ to: profile.email, code, name: profile.full_name || '', purpose, account });
     } catch (emailErr) {
       console.error('pin/send-code email error:', emailErr.message);
       return res.status(502).json({ error: 'Failed to send the code', details: 'Please try again shortly.' });
