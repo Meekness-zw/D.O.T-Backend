@@ -327,8 +327,21 @@ async function notifyAvailableCouriers(orderId, orderNumber, storeName, { exclud
       .not('courier_id', 'is', null);
     const busyIds = new Set((busyRows || []).map((r) => r.courier_id));
 
-    const numLabel = orderNumber ? `#${orderNumber}` : 'An order';
-    const store = storeName || 'a store';
+    // Short and scannable on a lock screen: where to collect, and what it pays.
+    //   New delivery job
+    //   Yummy Sushi · You earn $2.80
+    //   Tap to view and accept.
+    const store = storeName || 'A store near you';
+    let earnLabel = '';
+    try {
+      const { data: feeRow } = await supabase.from('orders').select('delivery_fee').eq('id', orderId).maybeSingle();
+      const payout = computeCourierDeliveryPayoutUsd(Number(feeRow?.delivery_fee) || 0);
+      if (payout > 0) earnLabel = ` · You earn $${payout.toFixed(2)}`;
+    } catch {
+      /* the alert still goes out without the amount */
+    }
+    const title = reopened ? 'Job available again' : 'New delivery job';
+    const body = `${store}${earnLabel}\nTap to view and accept.`;
     const pushMessages = [];
     for (const courier of couriers) {
       if (busyIds.has(courier.id) || courier.id === excludeCourierId) continue;
@@ -337,11 +350,9 @@ async function notifyAvailableCouriers(orderId, orderNumber, storeName, { exclud
       if (courier.user_profiles?.push_role !== 'courier') continue;
       pushMessages.push({
         to: token,
-        title: reopened ? 'Job available again' : 'Order accepted — head that way',
-        body: reopened
-          ? `${numLabel} from ${store} needs a courier. Tap to take it.`
-          : `${numLabel} from ${store} was just accepted and is being prepared. Get moving so you're there when it's ready.`,
-        data: { type: 'new_job', orderId, audience: 'courier' },
+        title,
+        body,
+        data: { type: 'new_job', orderId, orderNumber, storeName, audience: 'courier' },
         sound: 'default',
         // High priority wakes an Android phone whose screen is off; at normal
         // priority Android holds the message until the phone wakes, often after
