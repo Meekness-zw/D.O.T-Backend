@@ -91,6 +91,7 @@ import {
 } from './onboardingService.js';
 import { zimbabweNumberProblem } from './internalCourierService.js';
 import { registerStoreWhatsappRoutes } from './storeWhatsapp.js';
+import { registerAdminDeleteRoutes } from './adminDelete.js';
 import { settleStoreCategory, ensureBusinessType, CATEGORY_CHECK_VERSION } from './storeCategory.js';
 import { detectProviderFromPhone, normalizeZwPhone } from './walletProvider.js';
 import { getSuggestedProductCategoryNames } from './storeCategorySuggestions.js';
@@ -10578,18 +10579,9 @@ app.get('/admin/users', requireAdmin, async (req, res) => {
   }
 });
 
-// DELETE /admin/users/:id — permanently delete a user (auth + profile)
-app.delete('/admin/users/:id', requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!id) return res.status(400).json({ error: 'User ID required' });
-    await deleteUserById(id);
-    return res.json({ success: true, message: 'User deleted' });
-  } catch (error) {
-    console.error('admin delete user error:', error);
-    return res.status(500).json({ error: 'Failed to delete user', details: error.message || 'Try again later' });
-  }
-});
+// DELETE /admin/users/:id, DELETE /admin/stores/:id and GET /admin/delete-preview:
+// permanent deletes with everything linked, orders included (src/adminDelete.js).
+registerAdminDeleteRoutes(app, requireAdmin);
 
 // PATCH /admin/users/:id/suspend — suspend or unsuspend a user
 /**
