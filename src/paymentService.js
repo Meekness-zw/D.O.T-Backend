@@ -679,7 +679,7 @@ async function refundLatePaymentForCancelledOrder(order, payment) {
     await insertUserNotification(supabase, {
       userId: order.customer_id,
       title: 'Payment refunded',
-      message: `Your payment for cancelled order #${order.order_number} has been refunded to your wallet.`,
+      message: ['Your payment for cancelled order #{number} has been refunded to your wallet.', { number: order.order_number }],
       type: 'payment',
       referenceId: order.id,
       audience: 'customer',
@@ -780,12 +780,12 @@ export async function finalizeOrderPaymentFromPesepay({ payment, paymentStatus, 
     // in one call — a second raw push here used to fire right after it for
     // the same event, so merchants got two banners for one payment. Removed.
     if (store?.merchant_id) {
-      const numLabel = order.order_number ? `#${order.order_number}` : 'New order';
+      const numLabel = order.order_number ? `#${order.order_number}` : ['New order'];
       try {
         await insertUserNotification(supabase, {
           userId: store.merchant_id,
           title: 'Payment confirmed — start preparing',
-          message: `${numLabel} payment received ($${Number(order.total_amount || 0).toFixed(2)}). The order is waiting for your confirmation.`,
+          message: ['{order} payment received (${amount}). The order is waiting for your confirmation.', { order: numLabel, amount: Number(order.total_amount || 0).toFixed(2) }],
           type: 'order',
           referenceId: updatedOrder.id,
           audience: 'merchant',

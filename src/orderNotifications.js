@@ -11,11 +11,13 @@
  */
 
 import axios from 'axios';
+import { getUserLanguage, render } from './i18n.js';
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
 
 /** Fire an Expo push to one user's registered device (best-effort). */
 async function sendPushToUser(supabase, userId, { title, message, type, referenceId, data }) {
+  // title and message arrive already in the user's language (insertUserNotification).
   try {
     const { data: profile } = await supabase
       .from('user_profiles')
@@ -60,6 +62,10 @@ export async function insertUserNotification(
 ) {
   if (!supabase || !userId || !title || !message) return;
 
+  // title / message: a string or [template, params]; written in the user's app language.
+  const lang = await getUserLanguage(supabase, userId);
+  title = render(lang, title);
+  message = render(lang, message);
   const mergedData = { ...(data || {}), audience };
 
   const { error } = await supabase.from('notifications').insert({
@@ -93,16 +99,19 @@ export async function notifyCustomerMerchantOrderStatus(supabase, {
   refunded = false,
 }) {
   if (!customerId || !status) return;
-  const numLabel = orderNumber ? `#${orderNumber}` : 'your order';
-
-  const cancelledParts = [`${numLabel} was cancelled by the store.`];
-  if (reason) cancelledParts.push(`Reason: ${reason}.`);
-  if (refunded) cancelledParts.push('The amount you paid has been refunded to your wallet.');
+  const numLabel = orderNumber ? `#${orderNumber}` : ['your order'];
+  const cancelled = reason
+    ? (refunded
+      ? ['{order} was cancelled by the store. Reason: {reason}. The amount you paid has been refunded to your wallet.', { order: numLabel, reason: [reason] }]
+      : ['{order} was cancelled by the store. Reason: {reason}.', { order: numLabel, reason: [reason] }])
+    : (refunded
+      ? ['{order} was cancelled by the store. The amount you paid has been refunded to your wallet.', { order: numLabel }]
+      : ['{order} was cancelled by the store.', { order: numLabel }]);
 
   const map = {
     cancelled: {
       title: 'Order cancelled',
-      message: cancelledParts.join(' '),
+      message: cancelled,
     },
   };
 
@@ -139,14 +148,14 @@ export async function notifyCustomerOrderPlaced(supabase, {
   totalAmount = null,
 }) {
   if (!customerId) return;
-  const store = storeName || 'The store';
-  const numLabel = orderNumber ? `#${orderNumber}` : 'your order';
+  const store = storeName || ['The store'];
+  const numLabel = orderNumber ? `#${orderNumber}` : ['your order'];
 
   if (awaitingPayment) {
     await insertUserNotification(supabase, {
       userId: customerId,
       title: 'Complete payment',
-      message: `Finish paying for ${numLabel} at ${store} to send it to the kitchen.`,
+      message: ['Finish paying for {order} at {store} to send it to the kitchen.', { order: numLabel, store }],
       type: 'payment',
       referenceId: orderId,
       audience: 'customer',
@@ -174,13 +183,13 @@ export async function notifyCustomerOrderSelfCancelled(supabase, {
   refunded = false,
 }) {
   if (!customerId) return;
-  const numLabel = orderNumber ? `#${orderNumber}` : 'Your order';
+  const numLabel = orderNumber ? `#${orderNumber}` : ['Your order'];
   await insertUserNotification(supabase, {
     userId: customerId,
     title: 'Order cancelled',
     message: refunded
-      ? `${numLabel} was cancelled and the amount you paid has been refunded to your wallet.`
-      : `${numLabel} was cancelled.`,
+      ? ['{order} was cancelled and the amount you paid has been refunded to your wallet.', { order: numLabel }]
+      : ['{order} was cancelled.', { order: numLabel }],
     type: 'order',
     referenceId: orderId,
     audience: 'customer',
@@ -200,8 +209,8 @@ export async function notifyMerchantStockLevel(supabase, {
     userId: merchantId,
     title: outOfStock ? 'Out of stock — item disabled' : 'Low stock warning',
     message: outOfStock
-      ? `"${productName}" is out of stock and has been automatically marked unavailable.`
-      : `"${productName}" is running low — ${stockQuantity} left in stock.`,
+      ? ['"{product}" is out of stock and has been automatically marked unavailable.', { product: productName }]
+      : ['"{product}" is running low — {count} left in stock.', { product: productName, count: stockQuantity }],
     type: 'system',
     referenceId: productId,
     audience: 'merchant',

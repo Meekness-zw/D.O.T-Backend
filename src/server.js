@@ -184,6 +184,7 @@ import { getWalletBalance } from './walletLedger.js';
 import { createRequireApprovedCourier } from './courierApproval.js';
 import { createRequireApprovedMerchant } from './merchantApproval.js';
 import * as quickbooksService from './quickbooksService.js';
+import { getUserLanguage, getUserLanguages, render, saveUserLanguage } from './i18n.js';
 import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
 
 const app = express();
@@ -332,27 +333,31 @@ async function notifyAvailableCouriers(orderId, orderNumber, storeName, { exclud
     //   New delivery job
     //   Yummy Sushi · You earn $2.80
     //   Tap to view and accept.
-    const store = storeName || 'A store near you';
+    const store = storeName || ['A store near you'];
     let earnLabel = '';
     try {
       const { data: feeRow } = await supabase.from('orders').select('delivery_fee').eq('id', orderId).maybeSingle();
       const payout = computeCourierDeliveryPayoutUsd(Number(feeRow?.delivery_fee) || 0);
-      if (payout > 0) earnLabel = ` · You earn $${payout.toFixed(2)}`;
+      if (payout > 0) earnLabel = payout.toFixed(2);
     } catch {
       /* the alert still goes out without the amount */
     }
     const title = reopened ? 'Job available again' : 'New delivery job';
-    const body = `${store}${earnLabel}\nTap to view and accept.`;
+    const body = earnLabel
+      ? ['{store} · You earn ${amount}\nTap to view and accept.', { store, amount: earnLabel }]
+      : ['{store}\nTap to view and accept.', { store }];
+    const languages = await getUserLanguages(supabase, couriers.map((c) => c.id));
     const pushMessages = [];
     for (const courier of couriers) {
       if (busyIds.has(courier.id) || courier.id === excludeCourierId) continue;
       const token = courier.user_profiles?.push_token;
       if (!token || !token.startsWith('ExponentPushToken')) continue;
       if (courier.user_profiles?.push_role !== 'courier') continue;
+      const lang = languages.get(courier.id) || 'en';
       pushMessages.push({
         to: token,
-        title,
-        body,
+        title: render(lang, title),
+        body: render(lang, body),
         data: { type: 'new_job', orderId, orderNumber, storeName, audience: 'courier' },
         sound: 'default',
         // High priority wakes an Android phone whose screen is off; at normal
@@ -4869,10 +4874,11 @@ app.delete('/users/me/account', requireAuth, async (req, res) => {
 app.put('/users/me/push-token', requireAuth, async (req, res) => {
   try {
     if (!supabase) throw new Error('Server not configured');
-    const { token, role } = req.body || {};
+    const { token, role, language } = req.body || {};
     if (!token || typeof token !== 'string') {
       return res.status(400).json({ error: 'token is required' });
     }
+    if (language) await saveUserLanguage(supabase, req.userId, language);
     if (!['customer', 'merchant', 'courier'].includes(role)) {
       return res.status(400).json({ error: 'A valid active role is required' });
     }
@@ -5320,7 +5326,7 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
           order.courier_id && insertUserNotification(supabase, {
             userId: order.courier_id,
             title: 'Order cancelled',
-            message: `The customer cancelled order ${num} because it wasn't delivered within 60 minutes. Contact DOT support about the order you're carrying.`,
+            message: ["The customer cancelled order {number} because it wasn't delivered within 60 minutes. Contact DOT support about the order you're carrying.", { number: num }],
             referenceId: updated.id,
             audience: 'courier',
             data: { type: 'order_cancelled', orderId: updated.id, reason: 'late_delivery' },
@@ -5328,7 +5334,7 @@ app.post('/orders/:id/cancel', requireAuth, async (req, res) => {
           store?.merchant_id && insertUserNotification(supabase, {
             userId: store.merchant_id,
             title: 'Order cancelled after handover',
-            message: `The customer cancelled order ${num}: the courier didn't deliver it within 60 minutes. You'll still be paid for this order.`,
+            message: ["The customer cancelled order {number}: the courier didn't deliver it within 60 minutes. You'll still be paid for this order.", { number: num }],
             referenceId: updated.id,
             audience: 'merchant',
             data: { type: 'order_cancelled', orderId: updated.id, reason: 'late_delivery' },
@@ -5713,10 +5719,11 @@ app.post('/courier/orders/:id/arrived', requireAuth, requireApprovedCourier, asy
           .maybeSingle();
         const token = merchantProfile?.push_token;
         if (token?.startsWith('ExponentPushToken') && merchantProfile?.push_role === 'merchant') {
+          const lang = await getUserLanguage(supabase, store.merchant_id);
           await axios.post('https://exp.host/--/api/v2/push/send', {
             to: token,
-            title: 'Courier has arrived',
-            body: `The courier for order #${order.order_number} is at your location. Please confirm pickup.`,
+            title: render(lang, 'Courier has arrived'),
+            body: render(lang, ['The courier for order #{number} is at your location. Please confirm pickup.', { number: order.order_number }]),
             data: { type: 'courier_arrived', orderId: id, audience: 'merchant' },
             sound: 'default',
           }, { headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, timeout: 10000 });
@@ -6748,7 +6755,7 @@ app.post('/courier/orders/:id/pickup', requireAuth, requireApprovedCourier, asyn
         await insertUserNotification(supabase, {
           userId: deliveryContext.customer_id,
           title: 'Your order is on the way',
-          message: `Order #${deliveryContext.order_number || ''} has been picked up. Tap to track your delivery live.`,
+          message: ['Order #{number} has been picked up. Tap to track your delivery live.', { number: deliveryContext.order_number || '' }],
           type: 'delivery',
           referenceId: id,
           audience: 'customer',
@@ -6953,7 +6960,7 @@ app.post('/courier/orders/:id/complete', requireAuth, requireApprovedCourier, as
       await insertUserNotification(supabase, {
         userId: order.customer_id,
         title: 'Delivery complete',
-        message: `Order #${order.order_number || ''} was delivered successfully.`,
+        message: ['Order #{number} was delivered successfully.', { number: order.order_number || '' }],
         type: 'delivery', referenceId: id, audience: 'customer',
         data: { orderId: id, orderNumber: order.order_number, status: 'delivered' },
       });
@@ -7565,7 +7572,7 @@ app.post('/orders', requireAuth, async (req, res) => {
         await insertUserNotification(supabase, {
           userId: store.merchant_id,
           title: 'New order received',
-          message: `Order ${orderNumber} — ${itemCount} item${itemCount !== 1 ? 's' : ''} — $${totalAmount.toFixed(2)}`,
+          message: [itemCount === 1 ? 'Order {number} — 1 item — ${amount}' : 'Order {number} — {count} items — ${amount}', { number: orderNumber, count: itemCount, amount: totalAmount.toFixed(2) }],
           type: 'order',
           referenceId: order.id,
           audience: 'merchant',
@@ -10610,7 +10617,7 @@ app.post('/admin/users/:id/wallet-credit', requireAdmin, async (req, res) => {
       await insertUserNotification(supabase, {
         userId: req.params.id,
         title: 'Credit added to your wallet',
-        message: `$${result.amount.toFixed(2)} has been added to your DOT wallet.${result.note ? ` ${result.note}` : ''}`,
+        message: [result.note ? '${amount} has been added to your DOT wallet. {note}' : '${amount} has been added to your DOT wallet.', { amount: result.amount.toFixed(2), note: result.note }],
         type: 'payment',
         audience: 'customer',
         data: { type: 'promo_credit', amount: result.amount },
@@ -10665,7 +10672,7 @@ app.post('/admin/users/:id/wallet-debit', requireAdmin, async (req, res) => {
       await insertUserNotification(supabase, {
         userId: req.params.id,
         title: 'Amount deducted from your wallet',
-        message: `$${result.amount.toFixed(2)} was deducted from your ${result.wallet} wallet.${result.note ? ` ${result.note}` : ''}`,
+        message: [result.note ? '${amount} was deducted from your {wallet} wallet. {note}' : '${amount} was deducted from your {wallet} wallet.', { amount: result.amount.toFixed(2), wallet: [result.wallet], note: result.note }],
         type: 'payment',
         audience: result.wallet,
         data: { type: 'admin_debit', amount: result.amount, wallet: result.wallet },
@@ -10843,7 +10850,7 @@ app.post('/admin/orders/:id/refund', requireAdmin, async (req, res) => {
       await insertUserNotification(supabase, {
         userId: order.customer_id,
         title: 'Refund issued',
-        message: `You've been refunded $${refundAmount.toFixed(2)} for order ${order.order_number}.`,
+        message: ["You've been refunded ${amount} for order {number}.", { amount: refundAmount.toFixed(2), number: order.order_number }],
         type: 'payment',
         referenceId: order.id,
         audience: 'customer',
@@ -11373,11 +11380,11 @@ app.patch('/admin/withdrawals/:id', requireAdmin, async (req, res) => {
         paid: 'Withdrawal paid',
       };
       const bodyByStatus = {
-        approved: `Your withdrawal of $${Number(reqRow.amount).toFixed(2)} was approved and is being processed.`,
+        approved: ['Your withdrawal of ${amount} was approved and is being processed.', { amount: Number(reqRow.amount).toFixed(2) }],
         rejected: admin_note
-          ? `Your withdrawal of $${Number(reqRow.amount).toFixed(2)} was declined: ${admin_note}. The amount has been returned to your wallet.`
-          : `Your withdrawal of $${Number(reqRow.amount).toFixed(2)} was declined. The amount has been returned to your wallet.`,
-        paid: `Your withdrawal of $${Number(reqRow.amount).toFixed(2)} has been paid out.`,
+          ? ['Your withdrawal of ${amount} was declined: {note}. The amount has been returned to your wallet.', { amount: Number(reqRow.amount).toFixed(2), note: admin_note }]
+          : ['Your withdrawal of ${amount} was declined. The amount has been returned to your wallet.', { amount: Number(reqRow.amount).toFixed(2) }],
+        paid: ['Your withdrawal of ${amount} has been paid out.', { amount: Number(reqRow.amount).toFixed(2) }],
       };
       await insertUserNotification(supabase, {
         userId: reqRow.user_id,
@@ -11994,7 +12001,7 @@ app.post('/merchant/share-links', requireAuth, async (req, res) => {
       await insertUserNotification(supabase, {
         userId: toStore.merchant_id,
         title: 'Product list share request',
-        message: `${senderMerchant?.business_name || fromStore.store_name} wants to share their product list with ${toStore.store_name}. Accept to import their menu items.`,
+        message: ['{from} wants to share their product list with {to}. Accept to import their menu items.', { from: senderMerchant?.business_name || fromStore.store_name, to: toStore.store_name }],
         type: 'system',
         referenceId: created.id,
         audience: 'merchant',
@@ -12107,7 +12114,7 @@ app.post('/merchant/share-links/:id/accept', requireAuth, async (req, res) => {
       await insertUserNotification(supabase, {
         userId: link.from_merchant_id,
         title: 'Share request accepted',
-        message: `Your product list share offer was accepted. They can now import your items anytime.`,
+        message: 'Your product list share offer was accepted. They can now import your items anytime.',
         type: 'system',
         referenceId: link.id,
         audience: 'merchant',
@@ -12491,7 +12498,7 @@ app.post('/admin/stores/:storeId/share-links', requireAdmin, async (req, res) =>
       await insertUserNotification(supabase, {
         userId: toStore.merchant_id,
         title: 'Product list share request',
-        message: `${senderMerchant?.business_name || fromStore.store_name} wants to share their product list with ${toStore.store_name}. Accept to import their menu items.`,
+        message: ['{from} wants to share their product list with {to}. Accept to import their menu items.', { from: senderMerchant?.business_name || fromStore.store_name, to: toStore.store_name }],
         type: 'system',
         referenceId: created.id,
         audience: 'merchant',
@@ -12535,7 +12542,7 @@ app.post('/admin/share-links/:id/accept', requireAdmin, async (req, res) => {
       await insertUserNotification(supabase, {
         userId: link.from_merchant_id,
         title: 'Share request accepted',
-        message: `Your product list share offer was accepted. They can now import your items anytime.`,
+        message: 'Your product list share offer was accepted. They can now import your items anytime.',
         type: 'system',
         referenceId: link.id,
         audience: 'merchant',
