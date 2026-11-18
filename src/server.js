@@ -646,7 +646,9 @@ async function requireAuth(req, res, next) {
     const decoded = verifyAccessToken(token, process.env.SUPABASE_JWT_SECRET);
     if (decoded?.sub) {
       req.userId = decoded.sub;
-      if (await isAccountFrozen(req.userId)) return frozenAccount(res);
+      const state = await accountState(req.userId);
+      if (state === 'missing') return deletedAccount(res);
+      if (state === 'frozen') return frozenAccount(res);
       // DOT team working in a merchant's store (src/merchantControl.js).
       if (decoded.act_by) {
         if (!(await actingStillAllowed(decoded))) {
@@ -668,7 +670,9 @@ async function requireAuth(req, res, next) {
       return res.status(401).json({ error: 'Unauthorized', details: 'Invalid or expired token' });
     }
     req.userId = data.user.id;
-    if (await isAccountFrozen(req.userId)) return frozenAccount(res);
+    const state = await accountState(req.userId);
+    if (state === 'missing') return deletedAccount(res);
+    if (state === 'frozen') return frozenAccount(res);
     next();
   } catch (err) {
     return res.status(401).json({ error: 'Unauthorized', details: err.message });
@@ -684,7 +688,10 @@ function frozenAccount(res) {
 
 /** A frozen account keeps its session token, so signed-in requests re-check
  *  the flag. A lookup failure does not lock the whole app out. */
-async function isAccountFrozen(userId) {
+/** 'ok', 'frozen', or 'missing' (the account was deleted but the phone still
+ *  has a valid token). A lookup failure counts as 'ok' so a database hiccup
+ *  never signs everyone out. */
+async function accountState(userId) {
   try {
     const { data, error } = await supabaseAdmin
       .from('user_profiles')
@@ -692,14 +699,27 @@ async function isAccountFrozen(userId) {
       .eq('id', userId)
       .maybeSingle();
     if (error) {
-      console.error('freeze check failed:', error.message || error);
-      return false;
+      console.error('account check failed:', error.message || error);
+      return 'ok';
     }
-    return !!data?.is_suspended;
+    if (!data) return 'missing';
+    return data.is_suspended ? 'frozen' : 'ok';
   } catch (err) {
-    console.error('freeze check failed:', err?.message || err);
-    return false;
+    console.error('account check failed:', err?.message || err);
+    return 'ok';
   }
+}
+
+async function isAccountFrozen(userId) {
+  return (await accountState(userId)) === 'frozen';
+}
+
+/** The app signs out and explains when it sees "no longer exists" on a 401. */
+function deletedAccount(res) {
+  return res.status(401).json({
+    error: 'Account no longer exists',
+    details: 'This account was removed. Please sign up again or contact support.',
+  });
 }
 
 /** Like requireAuth, but never rejects — sets req.userId when a valid token
@@ -712,11 +732,11 @@ async function optionalAuth(req, res, next) {
   try {
     const decoded = verifyAccessToken(token, process.env.SUPABASE_JWT_SECRET);
     if (decoded?.sub) {
-      if (!(await isAccountFrozen(decoded.sub))) req.userId = decoded.sub;
+      if ((await accountState(decoded.sub)) === 'ok') req.userId = decoded.sub;
       return next();
     }
     const { data } = await supabaseAdmin.auth.getUser(token);
-    if (data?.user?.id && !(await isAccountFrozen(data.user.id))) req.userId = data.user.id;
+    if (data?.user?.id && (await accountState(data.user.id)) === 'ok') req.userId = data.user.id;
   } catch (_) {
     // Invalid/expired token on a public endpoint — just proceed unauthenticated.
   }
@@ -8901,7 +8921,11 @@ app.post('/users/me/addresses', requireAuth, async (req, res) => {
       .from('customers')
       .upsert({ id: req.userId }, { onConflict: 'id' });
     if (ensureErr) {
-      console.warn('addresses: ensure customer row:', ensureErr.message);
+      console.error('addresses: ensure customer row:', ensureErr.message);
+      return res.status(409).json({
+        error: 'Could not set up your customer account',
+        details: 'Please sign out and sign in again. If it keeps happening, contact support.',
+      });
     }
 
     const insert = {
