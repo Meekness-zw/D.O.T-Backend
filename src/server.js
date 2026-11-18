@@ -185,6 +185,7 @@ import { createRequireApprovedCourier } from './courierApproval.js';
 import { createRequireApprovedMerchant } from './merchantApproval.js';
 import * as quickbooksService from './quickbooksService.js';
 import { getUserLanguage, getUserLanguages, render, saveUserLanguage } from './i18n.js';
+import { alertOfflineRiders } from './riderWhatsAppAlerts.js';
 import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
 
 const app = express();
@@ -311,6 +312,8 @@ async function findAuthUserByPhone(phone) {
 // the order is actually finished being prepared.
 async function notifyAvailableCouriers(orderId, orderNumber, storeName, { excludeCourierId = null, reopened = false } = {}) {
   if (!supabase) return;
+  // Offline riders get a WhatsApp nudge to go online (off until the template is set).
+  alertOfflineRiders(supabase, { storeName, excludeCourierId }).catch(() => {});
   try {
     // Both fields must agree: legacy/incomplete rows must not receive live jobs.
     const { data: couriers } = await supabase

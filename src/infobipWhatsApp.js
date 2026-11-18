@@ -15,7 +15,12 @@ export function infobipWhatsAppConfigured() {
   return Boolean(process.env.INFOBIP_API_KEY && process.env.INFOBIP_BASE_URL);
 }
 
-export async function sendWhatsAppTemplate({ to, placeholder }) {
+/**
+ * to: phone in international format. placeholder: one value (sign-in code),
+ * or placeholders: [...] for templates with several. templateName / language
+ * override the sign-in template defaults.
+ */
+export async function sendWhatsAppTemplate({ to, placeholder, placeholders, templateName, language }) {
   const apiKey = process.env.INFOBIP_API_KEY;
   const baseUrl = String(process.env.INFOBIP_BASE_URL || '').replace(/\/$/, '');
   if (!apiKey || !baseUrl) {
@@ -34,13 +39,13 @@ export async function sendWhatsAppTemplate({ to, placeholder }) {
           to: destination,
           messageId: crypto.randomUUID(),
           content: {
-            templateName: process.env.INFOBIP_WHATSAPP_TEMPLATE || 'test_whatsapp_template_en',
+            templateName: templateName || process.env.INFOBIP_WHATSAPP_TEMPLATE || 'test_whatsapp_template_en',
             templateData: {
               body: {
-                placeholders: [String(placeholder)],
+                placeholders: (placeholders || [placeholder]).map((v) => String(v ?? '')),
               },
             },
-            language: process.env.INFOBIP_WHATSAPP_LANGUAGE || 'en',
+            language: language || process.env.INFOBIP_WHATSAPP_LANGUAGE || 'en',
           },
         },
       ],
