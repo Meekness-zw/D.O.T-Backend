@@ -131,6 +131,7 @@
   "Adding ${value} USD via Pesepay": "A adicionar ${value} USD via Pesepay",
   "Address": "Morada",
   "Address not available": "Morada indisponível",
+  "Address search isn't working right now. Move the pin to your spot on the map, or use your current location.": "A pesquisa de moradas não está a funcionar de momento. Mova o marcador para o seu local no mapa ou use a sua localização atual.",
   "Admin API not configured": "A API de administração não está configurada",
   "After confirming your order, you can see real‑time updates on the order tracking screen, including courier location and ETA.": "Depois de confirmar o pedido, pode ver atualizações em tempo real no ecrã de acompanhamento, incluindo a localização do estafeta e a hora prevista de chegada.",
   "Alarms": "Alarmes",

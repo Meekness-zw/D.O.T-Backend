@@ -131,6 +131,7 @@
   "Adding ${value} USD via Pesepay": "正在通过 Pesepay 充值 ${value} 美元",
   "Address": "地址",
   "Address not available": "地址不可用",
+  "Address search isn't working right now. Move the pin to your spot on the map, or use your current location.": "地址搜索暂时无法使用。请在地图上把标记移到您的位置，或使用您当前的位置。",
   "Admin API not configured": "管理 API 未配置",
   "After confirming your order, you can see real‑time updates on the order tracking screen, including courier location and ETA.": "确认订单后，您可以在订单跟踪页面查看实时进度，包括骑手位置和预计送达时间。",
   "Alarms": "报警器",
