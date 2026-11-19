@@ -186,6 +186,7 @@ import { createRequireApprovedMerchant } from './merchantApproval.js';
 import * as quickbooksService from './quickbooksService.js';
 import { getUserLanguage, getUserLanguages, render, saveUserLanguage } from './i18n.js';
 import { alertDotTeam } from './teamOrderAlert.js';
+import { registerBroadcastRoutes } from './broadcastRoutes.js';
 import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
 
 const app = express();
@@ -1293,9 +1294,9 @@ app.use((req, res, next) => {
 });
 
 const DASHBOARD_SECTIONS = {
-  admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals', 'settlements', 'withdrawals', 'companies', 'fleet', 'quickbooks'],
+  admin: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'discounts', 'approvals', 'settlements', 'withdrawals', 'companies', 'fleet', 'quickbooks', 'notifications'],
   accountant: ['overview', 'users', 'orders', 'deliveries', 'merchants', 'couriers', 'stores', 'payments', 'settlements', 'withdrawals', 'companies', 'fleet', 'quickbooks'],
-  sales_marketing: ['overview', 'users', 'orders', 'merchants', 'couriers', 'stores', 'discounts', 'approvals', 'companies', 'fleet'],
+  sales_marketing: ['overview', 'users', 'orders', 'merchants', 'couriers', 'stores', 'discounts', 'notifications', 'approvals', 'companies', 'fleet'],
 };
 
 function dashboardRoleForKey(headerKey) {
@@ -1338,6 +1339,8 @@ function dashboardRoleCanAccess(role, method, path) {
   }
   if (role === 'sales_marketing') {
     if (path.startsWith('/admin/discount-codes')) return true;
+    // Deals and news go out to app users from the Notifications page.
+    if (path === '/admin/broadcast' || path === '/admin/broadcasts') return true;
     if (path.startsWith('/admin/products/') || /^\/admin\/stores\/[^/]+\/products(?:\/upload-image)?$/.test(path)) {
       return true;
     }
@@ -11024,104 +11027,7 @@ app.get('/admin/couriers', requireAdmin, async (req, res) => {
   }
 });
 
-// POST /admin/broadcast — send an announcement (e.g. "new app version
-// available", a feature announcement) to every user, or just one role.
-// Body: { title, message, audience? } — audience: 'all' | 'customer' |
-// 'merchant' | 'courier' (default 'all').
-app.post('/admin/broadcast', requireAdmin, async (req, res) => {
-  try {
-    if (!supabase) throw new Error('Server not configured');
-    const { title, message, audience = 'all' } = req.body || {};
-    if (!title || !String(title).trim()) {
-      return res.status(400).json({ error: 'title is required' });
-    }
-    if (!message || !String(message).trim()) {
-      return res.status(400).json({ error: 'message is required' });
-    }
-    const validAudiences = ['all', 'customer', 'merchant', 'courier'];
-    if (!validAudiences.includes(audience)) {
-      return res.status(400).json({
-        error: 'Invalid audience',
-        details: `audience must be one of: ${validAudiences.join(', ')}`,
-      });
-    }
-
-    let targetIds = [];
-    if (audience === 'all') {
-      const { data, error } = await supabase.from('user_profiles').select('id');
-      if (error) throw new Error(error.message || 'Failed to load users');
-      targetIds = (data || []).map((r) => r.id);
-    } else {
-      const table = audience === 'customer' ? 'customers' : audience === 'merchant' ? 'merchants' : 'couriers';
-      const { data, error } = await supabase.from(table).select('id');
-      if (error) throw new Error(error.message || `Failed to load ${audience}s`);
-      targetIds = (data || []).map((r) => r.id);
-    }
-
-    if (targetIds.length === 0) {
-      return res.json({ sent: 0, details: 'No users matched that audience.' });
-    }
-
-    const titleTrimmed = String(title).trim().slice(0, 200);
-    const messageTrimmed = String(message).trim().slice(0, 2000);
-
-    const notificationAudience = audience === 'all' ? 'all' : audience;
-    const rows = targetIds.map((userId) => ({
-      user_id: userId,
-      title: titleTrimmed,
-      message: messageTrimmed,
-      type: 'announcement',
-      data: { audience: notificationAudience },
-    }));
-    // Chunk inserts to stay well under any single-request payload limit.
-    for (let i = 0; i < rows.length; i += 500) {
-      const { error: insertError } = await supabase.from('notifications').insert(rows.slice(i, i + 500));
-      if (insertError) console.error('[broadcast] notification insert error:', insertError.message);
-    }
-
-    // Push to everyone with a registered device token, batched (Expo accepts
-    // up to 100 messages per request).
-    const { data: profiles, error: profilesError } = await supabase
-      .from('user_profiles')
-      .select('push_token, push_role')
-      .in('id', targetIds)
-      .not('push_token', 'is', null);
-    if (profilesError) console.error('[broadcast] push token lookup error:', profilesError.message);
-
-    const pushMessages = (profiles || [])
-      .filter((p) => p.push_token && p.push_token.startsWith('ExponentPushToken'))
-      .filter((p) => notificationAudience === 'all' || p.push_role === notificationAudience)
-      .map((p) => ({
-        to: p.push_token,
-        title: titleTrimmed,
-        body: messageTrimmed,
-        sound: 'default',
-        data: { type: 'announcement', audience: notificationAudience },
-      }));
-
-    let pushed = 0;
-    for (let i = 0; i < pushMessages.length; i += 100) {
-      const batch = pushMessages.slice(i, i + 100);
-      try {
-        await axios.post('https://exp.host/--/api/v2/push/send', batch, {
-          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-          timeout: 10000,
-        });
-        pushed += batch.length;
-      } catch (pushErr) {
-        console.warn('[broadcast] push batch failed:', pushErr?.message);
-      }
-    }
-
-    return res.json({ sent: targetIds.length, pushed, audience });
-  } catch (error) {
-    console.error('post /admin/broadcast error:', error);
-    return res.status(500).json({
-      error: 'Failed to send broadcast',
-      details: error.message || 'Please try again later',
-    });
-  }
-});
+registerBroadcastRoutes(app, requireAdmin);
 
 // POST /admin/discount-codes — create a code.
 // The code itself is generated by the server; admins only configure its rules.
