@@ -12,7 +12,7 @@
  *   INFOBIP_RIDER_ALERT_TEMPLATE        approved template name, body e.g.
  *     "New DOT order at {{1}}. Open the DOT app and go online to take it."
  * Optional:
- *   INFOBIP_RIDER_ALERT_LANGUAGES  template languages approved, e.g. "en,pt"
+ *   INFOBIP_RIDER_ALERT_LANGUAGES  approved template language codes, e.g. "en_GB,pt_PT"
  *                                  (default "en"); a rider gets their app
  *                                  language when it is in this list.
  *   RIDER_ALERT_COOLDOWN_MINUTES   at most one alert per rider in this
@@ -36,11 +36,18 @@ function cooldownMs() {
   return (Number.isFinite(minutes) && minutes >= 0 ? minutes : 15) * 60 * 1000;
 }
 
+/** Approved template language codes, exactly as WhatsApp lists them (en, en_GB, pt_PT…). */
 function templateLanguages() {
   return String(process.env.INFOBIP_RIDER_ALERT_LANGUAGES || 'en')
     .split(',')
-    .map((s) => s.trim().toLowerCase())
+    .map((s) => s.trim())
     .filter(Boolean);
+}
+
+/** The approved code for a rider's app language ('pt' → 'pt_PT'), else the first one. */
+function pickTemplateLanguage(appLanguage, allowed) {
+  const match = allowed.find((code) => code.toLowerCase().split(/[_-]/)[0] === appLanguage);
+  return match || allowed[0] || 'en';
 }
 
 /** WhatsApp wants digits with the country code: "+263 77 123 4567" → "263771234567". */
@@ -89,7 +96,7 @@ export async function alertOfflineRiders(supabase, { storeName, excludeCourierId
             to,
             placeholders: [store],
             templateName: process.env.INFOBIP_RIDER_ALERT_TEMPLATE,
-            language: allowed.includes(lang) ? lang : allowed[0] || 'en',
+            language: pickTemplateLanguage(lang, allowed),
           });
           result.sent += 1;
         } catch (err) {
