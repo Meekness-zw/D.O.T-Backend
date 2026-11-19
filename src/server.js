@@ -1364,6 +1364,7 @@ function dashboardRoleCanAccess(role, method, path) {
     if (/^\/admin\/stores\/[^/]+\/promotions(\/upload-image)?$/.test(path)) return true;
     if (['PATCH', 'DELETE'].includes(method) && /^\/admin\/promotions\/[^/]+$/.test(path)) return true;
     if (method === 'PATCH' && /^\/admin\/stores\/[^/]+\/categories\/[^/]+$/.test(path)) return true;
+    if (method === 'PATCH' && /^\/admin\/stores\/[^/]+\/(product|category)-order$/.test(path)) return true;
     // Sharing a store's product list with another store — same full read/write
     // access a merchant has to their own sharing inbox/outbox, just scoped to
     // whichever store this dashboard account is managing.
@@ -2538,7 +2539,9 @@ app.get('/stores/:storeId/menu', async (req, res) => {
       )
       .eq('store_id', storeId)
       .eq('is_available', true)
-      .order('display_order', { ascending: true });
+      .order('display_order', { ascending: true })
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true });
 
     if (productsError) {
       console.error('public store menu products error:', productsError);
@@ -2601,7 +2604,8 @@ app.get('/stores/:storeId/menu', async (req, res) => {
       .select('name')
       .eq('store_id', storeId)
       .eq('is_active', true)
-      .order('display_order', { ascending: true });
+      .order('display_order', { ascending: true })
+      .order('created_at', { ascending: true });
 
     const categories = [];
     if (categorySet.has('Popular')) categories.push('Popular');
@@ -12776,7 +12780,8 @@ app.get('/admin/stores/:storeId/products', requireAdmin, async (req, res) => {
       )
       .eq('store_id', storeId)
       .order('display_order', { ascending: true })
-      .order('created_at', { ascending: true });
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true });
     if (error) throw new Error(error.message || 'Failed to load products');
 
     const groupsMap = await fetchOptionGroupsForProducts((data || []).map((p) => p.id));
@@ -12863,7 +12868,8 @@ app.get('/admin/stores/:storeId/categories', requireAdmin, async (req, res) => {
       .from('product_categories')
       .select('id, name, display_order')
       .eq('store_id', storeId)
-      .order('display_order', { ascending: true });
+      .order('display_order', { ascending: true })
+      .order('created_at', { ascending: true });
     if (error) throw new Error(error.message || 'Failed to load categories');
     return res.json({ categories: data || [] });
   } catch (error) {
@@ -12902,6 +12908,55 @@ app.patch('/admin/stores/:storeId/categories/:categoryId', requireAdmin, async (
   } catch (error) {
     console.error('patch /admin/stores/:storeId/categories/:categoryId error:', error);
     return res.status(500).json({ error: 'Failed to update category', details: error.message || 'Try again later' });
+  }
+});
+
+// PATCH /admin/stores/:storeId/product-order { product_ids }
+// PATCH /admin/stores/:storeId/category-order { category_ids }
+// Save the whole order in one go: position in the list becomes display_order.
+// (Swapping two numbers at a time broke when products shared a number.)
+async function saveStoreDisplayOrder(table, storeId, ids) {
+  const uniqueIds = [...new Set((ids || []).map(String).filter(Boolean))];
+  if (!uniqueIds.length) return { error: 'Nothing to reorder', status: 400 };
+  const { data: rows, error } = await supabase.from(table).select('id, display_order').eq('store_id', storeId);
+  if (error) throw new Error(error.message);
+  const current = new Map((rows || []).map((r) => [String(r.id), r.display_order]));
+  if (uniqueIds.some((id) => !current.has(id))) return { error: 'Some items are not in this store', status: 400 };
+  // Items left out of the list (none, normally) keep their place after it.
+  const rest = (rows || [])
+    .filter((r) => !uniqueIds.includes(String(r.id)))
+    .sort((a, b) => (a.display_order || 0) - (b.display_order || 0))
+    .map((r) => String(r.id));
+  const changed = [...uniqueIds, ...rest]
+    .map((id, display_order) => ({ id, display_order }))
+    .filter(({ id, display_order }) => current.get(id) !== display_order);
+  const results = await Promise.all(
+    changed.map(({ id, display_order }) => supabase.from(table).update({ display_order }).eq('id', id).eq('store_id', storeId)),
+  );
+  const failed = results.find((r) => r.error);
+  if (failed) throw new Error(failed.error.message);
+  return { updated: changed.length };
+}
+
+app.patch('/admin/stores/:storeId/product-order', requireAdmin, async (req, res) => {
+  try {
+    const result = await saveStoreDisplayOrder('products', req.params.storeId, req.body?.product_ids);
+    if (result.error) return res.status(result.status).json({ error: result.error });
+    return res.json(result);
+  } catch (error) {
+    console.error('patch /admin/stores/:storeId/product-order error:', error);
+    return res.status(500).json({ error: 'Failed to save product order', details: error.message });
+  }
+});
+
+app.patch('/admin/stores/:storeId/category-order', requireAdmin, async (req, res) => {
+  try {
+    const result = await saveStoreDisplayOrder('product_categories', req.params.storeId, req.body?.category_ids);
+    if (result.error) return res.status(result.status).json({ error: result.error });
+    return res.json(result);
+  } catch (error) {
+    console.error('patch /admin/stores/:storeId/category-order error:', error);
+    return res.status(500).json({ error: 'Failed to save category order', details: error.message });
   }
 });
 
