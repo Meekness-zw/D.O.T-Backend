@@ -187,6 +187,7 @@ import * as quickbooksService from './quickbooksService.js';
 import { getUserLanguage, getUserLanguages, render, saveUserLanguage } from './i18n.js';
 import { alertDotTeam } from './teamOrderAlert.js';
 import { registerBroadcastRoutes } from './broadcastRoutes.js';
+import { registerDeliveryCodeRoutes } from './deliveryCodeRoutes.js';
 import { registerVariantLibraryRoutes, resolveLinkedGroups } from './variantLibrary.js';
 import { rateLimit, ipKeyGenerator } from 'express-rate-limit';
 
@@ -11046,6 +11047,7 @@ app.get('/admin/couriers', requireAdmin, async (req, res) => {
 });
 
 registerBroadcastRoutes(app, requireAdmin);
+registerDeliveryCodeRoutes(app, requireAdmin);
 registerVariantLibraryRoutes(app, { requireAdmin, requireAuth });
 
 // POST /admin/discount-codes — create a code.
@@ -13649,6 +13651,8 @@ app.post('/admin/settlements/:orderId/disburse', requireAdmin, async (req, res) 
 /** One order in full: items, prices, timeline and the money split. */
 app.get('/admin/orders/:id/detail', requireAdmin, async (req, res) => {
   try {
+    // The delivery code is not in here: it comes from
+    // /admin/orders/:id/delivery-code (admin only, each look logged).
     return res.json(await getOrderDetail(req.params.id));
   } catch (error) {
     if (error.status) return res.status(error.status).json({ error: error.message });
